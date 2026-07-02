@@ -32,22 +32,42 @@ fully unit-tested against those real cases.
 ## Usage
 
 ```sh
-netpush                 # browse the demo 10.87.3.0/24 in the TUI (read-only)
-netpush --list          # print the reconciled table and exit (no TUI)
-netpush --range CIDR    # browse another range (live sources: TODO)
+netpush                       # browse the offline demo 10.87.3.0/24 in the TUI
+netpush --list                # print the reconciled table and exit (no TUI)
+
+# live: gather real facts over SSH. NetBox + DNS run on --vantage; the ARP probe
+# runs on --probe-host (must sit on the target L2). Token from `pass` (or
+# $NETPUSH_NETBOX_TOKEN).
+netpush --live --range 10.87.3.0/24 \
+        --vantage dns1.astron.nl --probe-host takkie.astron.nl
 ```
 
 Keys: `j/k` move · `g/G` top/bottom · `f` next free · `q` quit.
 
-Read-only by default; `--write` / `--dry-run` are reserved for when live pushes land.
+Read-only by default; `--write` / `--dry-run` are reserved for when the push path lands.
+
+### How live gathering works
+
+netpush usually runs off the ASTRON network, so each source runs its query on an
+SSH **vantage** host (reusing `~/.ssh/config`, bastion jump and all):
+
+- **NetBox** — `curl` the REST API on the vantage; the token is fed over stdin so it
+  never appears in any argv.
+- **DNS** — one reverse lookup per host on the vantage's resolver.
+- **probe** — a parallel `ping` sweep from an on-subnet host (ARP truth).
+
+Each source fills one field of a fact; [`sources::merge`](src/sources/mod.rs) unions
+them before reconciling.
 
 ## Roadmap
 
 1. ✅ **Reconciler + TUI** over an offline fixture of the real data.
-2. **Live sources** — NetBox REST client (token via `pass`), DNS PTR reader, ARP probe
-   (run from an on-subnet host over the bastion SSH jump).
+2. ✅ **Live sources** — NetBox + DNS over an SSH vantage, parallel ARP probe, merged
+   behind the fact shape. `--live` reconciles a real `/24` in seconds.
 3. **Writes** — allocate in NetBox + push forward/reverse DNS to `dns1` (edit
    `db.nfra.nl`, bump serial, `rndc reload`), with a diff preview and `--dry-run`.
+4. **Node-graph DNS** — the long vision in [docs/vision.md](docs/vision.md): DNS as a
+   mullion node graph, nice auto-layout, transform-and-migrate to Technitium/PowerDNS.
 
 ## Licence
 

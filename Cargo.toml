@@ -14,11 +14,12 @@ name = "netpush"
 path = "src/main.rs"
 
 [dependencies]
-anyhow    = "1"
-clap      = { version = "4", features = ["derive"] }
-crossterm = "0.28"
+anyhow     = "1"
+clap       = { version = "4", features = ["derive"] }
+crossterm  = "0.28"
+serde_json = "1"
 # mullion is Roland's terminal-UI tiling engine; census is built on it too.
-mullion   = { path = "../mullion", version = "0.3.0" }
+mullion    = { path = "../mullion", version = "0.3.0" }
 
 [profile.release]
 strip = true

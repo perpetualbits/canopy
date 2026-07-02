@@ -9,21 +9,44 @@
 
 mod fixture;
 mod reconcile;
+mod sources;
 mod tui;
 
+use anyhow::Context;
 use clap::Parser;
 
-use reconcile::Cidr;
+use reconcile::{AddressFacts, Cidr};
+use sources::{dns::DnsSource, netbox::NetboxSource, probe::ProbeSource, FactSource, Vantage};
 
 /// Command-line options — mirrors census's read-only-by-default posture.
 #[derive(Parser, Debug)]
 #[command(name = "netpush", about = "Reconcile IP allocation across NetBox, DNS and the live network")]
 struct Args {
-    /// CIDR range to browse (the demo data only covers 10.87.3.0/24 for now).
+    /// CIDR range to browse.
     #[arg(long, default_value = "10.87.3.0/24")]
     range: String,
 
-    /// Allow pushing NetBox/DNS changes (reserved — not wired to live sources yet).
+    /// Gather facts from the live NetBox/DNS/probe sources instead of the demo data.
+    #[arg(long)]
+    live: bool,
+
+    /// SSH host to run NetBox + DNS queries from (must reach NetBox and internal DNS).
+    #[arg(long, default_value = "dns1.astron.nl")]
+    vantage: String,
+
+    /// SSH host on the target L2 to run the ARP/ping probe from.
+    #[arg(long, default_value = "takkie.astron.nl")]
+    probe_host: String,
+
+    /// NetBox base URL.
+    #[arg(long, default_value = "https://netbox.astron.nl")]
+    netbox_url: String,
+
+    /// `pass` entry holding the NetBox API token (or set NETPUSH_NETBOX_TOKEN).
+    #[arg(long, default_value = "astron/netbox.astron.nl/dns_api_token")]
+    token_pass: String,
+
+    /// Allow pushing NetBox/DNS changes (reserved — write path not implemented yet).
     #[arg(long)]
     write: bool,
 
@@ -40,13 +63,11 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let range = Cidr::parse(&args.range).map_err(|e| anyhow::anyhow!(e))?;
-    let (demo_range, demo_facts) = fixture::demo();
-    // Until live sources land, facts only exist for the demo range; keep just the
-    // ones that actually fall inside the range being browsed.
-    let facts: Vec<_> = if range == demo_range {
-        demo_facts.into_iter().filter(|f| range.contains(f.addr)).collect()
+
+    let facts = if args.live {
+        gather_live(&range, &args)?
     } else {
-        Vec::new()
+        demo_facts(&range)
     };
 
     if args.list {
@@ -55,6 +76,68 @@ fn main() -> anyhow::Result<()> {
     }
 
     tui::run(range, facts, args.write, args.dry_run)
+}
+
+/// The offline demo facts, kept to whatever falls inside `range`.
+fn demo_facts(range: &Cidr) -> Vec<AddressFacts> {
+    let (demo_range, facts) = fixture::demo();
+    if *range == demo_range {
+        facts.into_iter().filter(|f| range.contains(f.addr)).collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Gather NetBox + DNS + probe facts from the live sources and merge them.
+///
+/// NetBox and DNS run on the `--vantage` host (they need internal reachability); the
+/// ping probe runs on `--probe-host`, which must sit on the target L2.
+fn gather_live(range: &Cidr, args: &Args) -> anyhow::Result<Vec<AddressFacts>> {
+    let vantage = Vantage::new(&args.vantage);
+    let token = get_token(&args.token_pass)?;
+
+    let netbox = NetboxSource {
+        vantage: vantage.clone(),
+        base_url: args.netbox_url.clone(),
+        token,
+    };
+    let dns = DnsSource { vantage: vantage.clone() };
+    let probe = ProbeSource { vantage: Vantage::new(&args.probe_host) };
+
+    Ok(sources::merge(vec![
+        netbox.gather(range).context("NetBox source")?,
+        dns.gather(range).context("DNS source")?,
+        probe.gather(range).context("probe source")?,
+    ]))
+}
+
+/// Fetch the NetBox token from `$NETPUSH_NETBOX_TOKEN`, else from `pass`.
+///
+/// Keeping it out of argv and config: the env var wins for CI, otherwise we shell
+/// out to `pass <entry>` and take the first line.
+fn get_token(pass_entry: &str) -> anyhow::Result<String> {
+    if let Ok(t) = std::env::var("NETPUSH_NETBOX_TOKEN") {
+        if !t.trim().is_empty() {
+            return Ok(t.trim().to_string());
+        }
+    }
+    let out = std::process::Command::new("pass")
+        .arg(pass_entry)
+        .output()
+        .with_context(|| format!("running `pass {pass_entry}` for the NetBox token"))?;
+    if !out.status.success() {
+        anyhow::bail!("`pass {pass_entry}` failed; set NETPUSH_NETBOX_TOKEN instead");
+    }
+    let token = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if token.is_empty() {
+        anyhow::bail!("`pass {pass_entry}` returned no token");
+    }
+    Ok(token)
 }
 
 /// Print the reconciled range as plain text: a status tally, then every address
