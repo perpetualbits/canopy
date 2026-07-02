@@ -64,10 +64,13 @@ them before reconciling.
 1. ✅ **Reconciler + TUI** over an offline fixture of the real data.
 2. ✅ **Live sources** — NetBox + DNS over an SSH vantage, parallel ARP probe, merged
    behind the fact shape. `--live` reconciles a real `/24` in seconds.
-3. 🚧 **Writes** — an allocation **planner** with a `--dry-run` diff is done: NetBox
-   create + forward `A` + reverse `PTR`, refusing any non-free target. The live
-   `--write` apply is wired but gated and unrun; the DNS SOA-serial bump and reverse
-   mechanism are flagged `[needs review]` before it can be trusted.
+3. 🚧 **Writes** — an allocation **planner** with a `--dry-run` diff: NetBox create +
+   forward `A` + reverse `PTR`, refusing any non-free target, each action **routed to
+   its own server** (see [docs/dns-estate.md](docs/dns-estate.md)). The forward edit is
+   *matured and proven*: correct per-scheme SOA-serial bump, `named-checkzone` on a
+   copy before swap-in, backup + `rndc reload`. The reverse (on ntserver1) is modelled
+   but gated until its zone file is confirmed. Apply is behind `--write` and skips
+   review-gated steps.
 4. **Node-graph DNS** — the long vision in [docs/vision.md](docs/vision.md): DNS as a
    mullion node graph, live **bitstream** wires, and eventually the switch/router
    fabric (with the AAA/security that must gate it).

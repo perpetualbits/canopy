@@ -5,13 +5,16 @@
 //! A [`Plan`] is built from an [`Allocation`] (an address + the name it should get)
 //! and, when we have live data, the current reconciled state — which lets the plan
 //! **refuse to touch an address that isn't free**. Each [`Action`] carries the exact
-//! remote command it would run, so `--dry-run` shows precisely what `--write` will do.
+//! remote command it would run *and the host to run it on*, because the estate is
+//! multi-server (NetBox + forward DNS via dns1, reverse DNS on ntserver1).
 //!
-//! Nothing here executes anything; [`Plan::apply`] is the only thing that runs, and
-//! only the binary, behind `--write`, ever calls it.
+//! Nothing here mutates anything until [`Plan::apply`] is called — and that only
+//! happens from the binary, behind `--write`, and it skips any step still flagged
+//! for review.
 
 use std::net::Ipv4Addr;
 
+use crate::dns::{reverse_ptr, DnsName, Record, Zone};
 use crate::reconcile::{AddressRow, AddressStatus};
 use crate::sources::Vantage;
 
@@ -26,26 +29,14 @@ pub struct Allocation {
     pub fqdn: String,
 }
 
-impl Allocation {
-    /// Split the FQDN into its owner label and zone, e.g.
-    /// `"dop370-ipmi.nfra.nl"` → `("dop370-ipmi", "nfra.nl")`.
-    ///
-    /// The owner is everything before the first dot; the zone is the rest. That
-    /// matches how a flat zone file like `db.nfra.nl` names its records.
-    #[must_use]
-    pub fn owner_and_zone(&self) -> (&str, &str) {
-        self.fqdn.split_once('.').unwrap_or((self.fqdn.as_str(), ""))
-    }
-}
-
 /// Which system an action touches — used to route it and to colour the preview.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     /// The NetBox IPAM.
     Netbox,
-    /// The forward zone on the DNS primary (`db.nfra.nl` on dns1).
+    /// A forward zone on its DNS primary.
     DnsForward,
-    /// The reverse (PTR) zone.
+    /// A reverse (PTR) zone on its DNS primary.
     DnsReverse,
 }
 
@@ -61,21 +52,23 @@ impl Target {
     }
 }
 
-/// One concrete change: what it does, the record/payload, and how to apply it.
+/// One concrete change: what it does, the record/payload, where and how to apply it.
 #[derive(Debug, Clone)]
 pub struct Action {
     /// Which system this touches.
     pub target: Target,
+    /// The SSH host to run on, or `None` to use the default vantage (NetBox).
+    pub host: Option<String>,
     /// One-line description of the change.
     pub summary: String,
     /// The record line or payload, for the human to eyeball.
     pub detail: String,
-    /// The remote command to run on the vantage host.
+    /// The remote command to run.
     pub script: String,
     /// Whether the NetBox token must be fed to `script` via stdin.
     pub needs_token: bool,
-    /// `true` when the step still needs human review before it can be trusted
-    /// (e.g. the DNS serial bump / reverse-zone mechanism we have not automated).
+    /// `true` when the step is not yet trustworthy to run automatically (e.g. a zone
+    /// whose file path we have not confirmed). Such steps are shown but never applied.
     pub review: bool,
 }
 
@@ -91,10 +84,11 @@ pub struct Plan {
 impl Plan {
     /// Build the plan for `alloc`, refusing if `current` shows the address is taken.
     ///
-    /// How: if we have reconciled rows and the target is anything but `Free`, bail —
-    /// we never overwrite an address some source already claims. Otherwise emit the
-    /// three changes (NetBox object, forward `A`, reverse `PTR`). The principle is
-    /// the reconciler's: only a `Free` address is safe to hand out.
+    /// How: if reconciled rows are supplied and the target is anything but `Free`,
+    /// bail — we never overwrite an address some source already claims. Otherwise
+    /// emit the three changes: NetBox object, forward `A` on dns1, reverse `PTR` on
+    /// ntserver1. The DNS actions use [`Zone`], so they carry the safe edit script
+    /// and the correct server.
     ///
     /// # Errors
     /// Fails if the address is not free in the supplied current state.
@@ -116,7 +110,7 @@ impl Plan {
             }
         }
 
-        let (owner, zone) = alloc.owner_and_zone();
+        let fqdn = DnsName::parse(&alloc.fqdn);
         let base = netbox_base.trim_end_matches('/');
 
         // 1) NetBox: create the IP object with its DNS name. Reversible (delete).
@@ -126,7 +120,8 @@ impl Plan {
         );
         let netbox = Action {
             target: Target::Netbox,
-            summary: format!("NetBox: create {} as {}", alloc.addr, alloc.fqdn),
+            host: None, // runs on the default vantage
+            summary: format!("create {} as {}", alloc.addr, alloc.fqdn),
             detail: payload.clone(),
             script: format!(
                 "read TOK; curl -sS --max-time 25 -H \"Authorization: Token $TOK\" \
@@ -136,26 +131,31 @@ impl Plan {
             review: false,
         };
 
-        // 2) Forward A record in db.nfra.nl (static, inline-signed → file edit + reload).
-        let record = format!("{owner}\tIN\tA\t{}", alloc.addr);
+        // 2) Forward A record on dns1 — matured safe edit (validate a copy, then swap).
+        let fzone = Zone::nfra_forward();
+        let a_rec = Record::a(fqdn.clone(), alloc.addr);
         let forward = Action {
             target: Target::DnsForward,
-            summary: format!("DNS {zone}: add A record for {owner}"),
-            detail: record.clone(),
-            script: forward_script(zone, &record),
+            host: Some(fzone.server.clone()),
+            summary: format!("add A {} -> {} in {}", fqdn, alloc.addr, fzone.origin),
+            detail: a_rec.zone_line(&fzone.origin),
+            script: fzone.add_record_script(&a_rec),
             needs_token: false,
-            review: true, // SOA serial bump + reload is the sensitive part
+            review: !fzone.is_editable(),
         };
 
-        // 3) Reverse PTR. On this estate PTRs are generated from NetBox (gen_ptr.py),
-        // so the reverse follows step 1 — but the exact mechanism must be confirmed.
+        // 3) Reverse PTR on ntserver1 — same safe edit, but the zone file path there
+        // is still TBD, so this is shown and gated (review) until confirmed.
+        let rzone = Zone::reverse_10();
+        let ptr_rec = Record::ptr(reverse_ptr(alloc.addr), &fqdn);
         let reverse = Action {
             target: Target::DnsReverse,
-            summary: format!("DNS reverse: PTR {} -> {}", alloc.addr, alloc.fqdn),
-            detail: format!("{} IN PTR {}", reverse_name(alloc.addr), alloc.fqdn),
-            script: "sudo -n /root/bin/gen_ptr.py 2>/dev/null || true".to_string(),
+            host: Some(rzone.server.clone()),
+            summary: format!("add PTR {} -> {} in {}", alloc.addr, alloc.fqdn, rzone.origin),
+            detail: ptr_rec.to_string(),
+            script: rzone.add_record_script(&ptr_rec),
             needs_token: false,
-            review: true, // confirm gen_ptr.py covers IPv4 + the right reverse zone
+            review: !rzone.is_editable(),
         };
 
         Ok(Plan { alloc, actions: vec![netbox, forward, reverse] })
@@ -166,24 +166,31 @@ impl Plan {
     pub fn preview(&self) -> String {
         let mut s = format!("Plan: allocate {} as {}\n", self.alloc.addr, self.alloc.fqdn);
         for (i, a) in self.actions.iter().enumerate() {
-            let flag = if a.review { "  [needs review]" } else { "" };
-            s.push_str(&format!("\n{}. [{}] {}{}\n", i + 1, a.target.label(), a.summary, flag));
-            s.push_str(&format!("     {}\n", a.detail));
-            s.push_str(&format!("     $ {}\n", a.script));
+            let at = a.host.as_deref().map(|h| format!(" @{h}")).unwrap_or_default();
+            let flag = if a.review { "  [needs review — will NOT auto-apply]" } else { "" };
+            s.push_str(&format!("\n{}. [{}{}] {}{}\n", i + 1, a.target.label(), at, a.summary, flag));
+            s.push_str(&format!("     record: {}\n", a.detail));
+            s.push_str(&format!("     $ {}\n", first_line(&a.script)));
         }
         s
     }
 
-    /// Apply every action on `vantage` (dns1), feeding `token` to those that need it.
+    /// Apply every non-review action, each on its own host, feeding `token` to those
+    /// that need it. Review-flagged actions are reported and skipped.
     ///
     /// The caller must have decided writes are allowed (`--write` and not
-    /// `--dry-run`); this method does not re-check. Runs actions in order and stops
-    /// on the first failure.
+    /// `--dry-run`); this runs actions in order and stops on the first failure.
     ///
     /// # Errors
     /// Propagates the first failing remote command.
-    pub fn apply(&self, vantage: &Vantage, token: &str) -> anyhow::Result<()> {
+    pub fn apply(&self, default_vantage: &Vantage, token: &str) -> anyhow::Result<()> {
         for a in &self.actions {
+            if a.review {
+                println!("[skip: needs review] {} ({})", a.summary, a.target.label());
+                continue;
+            }
+            let host = a.host.clone().unwrap_or_else(|| default_vantage.host.clone());
+            let vantage = Vantage::new(host);
             let out = if a.needs_token {
                 vantage.run_with_stdin(&a.script, &format!("{token}\n"))?
             } else {
@@ -195,60 +202,47 @@ impl Plan {
     }
 }
 
-/// The `$ORIGIN`-relative reverse name for an address, e.g. `10.87.3.69` →
-/// `69.3.87.10.in-addr.arpa`.
-fn reverse_name(addr: Ipv4Addr) -> String {
-    let o = addr.octets();
-    format!("{}.{}.{}.{}.in-addr.arpa", o[3], o[2], o[1], o[0])
-}
-
-/// The forward-zone edit script: back up the file, append the record, validate the
-/// zone, and reload. The SOA serial bump is intentionally left to review (see the
-/// action's `review` flag) — getting it wrong breaks secondaries and DNSSEC.
-fn forward_script(zone: &str, record: &str) -> String {
-    let file = "/etc/bind/master/db.nfra.nl";
-    format!(
-        "set -e; f={file}; sudo -n cp -a \"$f\" \"$f.netpush-bak\"; \
-         printf '%s\\n' '{record}' | sudo -n tee -a \"$f\" >/dev/null; \
-         sudo -n named-checkzone {zone} \"$f\" && sudo -n rndc reload {zone}"
-    )
+/// The first line of a (possibly multi-line) script, for a compact preview.
+fn first_line(script: &str) -> &str {
+    script.lines().next().unwrap_or(script)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reconcile::{Cidr, NetBoxRecord, AddressFacts, reconcile};
+    use crate::reconcile::{reconcile, AddressFacts, Cidr, NetBoxRecord};
 
     fn alloc() -> Allocation {
         Allocation { addr: "10.87.3.69".parse().unwrap(), prefix_len: 20, fqdn: "dop370-ipmi.nfra.nl".into() }
     }
 
     #[test]
-    fn owner_and_zone_split() {
-        assert_eq!(alloc().owner_and_zone(), ("dop370-ipmi", "nfra.nl"));
-    }
-
-    #[test]
-    fn reverse_name_is_correct() {
-        assert_eq!(reverse_name("10.87.3.69".parse().unwrap()), "69.3.87.10.in-addr.arpa");
-    }
-
-    #[test]
-    fn plan_has_three_actions_with_real_payloads() {
+    fn plan_has_three_routed_actions() {
         let p = Plan::for_allocation(alloc(), "https://netbox.astron.nl/", None).unwrap();
         assert_eq!(p.actions.len(), 3);
-        assert_eq!(p.actions[0].target, Target::Netbox);
-        assert!(p.actions[0].script.contains("10.87.3.69/20"));
-        assert!(p.actions[0].script.contains("\"dns_name\":\"dop370-ipmi.nfra.nl\""));
-        // no double slash from the trailing '/' in the base URL
-        assert!(p.actions[0].script.contains("netbox.astron.nl/api/ipam/ip-addresses/"));
-        assert!(p.actions[1].detail.contains("dop370-ipmi\tIN\tA\t10.87.3.69"));
-        assert!(p.actions[1].script.contains("rndc reload nfra.nl"));
+
+        // NetBox: real payload, no double slash, runs on the default vantage.
+        let nb = &p.actions[0];
+        assert_eq!(nb.target, Target::Netbox);
+        assert!(nb.host.is_none());
+        assert!(nb.script.contains("10.87.3.69/20"));
+        assert!(nb.script.contains("netbox.astron.nl/api/ipam/ip-addresses/"));
+
+        // Forward: safe edit on dns1, ready to run.
+        let fwd = &p.actions[1];
+        assert_eq!(fwd.host.as_deref(), Some("dns1.astron.nl"));
+        assert!(!fwd.review);
+        assert!(fwd.script.contains("named-checkzone"));
+        assert!(fwd.detail.contains("dop370-ipmi\tIN\tA\t10.87.3.69"));
+
+        // Reverse: on ntserver1, gated until the file path is confirmed.
+        let rev = &p.actions[2];
+        assert_eq!(rev.host.as_deref(), Some("ntserver1.nfra.nl"));
+        assert!(rev.review);
     }
 
     #[test]
     fn refuses_to_allocate_a_taken_address() {
-        // Build a current state where .69 is claimed by DNS.
         let range = Cidr::parse("10.87.3.0/24").unwrap();
         let facts = vec![AddressFacts {
             addr: "10.87.3.69".parse().unwrap(),
@@ -264,15 +258,15 @@ mod tests {
     #[test]
     fn allows_allocation_when_free() {
         let range = Cidr::parse("10.87.3.0/24").unwrap();
-        let rows = reconcile(range, &[]); // everything free
+        let rows = reconcile(range, &[]);
         assert!(Plan::for_allocation(alloc(), "https://netbox.astron.nl", Some(&rows)).is_ok());
     }
 
     #[test]
-    fn preview_mentions_review_steps() {
-        let p = Plan::for_allocation(alloc(), "https://netbox.astron.nl", None).unwrap();
-        let text = p.preview();
-        assert!(text.contains("allocate 10.87.3.69 as dop370-ipmi.nfra.nl"));
-        assert!(text.contains("[needs review]"));
+    fn preview_shows_hosts_and_review_gate() {
+        let text = Plan::for_allocation(alloc(), "https://netbox.astron.nl", None).unwrap().preview();
+        assert!(text.contains("@dns1.astron.nl"));
+        assert!(text.contains("@ntserver1.nfra.nl"));
+        assert!(text.contains("needs review"));
     }
 }
