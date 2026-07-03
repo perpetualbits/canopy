@@ -84,12 +84,19 @@ them before reconciling.
    copy before swap-in, backup + `rndc reload`. The reverse (on ntserver1) is modelled
    but gated until its zone file is confirmed. Apply is behind `--write` and skips
    review-gated steps.
-4. 🚧 **Node-graph view** — press `Tab` in the TUI to switch the table for a node
-   graph: hosts grouped under named **clusters** (`ntserver`, `netapp`, `dop`, …),
-   auto-laid-out by mullion's Sugiyama layered algorithm, with connectors and pan.
-   First cut; proper wire routing (`route`/`junction`) and the **bitstream** wires
-   come next. See the long vision in [docs/vision.md](docs/vision.md) (bitstream, the
-   switch/router fabric, and the AAA/security that must gate it).
+4. 🚧 **Interactive TUI** — `Tab` cycles three views:
+   - **Table** — reconciled addresses; `Enter` inspects a row (each source + the
+     reason for its verdict); `f` jumps to the next free; `a` allocates a free row
+     (name → plan → apply, gated by `--write`); `L` loads live data in-place.
+   - **Graph** — hosts grouped under named **clusters**, auto-laid-out by mullion's
+     Sugiyama algorithm with connectors and pan.
+   - **Tree** — walk the network as `network → cluster → host`, expand/collapse
+     groups, inspect a host.
+5. **Node graph + IP map, at scale** — the long vision in
+   [docs/vision.md](docs/vision.md): proper wire routing + **bitstream** wires, a
+   zoomable **IP map** (a square-of-squares over huge spaces), **pagination** for
+   `/8`-sized ranges and DNS, and eventually the switch/router fabric with the
+   AAA/security that must gate it.
 
 ```sh
 # preview the exact changes to give 10.87.3.69 the name dop370-ipmi.nfra.nl

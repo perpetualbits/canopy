@@ -211,7 +211,7 @@ fn alloc_overlay(buf: &mut Buffer, area: Rect, app: &App) {
 
 /// A centred panel showing the selected address's facts from each source and the
 /// reason for its verdict — the "why" behind the status.
-fn detail_overlay(buf: &mut Buffer, area: Rect, app: &App) {
+pub(crate) fn detail_overlay(buf: &mut Buffer, area: Rect, app: &App) {
     if app.rows.is_empty() || area.width < 44 || area.height < 12 {
         return;
     }

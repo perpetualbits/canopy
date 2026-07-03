@@ -3,6 +3,7 @@
 //! TUI orchestrator: application state, the event loop, key routing, and render
 //! dispatch. One screen for now — the reconciled address table.
 
+use std::collections::HashSet;
 use std::io;
 use std::net::Ipv4Addr;
 use std::sync::mpsc;
@@ -58,6 +59,20 @@ pub enum View {
     Table,
     /// The cluster node graph.
     Graph,
+    /// The expandable network → cluster → host tree.
+    Tree,
+}
+
+impl View {
+    /// The next view in the `Tab` cycle.
+    #[must_use]
+    fn next(self) -> View {
+        match self {
+            View::Table => View::Graph,
+            View::Graph => View::Tree,
+            View::Tree => View::Table,
+        }
+    }
 }
 
 /// The whole application state.
@@ -88,6 +103,10 @@ pub struct App {
     pub graph_canvas: GraphCanvas,
     /// Pan offset (canvas cells) for the graph view.
     pub pan: (u16, u16),
+    /// Selected visible row in the tree view.
+    pub tree_cur: usize,
+    /// Group keys currently expanded in the tree view.
+    pub tree_expanded: HashSet<String>,
 
     /// Connection settings, used to gather live data on demand.
     pub cfg: Config,
@@ -132,6 +151,8 @@ impl App {
             graph,
             graph_canvas,
             pan: (0, 0),
+            tree_cur: 0,
+            tree_expanded: HashSet::new(),
             cfg,
             loading: false,
             applying: false,
@@ -347,10 +368,7 @@ impl App {
         }
         match code {
             KeyCode::Tab => {
-                self.view = match self.view {
-                    View::Table => View::Graph,
-                    View::Graph => View::Table,
-                };
+                self.view = self.view.next();
                 return;
             }
             KeyCode::Char('L') => {
@@ -362,6 +380,61 @@ impl App {
         match self.view {
             View::Table => self.on_key_table(code),
             View::Graph => self.on_key_graph(code),
+            View::Tree => self.on_key_tree(code),
+        }
+    }
+
+    /// Keys for the tree view: move, expand/collapse a group, inspect a host.
+    fn on_key_tree(&mut self, code: KeyCode) {
+        let rows = super::tree::rows(self);
+        if rows.is_empty() {
+            return;
+        }
+        self.tree_cur = self.tree_cur.min(rows.len() - 1);
+        let row = &rows[self.tree_cur];
+        match code {
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Esc => {
+                if self.detail {
+                    self.detail = false;
+                } else {
+                    self.quit = true;
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.tree_cur + 1 < rows.len() {
+                    self.tree_cur += 1;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.tree_cur = self.tree_cur.saturating_sub(1);
+            }
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+                if row.is_group {
+                    if let Some(k) = &row.key {
+                        if !self.tree_expanded.insert(k.clone()) {
+                            self.tree_expanded.remove(k); // toggle: was present → collapse
+                        }
+                    }
+                } else if let Some(addr) = row.addr {
+                    self.inspect_addr(addr);
+                }
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                // Collapse the group this row belongs to (its own, or its parent).
+                if let Some(k) = row.key.clone() {
+                    self.tree_expanded.remove(&k);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Open the inspect panel for `addr` by pointing the table cursor at its row.
+    fn inspect_addr(&mut self, addr: Ipv4Addr) {
+        if let Some(i) = self.rows.iter().position(|r| r.addr == addr) {
+            self.cur.cursor = i;
+            self.detail = true;
         }
     }
 
@@ -445,6 +518,7 @@ fn main_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -
         term.draw(|buf| match app.view {
             View::Table => draw::screen(buf, app),
             View::Graph => super::graph::screen(buf, app),
+            View::Tree => super::tree::screen(buf, app),
         })?;
         if let Some(Event::Key(KeyEvent { code, .. })) = reader.recv_timeout(RENDER_TICK) {
             app.on_key(code);
@@ -492,7 +566,8 @@ mod tests {
             app.on_key(KeyCode::Right); // pan around while rendering
             app.on_key(KeyCode::Down);
         }
-        app.on_key(KeyCode::Tab); // back to the table
+        app.on_key(KeyCode::Tab); // Graph → Tree
+        app.on_key(KeyCode::Tab); // Tree → Table
         assert_eq!(app.view, View::Table);
     }
 
@@ -559,11 +634,51 @@ mod tests {
     }
 
 
+
     #[test]
     fn next_free_lands_on_a_free_address() {
         let (range, facts) = fixture::demo();
         let mut app = App::new(range, facts, false, false, false, Config::default());
         app.jump_next_free();
         assert!(app.rows[app.cur.cursor].status.is_free());
+    }
+
+    #[test]
+    fn tree_expands_collapses_and_inspects() {
+        let (range, facts) = fixture::demo();
+        let mut app = App::new(range, facts, false, false, false, Config::default());
+        app.view = View::Tree;
+
+        let collapsed = crate::tui::tree::rows(&app).len();
+        // Groups are alphabetical after the root: (free), (unregistered), dop, …
+        app.tree_cur = 3; // the "dop" group row
+        app.on_key(KeyCode::Enter); // expand
+        assert!(app.tree_expanded.contains("dop"));
+        assert_eq!(crate::tui::tree::rows(&app).len(), collapsed + 2); // dop has 2 hosts
+
+        // Enter on a host opens the inspect panel for that address.
+        app.tree_cur = 4; // first dop host (10.87.3.68)
+        app.on_key(KeyCode::Enter);
+        assert!(app.detail);
+        assert_eq!(app.rows[app.cur.cursor].addr, "10.87.3.68".parse::<Ipv4Addr>().unwrap());
+
+        // Left collapses the group the cursor sits in.
+        app.detail = false;
+        app.tree_cur = 3;
+        app.on_key(KeyCode::Left);
+        assert!(!app.tree_expanded.contains("dop"));
+    }
+
+    #[test]
+    fn tab_cycles_all_three_views() {
+        let (range, facts) = fixture::demo();
+        let mut app = App::new(range, facts, false, false, false, Config::default());
+        assert_eq!(app.view, View::Table);
+        app.on_key(KeyCode::Tab);
+        assert_eq!(app.view, View::Graph);
+        app.on_key(KeyCode::Tab);
+        assert_eq!(app.view, View::Tree);
+        app.on_key(KeyCode::Tab);
+        assert_eq!(app.view, View::Table);
     }
 }

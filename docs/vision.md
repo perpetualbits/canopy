@@ -87,6 +87,33 @@ credentials, explicit apply-mode gating, and a full audit trail. The read-only-b
 default, `--dry-run`, diff-before-apply discipline from the DNS side is the seed —
 the fabric side must be stricter still.
 
+## Pagination (needed for scale)
+
+netpush must paginate. A `/24` fits on screen, but `10.0.0.0/8` is 16,777,216
+addresses; DNS zones and other listings grow unbounded too. Every data path —
+reconcile, the table, the tree, the graph — needs **windowed, lazy, paginated** data
+and must never materialise a whole `/8` (or a giant zone) at once. This underpins all
+the large-scale views below.
+
+## The IP map — a zoomable square-of-squares
+
+Render an address space as a big grid of **little squares** (the same primitive as a
+bitstream / mullion's `spiral_stress` demo): a **filled** square = used space, an
+**outline** = free.
+
+You can't draw 16M cells, so each cell **aggregates a block**. A `32×32` grid over a
+`/8` is 1024 cells, each standing for **16,384 addresses** (a `/18`); fill vs outline
+(or a shade in between) shows how used each block is. At the finest zoom one cell = one
+address, and it *is* a bitstream.
+
+- **Zoom:** select a cell and zoom in; a few steps take you `/8` → blocks → a subnet
+  small enough to resolve into individual IPs (which the table/tree already do).
+- **Axis legends need thought** (likely a discussion): what do the x/y axes label at
+  each zoom level — nibble/byte boundaries, the CIDR of the visible window, or the
+  block each cell covers? The legend must stay meaningful as you zoom *and* let you map
+  a screen position back to an address range unambiguously. This is the open design
+  question before building it.
+
 ## Why this order
 
 We earn the graph by first getting the boring plumbing right (live sources → reconcile
