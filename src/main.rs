@@ -9,6 +9,7 @@
 
 mod dns;
 mod fixture;
+mod graph;
 mod plan;
 mod reconcile;
 mod sources;

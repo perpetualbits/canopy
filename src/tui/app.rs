@@ -7,15 +7,25 @@ use std::io;
 use std::time::Duration;
 
 use crossterm::event::{Event, KeyEvent};
-use mullion::{backend::CrosstermBackend, style::Style, EventReader, KeyCode, Terminal};
+use mullion::{backend::CrosstermBackend, style::Style, EventReader, GraphCanvas, KeyCode, Terminal};
 
 use super::draw;
 use super::focus::ListCursor;
 use super::theme::{s_dim, s_err, s_warn};
+use crate::graph::DnsGraph;
 use crate::reconcile::{self, AddressFacts, AddressRow, Cidr, Counts};
 
 /// Idle redraw cap (~20 fps) so the UI stays responsive without busy-looping.
 const RENDER_TICK: Duration = Duration::from_millis(50);
+
+/// Which screen is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    /// The reconciled address table.
+    Table,
+    /// The cluster node graph.
+    Graph,
+}
 
 /// The whole application state.
 pub struct App {
@@ -30,6 +40,15 @@ pub struct App {
     /// Body height measured at the last render — used for PageUp/PageDown.
     pub page: usize,
 
+    /// Which screen is showing.
+    pub view: View,
+    /// The cluster graph built from `rows`.
+    pub graph: DnsGraph,
+    /// The laid-out canvas for the graph view.
+    pub graph_canvas: GraphCanvas,
+    /// Pan offset (canvas cells) for the graph view.
+    pub pan: (u16, u16),
+
     write_mode: bool,
     dry_run: bool,
     quit: bool,
@@ -41,12 +60,18 @@ impl App {
     pub fn new(range: Cidr, facts: Vec<AddressFacts>, write_mode: bool, dry_run: bool) -> Self {
         let rows = reconcile::reconcile(range, &facts);
         let counts = reconcile::counts(&rows);
+        let graph = DnsGraph::from_rows(&rows);
+        let graph_canvas = graph.layout();
         App {
             range,
             rows,
             counts,
             cur: ListCursor::new(),
             page: 10,
+            view: View::Table,
+            graph,
+            graph_canvas,
+            pan: (0, 0),
             write_mode,
             dry_run,
             quit: false,
@@ -65,8 +90,23 @@ impl App {
         }
     }
 
-    /// Route one key press.
+    /// Route one key press, first handling the global view toggle.
     pub fn on_key(&mut self, code: KeyCode) {
+        if code == KeyCode::Tab {
+            self.view = match self.view {
+                View::Table => View::Graph,
+                View::Graph => View::Table,
+            };
+            return;
+        }
+        match self.view {
+            View::Table => self.on_key_table(code),
+            View::Graph => self.on_key_graph(code),
+        }
+    }
+
+    /// Keys for the table view: list navigation.
+    fn on_key_table(&mut self, code: KeyCode) {
         let len = self.rows.len();
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
@@ -77,6 +117,21 @@ impl App {
             KeyCode::PageUp => self.cur.page(-(self.page as isize), len),
             KeyCode::PageDown => self.cur.page(self.page as isize, len),
             KeyCode::Char('f') => self.jump_next_free(),
+            _ => {}
+        }
+    }
+
+    /// Keys for the graph view: pan the window across the canvas.
+    fn on_key_graph(&mut self, code: KeyCode) {
+        let (cw, ch) = self.graph_canvas.size();
+        const STEP: u16 = 4;
+        match code {
+            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Left | KeyCode::Char('h') => self.pan.0 = self.pan.0.saturating_sub(STEP),
+            KeyCode::Right | KeyCode::Char('l') => self.pan.0 = (self.pan.0 + STEP).min(cw.saturating_sub(1)),
+            KeyCode::Up | KeyCode::Char('k') => self.pan.1 = self.pan.1.saturating_sub(STEP),
+            KeyCode::Down | KeyCode::Char('j') => self.pan.1 = (self.pan.1 + STEP).min(ch.saturating_sub(1)),
+            KeyCode::Char('g') | KeyCode::Home => self.pan = (0, 0),
             _ => {}
         }
     }
@@ -115,7 +170,10 @@ pub fn run(range: Cidr, facts: Vec<AddressFacts>, write_mode: bool, dry_run: boo
 fn main_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> anyhow::Result<()> {
     let reader = EventReader::new();
     while !app.quit {
-        term.draw(|buf| draw::screen(buf, app))?;
+        term.draw(|buf| match app.view {
+            View::Table => draw::screen(buf, app),
+            View::Graph => super::graph::screen(buf, app),
+        })?;
         if let Some(Event::Key(KeyEvent { code, .. })) = reader.recv_timeout(RENDER_TICK) {
             app.on_key(code);
         }
@@ -147,6 +205,23 @@ mod tests {
             let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
             draw::screen(&mut buf, &mut app);
         }
+    }
+
+    #[test]
+    fn graph_view_renders_and_pans_without_panicking() {
+        let (range, facts) = fixture::demo();
+        let mut app = App::new(range, facts, false, false);
+        app.on_key(KeyCode::Tab); // switch to the graph view
+        assert_eq!(app.view, View::Graph);
+        assert!(app.graph.cluster_count() > 0);
+        for (w, h) in [(120u16, 50u16), (80, 24), (40, 10), (24, 6)] {
+            let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
+            crate::tui::graph::screen(&mut buf, &mut app);
+            app.on_key(KeyCode::Right); // pan around while rendering
+            app.on_key(KeyCode::Down);
+        }
+        app.on_key(KeyCode::Tab); // back to the table
+        assert_eq!(app.view, View::Table);
     }
 
     #[test]

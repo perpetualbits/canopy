@@ -7,6 +7,7 @@
 pub mod app;
 pub mod draw;
 pub mod focus;
+pub mod graph;
 pub mod theme;
 
 pub use app::run;

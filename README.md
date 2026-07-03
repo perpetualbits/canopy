@@ -71,9 +71,12 @@ them before reconciling.
    copy before swap-in, backup + `rndc reload`. The reverse (on ntserver1) is modelled
    but gated until its zone file is confirmed. Apply is behind `--write` and skips
    review-gated steps.
-4. **Node-graph DNS** — the long vision in [docs/vision.md](docs/vision.md): DNS as a
-   mullion node graph, live **bitstream** wires, and eventually the switch/router
-   fabric (with the AAA/security that must gate it).
+4. 🚧 **Node-graph view** — press `Tab` in the TUI to switch the table for a node
+   graph: hosts grouped under named **clusters** (`ntserver`, `netapp`, `dop`, …),
+   auto-laid-out by mullion's Sugiyama layered algorithm, with connectors and pan.
+   First cut; proper wire routing (`route`/`junction`) and the **bitstream** wires
+   come next. See the long vision in [docs/vision.md](docs/vision.md) (bitstream, the
+   switch/router fabric, and the AAA/security that must gate it).
 
 ```sh
 # preview the exact changes to give 10.87.3.69 the name dop370-ipmi.nfra.nl
