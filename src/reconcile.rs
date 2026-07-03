@@ -266,6 +266,32 @@ impl Cidr {
         u32::from(ip) & self.mask() == u32::from(self.base) & self.mask()
     }
 
+    /// The total number of addresses in the block — `2^(32−prefix)`, a clean power of
+    /// two (network and broadcast included). This is the **map's** addressing space:
+    /// unlike the usable-host count it tiles evenly into CIDR quadrants, which the
+    /// space-filling map layout needs.
+    #[must_use]
+    pub fn block_len(self) -> u64 {
+        1u64 << (32 - u32::from(self.prefix_len))
+    }
+
+    /// The offset of `addr` within the block (`addr − network`), or `None` if `addr`
+    /// is outside the block.
+    #[must_use]
+    pub fn offset_of(self, addr: Ipv4Addr) -> Option<u64> {
+        let net = u32::from(self.base) & self.mask();
+        self.contains(addr).then(|| u64::from(u32::from(addr) - net))
+    }
+
+    /// The address at `offset` within the block (`network + offset`), clamped to the
+    /// last address of the block.
+    #[must_use]
+    pub fn address_at_offset(self, offset: u64) -> Ipv4Addr {
+        let net = u64::from(u32::from(self.base) & self.mask());
+        let last = net | u64::from(!self.mask());
+        Ipv4Addr::from((net + offset).min(last) as u32)
+    }
+
     /// The inclusive `(first, last)` usable-host address bounds, as `u32`.
     ///
     /// For `/1`–`/30` the network and broadcast addresses are skipped; `/31` uses

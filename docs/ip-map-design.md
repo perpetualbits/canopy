@@ -1,13 +1,20 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <!-- Copyright (C) 2026  Epsilon Null Operation -->
 
-# IP map — layout & legend design (decision pending)
+# IP map — layout & legend design
 
-The first cut (committed) renders the range as a `cols×rows` grid of shaded blocks
-(`·` free, `░▒▓█` used), aggregated from the bounded facts in `O(facts)`. It works,
-but the **layout** is the real design question, because it decides both what the
-legend/axes can say *and* how cleanly "zoom into a region" lands on a subnet — which
-is the stated next step ("in a few steps you arrive at subnets you CAN resolve").
+**Decided: Hilbert curve, with cell-cursor zoom (shipped).** The map lays the range on
+a Hilbert curve as a `2^order × 2^order` grid of shaded blocks (`·` free, `░▒▓█` used),
+aggregated from the bounded facts in `O(facts)`. A highlighted cursor moves over the
+grid (`hjkl`/arrows); `Enter` zooms into the cell under it — always a clean
+`/(prefix + 2·order)` subnet — and `Backspace`/`-` zooms back out. A few steps take a
+`/8` down to a `/24` the table and tree resolve to individual addresses. The sections
+below record the reasoning that led here.
+
+The first cut rendered the range as a raster `cols×rows` grid — it worked, but the
+**layout** was the real design question, because it decides both what the legend/axes
+can say *and* how cleanly "zoom into a region" lands on a subnet ("in a few steps you
+arrive at subnets you CAN resolve").
 
 ## The tension
 
@@ -59,11 +66,11 @@ each cell is a real `/k`. Zoom targets a *cell* (clean `/k`), not an arbitrary
 rectangle. Legend: "each cell = `/k`", plus the address span. Much less code than
 Hilbert; loses only whole-rectangle zoom.
 
-## Open sub-questions for the discussion
+## Open sub-questions
 
-1. Layout: Hilbert vs block-aligned raster vs keep raster (the table above).
+1. ~~Layout: Hilbert vs block-aligned raster vs keep raster.~~ **Decided: Hilbert.**
 2. Shade vs colour for density — the current `░▒▓█` in one accent colour is neutral;
    a green→red heat would read "fuller = hotter" (no free space). Which reading do we
-   want?
-3. Cell aspect: cells are 2 terminal columns wide now (squarer); revisit under Hilbert
-   where square-ness matters for the quadrant structure.
+   want? **Still open.**
+3. ~~Cell aspect.~~ Cells are 2 terminal columns wide (squarer), which keeps the
+   Hilbert quadrant structure readable. **Settled.**

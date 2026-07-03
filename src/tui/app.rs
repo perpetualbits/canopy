@@ -38,6 +38,12 @@ pub enum AllocPhase {
     Preview,
 }
 
+/// A saved map scope for zoom-out: a range and the facts within it.
+struct ZoomFrame {
+    range: Cidr,
+    facts: Rc<HashMap<Ipv4Addr, AddressFacts>>,
+}
+
 /// The in-progress "allocate this address" flow.
 pub struct AllocFlow {
     /// The address being allocated.
@@ -113,6 +119,13 @@ pub struct App {
     pub tree_cur: usize,
     /// Group keys currently expanded in the tree view.
     pub tree_expanded: HashSet<String>,
+    /// Cursor cell `(x, y)` on the Hilbert map grid.
+    pub map_cur: (u32, u32),
+    /// The map grid order measured at the last map render — used to clamp the cursor
+    /// and to compute which subnet a cell covers (the render owns the fit).
+    pub map_order: u32,
+    /// Parent scopes to return to on zoom-out (each a range + its facts).
+    zoom_stack: Vec<ZoomFrame>,
 
     /// Connection settings, used to gather live data on demand.
     pub cfg: Config,
@@ -161,6 +174,9 @@ impl App {
             pan: (0, 0),
             tree_cur: 0,
             tree_expanded: HashSet::new(),
+            map_cur: (0, 0),
+            map_order: 0,
+            zoom_stack: Vec::new(),
             cfg,
             loading: false,
             applying: false,
@@ -427,12 +443,88 @@ impl App {
         }
     }
 
-    /// Keys for the map view. (Pan/zoom will come with the legend design; for now
-    /// only quit — `Tab` cycles views globally.)
+    /// Keys for the map view: move the cursor over the Hilbert grid, `Enter` zooms
+    /// into the highlighted cell (a clean subnet), `Backspace`/`-` zooms back out.
     fn on_key_map(&mut self, code: KeyCode) {
-        if matches!(code, KeyCode::Char('q') | KeyCode::Esc) {
-            self.quit = true;
+        let last = (1u32 << self.map_order).saturating_sub(1);
+        match code {
+            KeyCode::Char('q') => self.quit = true,
+            // Esc zooms out if zoomed in, otherwise quits.
+            KeyCode::Esc => {
+                if self.zoom_stack.is_empty() {
+                    self.quit = true;
+                } else {
+                    self.zoom_out();
+                }
+            }
+            KeyCode::Left | KeyCode::Char('h') => self.map_cur.0 = self.map_cur.0.saturating_sub(1),
+            KeyCode::Right | KeyCode::Char('l') => self.map_cur.0 = (self.map_cur.0 + 1).min(last),
+            KeyCode::Up | KeyCode::Char('k') => self.map_cur.1 = self.map_cur.1.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => self.map_cur.1 = (self.map_cur.1 + 1).min(last),
+            KeyCode::Enter | KeyCode::Char('+') => self.zoom_into_cursor(),
+            KeyCode::Backspace | KeyCode::Char('-') => self.zoom_out(),
+            _ => {}
         }
+    }
+
+    /// How many levels the map is zoomed in — 0 at the top range. Used by the map
+    /// footer to show a breadcrumb depth.
+    #[must_use]
+    pub fn zoom_depth(&self) -> usize {
+        self.zoom_stack.len()
+    }
+
+    /// The subnet the map cursor sits over — the block that cell covers, a
+    /// `/(prefix + 2·order)` CIDR. `None` when the grid is a single cell (order 0),
+    /// i.e. nothing finer to zoom into.
+    #[must_use]
+    pub fn cursor_subnet(&self) -> Option<Cidr> {
+        if self.map_order == 0 {
+            return None;
+        }
+        let d = crate::map::hilbert_xy2d(self.map_order, self.map_cur.0, self.map_cur.1);
+        Some(crate::map::block_cidr(self.range, self.map_order, d))
+    }
+
+    /// Zoom into the cell under the cursor, if there is a finer subnet.
+    fn zoom_into_cursor(&mut self) {
+        if let Some(sub) = self.cursor_subnet() {
+            self.zoom_stack.push(ZoomFrame { range: self.range, facts: Rc::clone(&self.facts) });
+            let sub_facts: HashMap<Ipv4Addr, AddressFacts> = self
+                .facts
+                .iter()
+                .filter(|(a, _)| sub.contains(**a))
+                .map(|(a, f)| (*a, f.clone()))
+                .collect();
+            self.set_scope(sub, Rc::new(sub_facts));
+            self.status = Some((format!("zoomed into {}/{}", sub.base, sub.prefix_len), false));
+        }
+    }
+
+    /// Return to the parent scope (a no-op at the top).
+    fn zoom_out(&mut self) {
+        if let Some(f) = self.zoom_stack.pop() {
+            self.set_scope(f.range, f.facts);
+            self.status = Some((format!("zoomed out to {}/{}", self.range.base, self.range.prefix_len), false));
+        }
+    }
+
+    /// Point the whole app at `range` with `facts` (already narrowed to it), rebuilding
+    /// every derived view. Used by both zoom directions so all four views stay in sync.
+    fn set_scope(&mut self, range: Cidr, facts: Rc<HashMap<Ipv4Addr, AddressFacts>>) {
+        self.range = range;
+        self.total = range.host_count() as usize;
+        self.counts = reconcile::counts_from_facts(self.total as u64, &facts);
+        let (graph, canvas) = build_graph(&facts);
+        self.graph = graph;
+        self.graph_canvas = canvas;
+        self.facts = facts;
+        self.cur = ListCursor::new();
+        self.tree_cur = 0;
+        self.tree_expanded.clear();
+        self.pan = (0, 0);
+        self.map_cur = (0, 0);
+        self.detail = false;
     }
 
     /// Keys for the tree view: move, expand/collapse a group, inspect a host.
@@ -749,6 +841,69 @@ mod tests {
         assert_eq!(app.view, View::Table);
     }
 
+
+    #[test]
+    fn map_zoom_narrows_scope_and_zoom_out_restores_it() {
+        // A /8 with one host outside the top-left cell; render sets the grid order,
+        // then Enter zooms into the cursor cell and everything narrows to that subnet.
+        let range = Cidr::parse("10.0.0.0/8").unwrap();
+        let facts = vec![AddressFacts {
+            addr: "10.1.0.5".parse().unwrap(),
+            netbox: None,
+            ptr: Some("thing.nfra.nl.".into()),
+            live: false,
+        }];
+        let mut app = App::new(range, facts, false, false, false, Config::default());
+        app.view = View::Map;
+        // Render once so map_order is set from the fitted grid.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 50));
+        crate::tui::map::screen(&mut buf, &mut app);
+        assert!(app.map_order > 0);
+        let parent_total = app.total;
+
+        // Move the cursor onto the cell that actually holds the host, then zoom in.
+        let host: Ipv4Addr = "10.1.0.5".parse().unwrap();
+        let off = range.offset_of(host).unwrap();
+        let block = range.block_len() >> (2 * app.map_order);
+        app.map_cur = crate::map::hilbert_d2xy(app.map_order, off / block);
+        let target = app.cursor_subnet().unwrap();
+        assert!(target.contains(host));
+        app.on_key(KeyCode::Enter);
+        assert_eq!(app.range, target);
+        assert_eq!(app.zoom_depth(), 1);
+        assert!(app.total < parent_total);
+        // The one host survived the narrowing (it lies inside the zoomed subnet).
+        assert_eq!(app.counts.dns_only, 1);
+        assert_eq!(app.map_cur, (0, 0)); // cursor reset on scope change
+
+        // Zoom back out restores the /8 and its full facts.
+        app.on_key(KeyCode::Backspace);
+        assert_eq!(app.range, range);
+        assert_eq!(app.total, parent_total);
+        assert_eq!(app.zoom_depth(), 0);
+    }
+
+    #[test]
+    fn map_cursor_clamps_to_the_grid() {
+        let range = Cidr::parse("10.87.3.0/24").unwrap();
+        let mut app = App::new(range, Vec::new(), false, false, false, Config::default());
+        app.view = View::Map;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 50));
+        crate::tui::map::screen(&mut buf, &mut app);
+        let last = (1u32 << app.map_order) - 1;
+        // Hammer right/down past the edge — the cursor must stay in-bounds.
+        for _ in 0..64 {
+            app.on_key(KeyCode::Right);
+            app.on_key(KeyCode::Down);
+        }
+        assert_eq!(app.map_cur, (last, last));
+        // And back the other way, never below zero.
+        for _ in 0..64 {
+            app.on_key(KeyCode::Left);
+            app.on_key(KeyCode::Up);
+        }
+        assert_eq!(app.map_cur, (0, 0));
+    }
 
     #[test]
     fn a_slash_8_is_lazy_and_paginates() {
