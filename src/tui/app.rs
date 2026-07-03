@@ -4,6 +4,7 @@
 //! dispatch. One screen for now — the reconciled address table.
 
 use std::io;
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use crossterm::event::{Event, KeyEvent};
@@ -33,12 +34,19 @@ pub struct App {
     pub range: Cidr,
     /// The reconciled rows, one per host address, in address order.
     pub rows: Vec<AddressRow>,
+    /// The raw per-address facts behind the rows — kept so the inspect panel can
+    /// show *why* an address is classified the way it is.
+    pub facts: Vec<AddressFacts>,
     /// Cached status tally for the header.
     pub counts: Counts,
+    /// Whether `facts` came from the live sources (`true`) or the demo fixture.
+    pub live: bool,
     /// The list cursor (selection + scroll offset).
     pub cur: ListCursor,
     /// Body height measured at the last render — used for PageUp/PageDown.
     pub page: usize,
+    /// Whether the inspect panel for the selected row is open.
+    pub detail: bool,
 
     /// Which screen is showing.
     pub view: View,
@@ -55,9 +63,10 @@ pub struct App {
 }
 
 impl App {
-    /// Build the app by reconciling `facts` over `range`.
+    /// Build the app by reconciling `facts` over `range`. `live` records whether the
+    /// facts are real (from the sources) or the demo fixture.
     #[must_use]
-    pub fn new(range: Cidr, facts: Vec<AddressFacts>, write_mode: bool, dry_run: bool) -> Self {
+    pub fn new(range: Cidr, facts: Vec<AddressFacts>, write_mode: bool, dry_run: bool, live: bool) -> Self {
         let rows = reconcile::reconcile(range, &facts);
         let counts = reconcile::counts(&rows);
         let graph = DnsGraph::from_rows(&rows);
@@ -65,9 +74,12 @@ impl App {
         App {
             range,
             rows,
+            facts,
             counts,
+            live,
             cur: ListCursor::new(),
             page: 10,
+            detail: false,
             view: View::Table,
             graph,
             graph_canvas,
@@ -76,6 +88,12 @@ impl App {
             dry_run,
             quit: false,
         }
+    }
+
+    /// The raw facts for `addr`, if any source reported it (free addresses have none).
+    #[must_use]
+    pub fn facts_for(&self, addr: Ipv4Addr) -> Option<&AddressFacts> {
+        self.facts.iter().find(|f| f.addr == addr)
     }
 
     /// The mode badge shown top-right: colourful because write mode is dangerous.
@@ -105,11 +123,20 @@ impl App {
         }
     }
 
-    /// Keys for the table view: list navigation.
+    /// Keys for the table view: list navigation and the inspect panel.
     fn on_key_table(&mut self, code: KeyCode) {
         let len = self.rows.len();
         match code {
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('q') => self.quit = true,
+            // Esc closes the inspect panel if open, otherwise quits.
+            KeyCode::Esc => {
+                if self.detail {
+                    self.detail = false;
+                } else {
+                    self.quit = true;
+                }
+            }
+            KeyCode::Enter => self.detail = !self.detail,
             KeyCode::Char('j') | KeyCode::Down => self.cur.down(len),
             KeyCode::Char('k') | KeyCode::Up => self.cur.up(),
             KeyCode::Char('g') | KeyCode::Home => self.cur.reset(),
@@ -157,8 +184,8 @@ impl App {
 ///
 /// # Errors
 /// Propagates terminal setup / draw errors.
-pub fn run(range: Cidr, facts: Vec<AddressFacts>, write_mode: bool, dry_run: bool) -> anyhow::Result<()> {
-    let mut app = App::new(range, facts, write_mode, dry_run);
+pub fn run(range: Cidr, facts: Vec<AddressFacts>, write_mode: bool, dry_run: bool, live: bool) -> anyhow::Result<()> {
+    let mut app = App::new(range, facts, write_mode, dry_run, live);
     let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     term.enter()?;
     let result = main_loop(&mut term, &mut app);
@@ -190,7 +217,7 @@ mod tests {
     #[test]
     fn fixture_reconciles_to_expected_statuses() {
         let (range, facts) = fixture::demo();
-        let app = App::new(range, facts, false, false);
+        let app = App::new(range, facts, false, false, false);
         assert!(app.counts.dns_only >= 10); // the -ipmi/-bmc/iprotect drift
         assert_eq!(app.counts.live_unregistered, 1); // the .90 squatter
         assert_eq!(app.counts.netbox_only, 5);
@@ -200,7 +227,7 @@ mod tests {
     #[test]
     fn renders_without_panicking_at_many_sizes() {
         let (range, facts) = fixture::demo();
-        let mut app = App::new(range, facts, false, false);
+        let mut app = App::new(range, facts, false, false, false);
         for (w, h) in [(120u16, 50u16), (80, 24), (40, 10), (24, 6), (20, 4)] {
             let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
             draw::screen(&mut buf, &mut app);
@@ -210,7 +237,7 @@ mod tests {
     #[test]
     fn graph_view_renders_and_pans_without_panicking() {
         let (range, facts) = fixture::demo();
-        let mut app = App::new(range, facts, false, false);
+        let mut app = App::new(range, facts, false, false, false);
         app.on_key(KeyCode::Tab); // switch to the graph view
         assert_eq!(app.view, View::Graph);
         assert!(app.graph.cluster_count() > 0);
@@ -225,9 +252,23 @@ mod tests {
     }
 
     #[test]
+    fn inspect_panel_toggles_and_renders() {
+        let (range, facts) = fixture::demo();
+        let mut app = App::new(range, facts, false, false, false);
+        assert!(!app.detail);
+        app.on_key(KeyCode::Enter);
+        assert!(app.detail); // Enter opens the inspect panel
+        app.cur.cursor = 10; // a dns-only row (10.87.3.11)
+        let mut buf = Buffer::empty(Rect::new(0, 0, 90, 22));
+        draw::screen(&mut buf, &mut app);
+        app.on_key(KeyCode::Esc);
+        assert!(!app.detail && !app.quit); // Esc closes the panel, does not quit
+    }
+
+    #[test]
     fn next_free_lands_on_a_free_address() {
         let (range, facts) = fixture::demo();
-        let mut app = App::new(range, facts, false, false);
+        let mut app = App::new(range, facts, false, false, false);
         app.jump_next_free();
         assert!(app.rows[app.cur.cursor].status.is_free());
     }

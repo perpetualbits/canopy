@@ -125,7 +125,7 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    tui::run(range, facts, args.write, args.dry_run)
+    tui::run(range, facts, args.write, args.dry_run, args.live)
 }
 
 /// Build and preview (or, with `--write`, apply) a plan to allocate one address.

@@ -3,11 +3,13 @@
 //! Buffer drawing: the reconciled-address screen and the small primitives it uses
 //! (title, count bar, rows, key-hint footer, scrollbar). Primitives mirror census.
 
+use mullion::border::{draw_box, BorderStyle, Borders, CornerStyle, LineWeight};
+use mullion::style::Color;
 use mullion::{render_keyhints, render_scrollbar, style::Style, Buffer, Rect, ScrollMetrics, TextCtx};
 
 use super::app::App;
 use super::theme::{
-    s_accent, s_dim, s_err, s_normal, s_ok, s_sel, s_title, s_warn, status_label, status_style,
+    s_accent, s_dim, s_err, s_head, s_normal, s_ok, s_sel, s_title, s_warn, status_label, status_style,
 };
 use crate::reconcile::{AddressStatus, Counts};
 
@@ -57,7 +59,12 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
 
     // ── title row ──
     let mode = app.mode_label();
-    btxt(buf, area.x, area.y, &format!("netpush — {:?}", app.range), s_title());
+    let title = format!("netpush — {}/{}", app.range.base, app.range.prefix_len);
+    btxt(buf, area.x, area.y, &title, s_title());
+    // DEMO / LIVE badge just after the title, so it's obvious which data this is.
+    let (data, data_style) = if app.live { ("LIVE", s_ok()) } else { ("DEMO", s_warn()) };
+    btxt(buf, area.x + title.chars().count() as u16 + 2, area.y, data, data_style);
+    // Mode badge at the right.
     btxt(
         buf,
         area.x + area.width.saturating_sub(mode.0.len() as u16 + 1),
@@ -109,11 +116,65 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
         area.width,
         &[
             ("j/k", "move"),
-            ("g/G", "top/bottom"),
             ("f", "next free"),
+            ("Enter", "inspect"),
+            ("Tab", "graph"),
             ("q", "quit"),
         ],
     );
+
+    // ── inspect panel (overlay) ──
+    if app.detail {
+        detail_overlay(buf, area, app);
+    }
+}
+
+/// A centred panel showing the selected address's facts from each source and the
+/// reason for its verdict — the "why" behind the status.
+fn detail_overlay(buf: &mut Buffer, area: Rect, app: &App) {
+    if app.rows.is_empty() || area.width < 44 || area.height < 12 {
+        return;
+    }
+    let row = &app.rows[app.cur.cursor.min(app.rows.len() - 1)];
+    let w = 58u16.min(area.width - 4);
+    let h = 9u16.min(area.height - 4);
+    let x = area.x + (area.width - w) / 2;
+    let y = area.y + (area.height - h) / 2;
+
+    let bgc = Color::Rgb(28, 28, 44);
+    for yy in y..y + h {
+        fill_row(buf, x, yy, w, Style::default().bg(bgc));
+    }
+    let box_style = BorderStyle { weight: LineWeight::Heavy, corners: CornerStyle::Rounded, style: s_accent() };
+    draw_box(buf, Rect::new(x, y, w, h), Borders::ALL, &box_style);
+
+    let facts = app.facts_for(row.addr);
+    let netbox = match facts.and_then(|f| f.netbox.as_ref()) {
+        Some(rec) => rec.dns_name.as_deref().unwrap_or("(reserved, no name)"),
+        None => "(not in NetBox)",
+    };
+    let ptr = facts.and_then(|f| f.ptr.as_deref()).unwrap_or("(no PTR)");
+    let live = if facts.is_some_and(|f| f.live) { "yes" } else { "no" };
+
+    let tx = x + 2;
+    btxt(buf, tx, y + 1, &row.addr.to_string(), s_head().bg(bgc));
+    btxt(buf, tx, y + 2, &format!("status : {}", status_label(row.status)), status_style(row.status).bg(bgc));
+    btxt(buf, tx, y + 4, &format!("NetBox : {netbox}"), s_normal().bg(bgc));
+    btxt(buf, tx, y + 5, &format!("DNS PTR: {ptr}"), s_normal().bg(bgc));
+    btxt(buf, tx, y + 6, &format!("live   : {live}"), s_normal().bg(bgc));
+    btxt(buf, tx, y + 7, &format!("why    : {}", explain(row.status)), s_dim().bg(bgc));
+}
+
+/// A one-line explanation of what a verdict means, for the inspect panel.
+fn explain(s: AddressStatus) -> &'static str {
+    match s {
+        AddressStatus::Free => "no source claims it — safe to allocate",
+        AddressStatus::Allocated => "in NetBox and DNS, and the names agree",
+        AddressStatus::NetBoxOnly => "reserved in NetBox, no PTR yet",
+        AddressStatus::DnsOnly => "has a PTR but NetBox has no record (drift)",
+        AddressStatus::LiveUnregistered => "answers on the wire, in neither NetBox nor DNS",
+        AddressStatus::Conflict => "NetBox name and the PTR disagree",
+    }
 }
 
 /// The one-line status tally: each non-zero bucket in its own colour.
