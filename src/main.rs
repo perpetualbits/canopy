@@ -12,6 +12,7 @@ mod dns;
 mod fixture;
 mod graph;
 mod live;
+mod map;
 mod plan;
 mod reconcile;
 mod sources;

@@ -62,6 +62,8 @@ pub enum View {
     Graph,
     /// The expandable network → cluster → host tree.
     Tree,
+    /// The IP map: the range as a grid of used/free blocks.
+    Map,
 }
 
 impl View {
@@ -71,7 +73,8 @@ impl View {
         match self {
             View::Table => View::Graph,
             View::Graph => View::Tree,
-            View::Tree => View::Table,
+            View::Tree => View::Map,
+            View::Map => View::Table,
         }
     }
 }
@@ -420,6 +423,15 @@ impl App {
             View::Table => self.on_key_table(code),
             View::Graph => self.on_key_graph(code),
             View::Tree => self.on_key_tree(code),
+            View::Map => self.on_key_map(code),
+        }
+    }
+
+    /// Keys for the map view. (Pan/zoom will come with the legend design; for now
+    /// only quit — `Tab` cycles views globally.)
+    fn on_key_map(&mut self, code: KeyCode) {
+        if matches!(code, KeyCode::Char('q') | KeyCode::Esc) {
+            self.quit = true;
         }
     }
 
@@ -569,6 +581,7 @@ fn main_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -
             View::Table => draw::screen(buf, app),
             View::Graph => super::graph::screen(buf, app),
             View::Tree => super::tree::screen(buf, app),
+            View::Map => super::map::screen(buf, app),
         })?;
         if let Some(Event::Key(KeyEvent { code, .. })) = reader.recv_timeout(RENDER_TICK) {
             app.on_key(code);
@@ -617,7 +630,8 @@ mod tests {
             app.on_key(KeyCode::Down);
         }
         app.on_key(KeyCode::Tab); // Graph → Tree
-        app.on_key(KeyCode::Tab); // Tree → Table
+        app.on_key(KeyCode::Tab); // Tree → Map
+        app.on_key(KeyCode::Tab); // Map → Table
         assert_eq!(app.view, View::Table);
     }
 
@@ -719,6 +733,7 @@ mod tests {
         assert!(!app.tree_expanded.contains("dop"));
     }
 
+
     #[test]
     fn tab_cycles_all_three_views() {
         let (range, facts) = fixture::demo();
@@ -728,6 +743,8 @@ mod tests {
         assert_eq!(app.view, View::Graph);
         app.on_key(KeyCode::Tab);
         assert_eq!(app.view, View::Tree);
+        app.on_key(KeyCode::Tab);
+        assert_eq!(app.view, View::Map);
         app.on_key(KeyCode::Tab);
         assert_eq!(app.view, View::Table);
     }
