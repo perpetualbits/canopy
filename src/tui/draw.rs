@@ -5,7 +5,7 @@
 
 use mullion::border::{draw_box, BorderStyle, Borders, CornerStyle, LineWeight};
 use mullion::style::Color;
-use mullion::{render_keyhints, render_scrollbar, style::Style, Buffer, Rect, ScrollMetrics, TextCtx};
+use mullion::{render_keyhints, render_scrollbar, style::Style, Buffer, Rect, RecordSource, ScrollMetrics, TextCtx};
 
 use super::app::{AllocPhase, App};
 use super::theme::{
@@ -100,14 +100,19 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
 
     // ── body ──
     let body = Rect::new(area.x, area.y + 3, area.width, area.height.saturating_sub(4));
-    let len = app.rows.len();
+    let len = app.total;
     app.page = body.height as usize;
     app.cur.clamp(len);
     app.cur.keep_in_view(len, body.height as usize);
 
     let content = vscroll(buf, body, app.cur.offset, len, body.height as usize);
     let vis = content.height as usize;
-    for (i, row) in app.rows.iter().enumerate().skip(app.cur.offset).take(vis) {
+    // Fetch only the visible window from the paginated RangeSource — never the whole
+    // (possibly huge) range. `fetch_after(Some(offset-1), vis)` yields [offset, +vis).
+    let key = app.cur.offset.checked_sub(1).map(|k| k as u64);
+    let window = app.table_source().fetch_after(key, vis);
+    for (idx, row) in &window.rows {
+        let i = *idx as usize;
         let y = content.y + (i - app.cur.offset) as u16;
         let selected = i == app.cur.cursor;
         if selected {
@@ -212,10 +217,10 @@ fn alloc_overlay(buf: &mut Buffer, area: Rect, app: &App) {
 /// A centred panel showing the selected address's facts from each source and the
 /// reason for its verdict — the "why" behind the status.
 pub(crate) fn detail_overlay(buf: &mut Buffer, area: Rect, app: &App) {
-    if app.rows.is_empty() || area.width < 44 || area.height < 12 {
+    if app.total == 0 || area.width < 44 || area.height < 12 {
         return;
     }
-    let row = &app.rows[app.cur.cursor.min(app.rows.len() - 1)];
+    let row = app.row_at(app.cur.cursor.min(app.total - 1));
     let w = 58u16.min(area.width - 4);
     let h = 9u16.min(area.height - 4);
     let x = area.x + (area.width - w) / 2;

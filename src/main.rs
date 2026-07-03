@@ -184,14 +184,21 @@ fn demo_facts(range: &Cidr) -> Vec<AddressFacts> {
 /// that is *not* simply free (the interesting rows). Lets you eyeball the result
 /// without a terminal — the counterpart of census's `--ping`.
 fn list_table(range: Cidr, facts: &[reconcile::AddressFacts]) {
-    let rows = reconcile::reconcile(range, facts);
-    let c = reconcile::counts(&rows);
+    // Lazy: never materialize the whole range. Counts and the non-free rows come from
+    // the bounded facts; the first free address is found by scanning host indices
+    // (instant on a mostly-empty range).
+    let total = range.host_count();
+    let map: std::collections::HashMap<std::net::Ipv4Addr, reconcile::AddressFacts> =
+        facts.iter().cloned().map(|f| (f.addr, f)).collect();
+    let c = reconcile::counts_from_facts(total, &map);
     println!(
-        "{}/{} (network {})  free={} allocated={} dns-only={} netbox-only={} live-unreg={} conflict={}",
+        "{}/{} (network {})  total={total} free={} allocated={} dns-only={} netbox-only={} live-unreg={} conflict={}",
         range.base, range.prefix_len, range.network(),
         c.free, c.allocated, c.dns_only, c.netbox_only, c.live_unregistered, c.conflict
     );
-    for r in rows.iter().filter(|r| !r.status.is_free()) {
+    let mut known: Vec<reconcile::AddressRow> = facts.iter().map(reconcile::row_from_facts).collect();
+    known.sort_by_key(|r| r.addr);
+    for r in known.iter().filter(|r| !r.status.is_free()) {
         println!(
             "  {:<15} {:<16} {}",
             r.addr.to_string(),
@@ -199,7 +206,7 @@ fn list_table(range: Cidr, facts: &[reconcile::AddressFacts]) {
             r.name.as_deref().unwrap_or("")
         );
     }
-    if let Some(free) = reconcile::first_free(&rows) {
+    if let Some(free) = (0..total).map(|i| range.host_at(i)).find(|a| !map.contains_key(a)) {
         println!("first free: {free}");
     }
 }

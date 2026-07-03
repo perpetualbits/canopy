@@ -92,11 +92,14 @@ them before reconciling.
      Sugiyama algorithm with connectors and pan.
    - **Tree** — walk the network as `network → cluster → host`, expand/collapse
      groups, inspect a host.
-5. **Node graph + IP map, at scale** — the long vision in
+5. ✅ **Pagination** — the table never materializes the range: `mullion::RangeSource`
+   plus a lazy per-index reconcile means `--range 10.0.0.0/8` (16M addresses) browses
+   for the cost of a `/24`. Graph/tree build from the bounded known facts; free space
+   is a count, not a list.
+6. **Node graph + IP map, at scale** — the long vision in
    [docs/vision.md](docs/vision.md): proper wire routing + **bitstream** wires, a
-   zoomable **IP map** (a square-of-squares over huge spaces), **pagination** for
-   `/8`-sized ranges and DNS, and eventually the switch/router fabric with the
-   AAA/security that must gate it.
+   zoomable **IP map** (a square-of-squares over huge spaces), and eventually the
+   switch/router fabric with the AAA/security that must gate it.
 
 ```sh
 # preview the exact changes to give 10.87.3.69 the name dop370-ipmi.nfra.nl

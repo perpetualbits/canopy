@@ -3,14 +3,15 @@
 //! TUI orchestrator: application state, the event loop, key routing, and render
 //! dispatch. One screen for now — the reconciled address table.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::Ipv4Addr;
+use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
 
 use crossterm::event::{Event, KeyEvent};
-use mullion::{backend::CrosstermBackend, style::Style, EventReader, GraphCanvas, KeyCode, Terminal};
+use mullion::{backend::CrosstermBackend, style::Style, EventReader, GraphCanvas, KeyCode, RangeSource, Terminal};
 
 use super::draw;
 use super::focus::ListCursor;
@@ -19,7 +20,7 @@ use crate::config::Config;
 use crate::graph::DnsGraph;
 use crate::live;
 use crate::plan::{Allocation, Plan};
-use crate::reconcile::{self, AddressFacts, AddressRow, Cidr, Counts};
+use crate::reconcile::{self, AddressFacts, AddressRow, AddressStatus, Cidr, Counts};
 use crate::sources::Vantage;
 
 /// The result the live-gather thread sends back.
@@ -79,12 +80,14 @@ impl View {
 pub struct App {
     /// The range being browsed.
     pub range: Cidr,
-    /// The reconciled rows, one per host address, in address order.
-    pub rows: Vec<AddressRow>,
-    /// The raw per-address facts behind the rows — kept so the inspect panel can
-    /// show *why* an address is classified the way it is.
-    pub facts: Vec<AddressFacts>,
-    /// Cached status tally for the header.
+    /// Number of usable host addresses in `range` — the table's row count. A `/8` is
+    /// 16M, so rows are computed on demand ([`row_at`](App::row_at)), never stored.
+    pub total: usize,
+    /// The raw per-address facts, keyed by address. Bounded by what the sources
+    /// reported (never the whole range), so it also backs inspect and the graph/tree.
+    /// Shared (`Rc`) so a [`RangeSource`] closure can borrow it.
+    pub facts: Rc<HashMap<Ipv4Addr, AddressFacts>>,
+    /// Cached status tally for the header (derived from `facts` + `total`).
     pub counts: Counts,
     /// Whether `facts` came from the live sources (`true`) or the demo fixture.
     pub live: bool,
@@ -97,7 +100,7 @@ pub struct App {
 
     /// Which screen is showing.
     pub view: View,
-    /// The cluster graph built from `rows`.
+    /// The cluster graph, built from the known facts (never the whole range).
     pub graph: DnsGraph,
     /// The laid-out canvas for the graph view.
     pub graph_canvas: GraphCanvas,
@@ -129,18 +132,20 @@ pub struct App {
 }
 
 impl App {
-    /// Build the app by reconciling `facts` over `range`. `live` records whether the
-    /// facts are real (from the sources) or the demo fixture; `cfg` lets the TUI
-    /// gather live data on demand.
+    /// Build the app from the `facts` gathered over `range`. `live` records whether
+    /// the facts are real (from the sources) or the demo fixture; `cfg` lets the TUI
+    /// gather live data on demand. Rows are never materialized — only `facts`
+    /// (bounded) and the row count are kept.
     #[must_use]
     pub fn new(range: Cidr, facts: Vec<AddressFacts>, write_mode: bool, dry_run: bool, live: bool, cfg: Config) -> Self {
-        let rows = reconcile::reconcile(range, &facts);
-        let counts = reconcile::counts(&rows);
-        let graph = DnsGraph::from_rows(&rows);
-        let graph_canvas = graph.layout();
+        let total = range.host_count() as usize;
+        let facts: Rc<HashMap<Ipv4Addr, AddressFacts>> =
+            Rc::new(facts.into_iter().map(|f| (f.addr, f)).collect());
+        let counts = reconcile::counts_from_facts(total as u64, &facts);
+        let (graph, graph_canvas) = build_graph(&facts);
         App {
             range,
-            rows,
+            total,
             facts,
             counts,
             live,
@@ -208,30 +213,58 @@ impl App {
 
     /// Replace the current data with freshly gathered live facts and rebuild views.
     fn apply_live(&mut self, facts: Vec<AddressFacts>) {
-        self.rows = reconcile::reconcile(self.range, &facts);
-        self.counts = reconcile::counts(&self.rows);
-        self.graph = DnsGraph::from_rows(&self.rows);
-        self.graph_canvas = self.graph.layout();
-        self.facts = facts;
+        self.facts = Rc::new(facts.into_iter().map(|f| (f.addr, f)).collect());
+        self.counts = reconcile::counts_from_facts(self.total as u64, &self.facts);
+        let (graph, canvas) = build_graph(&self.facts);
+        self.graph = graph;
+        self.graph_canvas = canvas;
         self.live = true;
         self.loading = false;
         self.live_rx = None;
         self.pan = (0, 0);
-        self.cur.clamp(self.rows.len());
+        self.cur.clamp(self.total);
         self.status = Some(("live data loaded".to_string(), false));
     }
 
     /// The raw facts for `addr`, if any source reported it (free addresses have none).
     #[must_use]
     pub fn facts_for(&self, addr: Ipv4Addr) -> Option<&AddressFacts> {
-        self.facts.iter().find(|f| f.addr == addr)
+        self.facts.get(&addr)
+    }
+
+    /// The reconciled row at table index `i`, computed on demand from `facts` — the
+    /// lazy core that lets the table browse a huge range without materializing it.
+    #[must_use]
+    pub fn row_at(&self, i: usize) -> AddressRow {
+        reconcile::reconcile_at(self.range, &self.facts, i as u64)
+    }
+
+    /// A `mullion::RangeSource` over the whole range, each row built lazily from its
+    /// index. This is the paginated data source (a `/8` costs the same as a `/24`);
+    /// a `VirtualList` can window it. Returned by value so callers own their cursor.
+    #[must_use]
+    pub fn table_source(&self) -> RangeSource<AddressRow, impl Fn(u64) -> AddressRow> {
+        let range = self.range;
+        let facts = Rc::clone(&self.facts);
+        RangeSource::new(self.total as u64, move |i| reconcile::reconcile_at(range, &facts, i))
+    }
+
+    /// The reconciled rows for the **known** addresses only (those any source
+    /// reported), sorted by address — bounded by `facts`, so it is safe to build for
+    /// the graph and tree even over a `/8`. Free space is represented as a count.
+    #[must_use]
+    pub fn known_rows(&self) -> Vec<AddressRow> {
+        let mut rows: Vec<AddressRow> = self.facts.values().map(reconcile::row_from_facts).collect();
+        rows.sort_by_key(|r| r.addr);
+        rows
     }
 
     /// Begin allocating the selected row — only free addresses qualify.
     fn start_alloc(&mut self) {
-        let Some(row) = self.rows.get(self.cur.cursor) else {
+        if self.total == 0 {
             return;
-        };
+        }
+        let row = self.row_at(self.cur.cursor);
         if !row.status.is_free() {
             self.status = Some(("only free addresses can be allocated".to_string(), true));
             return;
@@ -281,7 +314,13 @@ impl App {
             return;
         }
         let alloc = Allocation { addr, prefix_len: self.range.prefix_len, fqdn };
-        match Plan::for_allocation(alloc, &self.cfg.netbox_url, Some(&self.rows)) {
+        // The plan only needs the target address's current row for its free-check.
+        let target = self
+            .facts
+            .get(&addr)
+            .map(reconcile::row_from_facts)
+            .unwrap_or(AddressRow { addr, status: AddressStatus::Free, name: None });
+        match Plan::for_allocation(alloc, &self.cfg.netbox_url, Some(&[target])) {
             Ok(plan) => {
                 if let Some(f) = &mut self.alloc {
                     f.plan = Some(plan);
@@ -432,15 +471,15 @@ impl App {
 
     /// Open the inspect panel for `addr` by pointing the table cursor at its row.
     fn inspect_addr(&mut self, addr: Ipv4Addr) {
-        if let Some(i) = self.rows.iter().position(|r| r.addr == addr) {
-            self.cur.cursor = i;
+        if let Some(i) = self.range.host_index(addr) {
+            self.cur.cursor = i as usize;
             self.detail = true;
         }
     }
 
     /// Keys for the table view: list navigation and the inspect panel.
     fn on_key_table(&mut self, code: KeyCode) {
-        let len = self.rows.len();
+        let len = self.total;
         match code {
             KeyCode::Char('q') => self.quit = true,
             // Esc closes the inspect panel if open, otherwise quits.
@@ -480,20 +519,31 @@ impl App {
     }
 
     /// Move the cursor to the next free address after the current one, wrapping
-    /// around the list. Does nothing if there are no free addresses.
+    /// around the range. Rows are computed on demand, so this scans lazily; on a
+    /// mostly-empty range the next address is usually free, so it returns at once.
     fn jump_next_free(&mut self) {
-        let len = self.rows.len();
+        let len = self.total;
         if len == 0 {
             return;
         }
         for step in 1..=len {
             let i = (self.cur.cursor + step) % len;
-            if self.rows[i].status.is_free() {
+            if self.row_at(i).status.is_free() {
                 self.cur.cursor = i;
                 return;
             }
         }
     }
+}
+
+/// Build the cluster graph and its laid-out canvas from the known facts (bounded —
+/// only addresses a source reported, never the whole range).
+fn build_graph(facts: &HashMap<Ipv4Addr, AddressFacts>) -> (DnsGraph, GraphCanvas) {
+    let mut rows: Vec<AddressRow> = facts.values().map(reconcile::row_from_facts).collect();
+    rows.sort_by_key(|r| r.addr);
+    let graph = DnsGraph::from_rows(&rows);
+    let canvas = graph.layout();
+    (graph, canvas)
 }
 
 /// Enter the alternate screen, run the loop, and always restore the terminal.
@@ -640,7 +690,7 @@ mod tests {
         let (range, facts) = fixture::demo();
         let mut app = App::new(range, facts, false, false, false, Config::default());
         app.jump_next_free();
-        assert!(app.rows[app.cur.cursor].status.is_free());
+        assert!(app.row_at(app.cur.cursor).status.is_free());
     }
 
     #[test]
@@ -660,7 +710,7 @@ mod tests {
         app.tree_cur = 4; // first dop host (10.87.3.68)
         app.on_key(KeyCode::Enter);
         assert!(app.detail);
-        assert_eq!(app.rows[app.cur.cursor].addr, "10.87.3.68".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(app.row_at(app.cur.cursor).addr, "10.87.3.68".parse::<Ipv4Addr>().unwrap());
 
         // Left collapses the group the cursor sits in.
         app.detail = false;
@@ -680,5 +730,33 @@ mod tests {
         assert_eq!(app.view, View::Tree);
         app.on_key(KeyCode::Tab);
         assert_eq!(app.view, View::Table);
+    }
+
+
+    #[test]
+    fn a_slash_8_is_lazy_and_paginates() {
+        use mullion::VirtualList;
+        let range = Cidr::parse("10.0.0.0/8").unwrap();
+        // One known host in a 16M-address range — must be instant, not a 16M Vec.
+        let facts = vec![AddressFacts {
+            addr: "10.0.0.5".parse().unwrap(),
+            netbox: None,
+            ptr: Some("thing.nfra.nl.".into()),
+            live: false,
+        }];
+        let app = App::new(range, facts, false, false, false, Config::default());
+        assert_eq!(app.total, 16_777_214);
+        assert_eq!(app.counts.free, 16_777_213); // total − the one known host
+        assert_eq!(app.counts.dns_only, 1);
+
+        // row_at anywhere is O(1); a deep index is free.
+        assert!(app.row_at(10_000_000).status.is_free());
+        assert_eq!(app.row_at(4).addr, "10.0.0.5".parse::<Ipv4Addr>().unwrap());
+
+        // The RangeSource drives a VirtualList over the /8, materializing only a window.
+        let mut list = VirtualList::new(app.table_source(), 20, 32);
+        assert!(!list.visible().is_empty());
+        list.scroll_by(1_000_000);
+        assert!(!list.visible().is_empty());
     }
 }

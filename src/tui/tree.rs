@@ -48,27 +48,48 @@ fn group_key(row: &AddressRow) -> String {
     }
 }
 
-/// Build the currently-visible tree rows from the app's reconciled data and the set
-/// of expanded groups. Groups are alphabetical (via `BTreeMap`); the root is always
-/// shown expanded.
+/// Build the currently-visible tree rows from the app's data and the expanded set.
+///
+/// Only the **known** addresses (bounded by facts) are grouped into expandable
+/// clusters; empty space is shown as a single `(free)` count leaf, never enumerated —
+/// so this is safe over a `/8`. Groups are alphabetical (via `BTreeMap`); the root is
+/// always expanded.
 #[must_use]
 pub fn rows(app: &App) -> Vec<TreeRowView> {
-    let mut groups: BTreeMap<String, Vec<&AddressRow>> = BTreeMap::new();
-    for r in &app.rows {
-        groups.entry(group_key(r)).or_default().push(r);
+    let mut groups: BTreeMap<String, Vec<AddressRow>> = BTreeMap::new();
+    for r in app.known_rows() {
+        let key = group_key(&r);
+        if key == "(free)" {
+            continue; // free space is a count, not a per-address list
+        }
+        groups.entry(key).or_default().push(r);
     }
 
     let mut out = Vec::new();
     out.push(TreeRowView {
         depth: 0,
         label: format!("{}/{}", app.range.base, app.range.prefix_len),
-        detail: format!("{} free / {} total", app.counts.free, app.rows.len()),
+        detail: format!("{} free / {} total", app.counts.free, app.total),
         is_group: true,
         expanded: true,
         key: None,
         addr: None,
         status: None,
     });
+
+    // Free space: one non-expandable count leaf (could be millions of addresses).
+    if app.counts.free > 0 {
+        out.push(TreeRowView {
+            depth: 1,
+            label: "(free)".to_string(),
+            detail: format!("({})", app.counts.free),
+            is_group: false,
+            expanded: false,
+            key: None,
+            addr: None,
+            status: Some(AddressStatus::Free),
+        });
+    }
 
     for (key, members) in &groups {
         let expanded = app.tree_expanded.contains(key);

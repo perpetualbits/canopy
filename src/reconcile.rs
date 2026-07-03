@@ -123,10 +123,32 @@ fn best_name(facts: &AddressFacts) -> Option<String> {
         .map(normalize)
 }
 
+/// The reconciled row for one set of facts: its verdict and best display name.
+#[must_use]
+pub fn row_from_facts(facts: &AddressFacts) -> AddressRow {
+    AddressRow { addr: facts.addr, status: classify(facts), name: best_name(facts) }
+}
+
+/// The reconciled row for the address at `index` in `range`, looked up in `facts`.
+///
+/// This is the lazy, `O(1)` core of pagination: the address is computed by
+/// arithmetic ([`Cidr::host_at`]) and classified from the (bounded) fact map, so a
+/// caller can render just the visible window of a `/8` without building 16M rows.
+/// An address absent from `facts` is `Free`.
+#[must_use]
+pub fn reconcile_at(range: Cidr, facts: &HashMap<Ipv4Addr, AddressFacts>, index: u64) -> AddressRow {
+    let addr = range.host_at(index);
+    match facts.get(&addr) {
+        Some(f) => row_from_facts(f),
+        None => AddressRow { addr, status: AddressStatus::Free, name: None },
+    }
+}
+
 /// Build the reconciled table for every usable host address in `range`.
 ///
 /// How: index `facts` by address, then walk every host address in the CIDR;
-/// addresses with no facts default to `Free`. The result is sorted by address.
+/// addresses with no facts default to `Free`. Materializes the whole range, so it is
+/// for small ranges and tests — large ranges use [`reconcile_at`] lazily.
 #[must_use]
 pub fn reconcile(range: Cidr, facts: &[AddressFacts]) -> Vec<AddressRow> {
     let by_addr: HashMap<Ipv4Addr, &AddressFacts> =
@@ -135,24 +157,10 @@ pub fn reconcile(range: Cidr, facts: &[AddressFacts]) -> Vec<AddressRow> {
     range
         .hosts()
         .map(|addr| match by_addr.get(&addr) {
-            Some(f) => AddressRow {
-                addr,
-                status: classify(f),
-                name: best_name(f),
-            },
-            None => AddressRow {
-                addr,
-                status: AddressStatus::Free,
-                name: None,
-            },
+            Some(f) => row_from_facts(f),
+            None => AddressRow { addr, status: AddressStatus::Free, name: None },
         })
         .collect()
-}
-
-/// The lowest free address in a reconciled table, if any.
-#[must_use]
-pub fn first_free(rows: &[AddressRow]) -> Option<Ipv4Addr> {
-    rows.iter().find(|r| r.status.is_free()).map(|r| r.addr)
 }
 
 /// A tally of how many addresses fall into each status — for the header bar.
@@ -172,20 +180,37 @@ pub struct Counts {
     pub conflict: usize,
 }
 
-/// Count how many addresses fall into each [`AddressStatus`].
+/// Tally one status into `c`.
+fn tally(c: &mut Counts, status: AddressStatus) {
+    match status {
+        AddressStatus::Free => c.free += 1,
+        AddressStatus::Allocated => c.allocated += 1,
+        AddressStatus::NetBoxOnly => c.netbox_only += 1,
+        AddressStatus::DnsOnly => c.dns_only += 1,
+        AddressStatus::LiveUnregistered => c.live_unregistered += 1,
+        AddressStatus::Conflict => c.conflict += 1,
+    }
+}
+
+/// Tally the status counts for a whole range **without enumerating it**: classify
+/// the (bounded) known facts, then treat every remaining address as `Free`.
+///
+/// `free = total − known-non-free`, so a mostly-empty `/8` is counted in O(facts),
+/// not O(16M). A stray fact that itself classifies `Free` is handled correctly.
 #[must_use]
-pub fn counts(rows: &[AddressRow]) -> Counts {
+pub fn counts_from_facts(total: u64, facts: &HashMap<Ipv4Addr, AddressFacts>) -> Counts {
     let mut c = Counts::default();
-    for r in rows {
-        match r.status {
-            AddressStatus::Free => c.free += 1,
-            AddressStatus::Allocated => c.allocated += 1,
-            AddressStatus::NetBoxOnly => c.netbox_only += 1,
-            AddressStatus::DnsOnly => c.dns_only += 1,
-            AddressStatus::LiveUnregistered => c.live_unregistered += 1,
-            AddressStatus::Conflict => c.conflict += 1,
+    let mut free_known = 0u64;
+    for f in facts.values() {
+        let status = classify(f);
+        tally(&mut c, status);
+        if status == AddressStatus::Free {
+            free_known += 1;
         }
     }
+    // The addresses no source mentioned are all free; add them to any already tallied.
+    let unknown = total - facts.len() as u64;
+    c.free = (unknown + free_known) as usize;
     c
 }
 
@@ -241,18 +266,55 @@ impl Cidr {
         u32::from(ip) & self.mask() == u32::from(self.base) & self.mask()
     }
 
-    /// Iterate the **usable host** addresses of the block: for `/1`–`/30` we skip
-    /// the network and broadcast addresses; `/31` yields both (RFC 3021) and `/32`
-    /// the single address.
-    #[must_use]
-    pub fn hosts(self) -> impl Iterator<Item = Ipv4Addr> {
+    /// The inclusive `(first, last)` usable-host address bounds, as `u32`.
+    ///
+    /// For `/1`–`/30` the network and broadcast addresses are skipped; `/31` uses
+    /// both (RFC 3021) and `/32` the single address. This is the arithmetic shared by
+    /// [`hosts`](Cidr::hosts), [`host_count`](Cidr::host_count) and
+    /// [`host_at`](Cidr::host_at), so none of them needs to iterate.
+    fn host_bounds(self) -> (u32, u32) {
         let net = u32::from(self.base) & self.mask();
         let bcast = net | !self.mask();
-        let (start, end) = match self.prefix_len {
+        match self.prefix_len {
             32 => (net, net),
             31 => (net, bcast),
             _ => (net + 1, bcast - 1),
-        };
+        }
+    }
+
+    /// How many usable host addresses the block has — computed by arithmetic, so a
+    /// `/8` (16,777,214 hosts) is as cheap to size as a `/24`.
+    #[must_use]
+    pub fn host_count(self) -> u64 {
+        let (s, e) = self.host_bounds();
+        u64::from(e) - u64::from(s) + 1
+    }
+
+    /// The `index`-th usable host address (0-based), clamped to the last host.
+    ///
+    /// `O(1)` — the basis for lazily rendering only the visible slice of a huge
+    /// range without ever materializing all of it.
+    #[must_use]
+    pub fn host_at(self, index: u64) -> Ipv4Addr {
+        let (s, e) = self.host_bounds();
+        let addr = (u64::from(s) + index).min(u64::from(e)) as u32;
+        Ipv4Addr::from(addr)
+    }
+
+    /// The 0-based host index of `addr`, or `None` if it is not a usable host of the
+    /// block — the inverse of [`host_at`](Cidr::host_at), used to select an address
+    /// in the lazy table.
+    #[must_use]
+    pub fn host_index(self, addr: Ipv4Addr) -> Option<u64> {
+        let (s, e) = self.host_bounds();
+        let a = u32::from(addr);
+        (a >= s && a <= e).then(|| u64::from(a) - u64::from(s))
+    }
+
+    /// Iterate the usable host addresses of the block.
+    #[must_use]
+    pub fn hosts(self) -> impl Iterator<Item = Ipv4Addr> {
+        let (start, end) = self.host_bounds();
         (start..=end).map(Ipv4Addr::from)
     }
 }
@@ -344,12 +406,52 @@ mod tests {
         let rows = reconcile(range, &f);
         assert_eq!(rows.len(), 254);
 
-        let c = counts(&rows);
+        let map: HashMap<Ipv4Addr, AddressFacts> = f.iter().cloned().map(|x| (x.addr, x)).collect();
+        let c = counts_from_facts(range.host_count(), &map);
         assert_eq!(c.dns_only, 1);
         assert_eq!(c.live_unregistered, 1);
         assert_eq!(c.allocated, 1);
         assert_eq!(c.free, 251);
 
-        assert_eq!(first_free(&rows), Some("10.87.3.1".parse().unwrap()));
+        // The lowest free address is .1 (nothing claims it).
+        assert_eq!(rows.iter().find(|r| r.status.is_free()).map(|r| r.addr), Some("10.87.3.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn host_arithmetic_is_cheap_and_consistent() {
+        let c24 = Cidr::parse("10.87.3.0/24").unwrap();
+        assert_eq!(c24.host_count() as usize, c24.hosts().count());
+        assert_eq!(c24.host_at(0), "10.87.3.1".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(c24.host_at(67), "10.87.3.68".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(c24.host_index("10.87.3.68".parse().unwrap()), Some(67));
+        assert_eq!(c24.host_index("10.87.4.1".parse().unwrap()), None); // outside
+
+        // A /8 is sized and addressed by arithmetic — no iteration.
+        let c8 = Cidr::parse("10.0.0.0/8").unwrap();
+        assert_eq!(c8.host_count(), 16_777_214); // 2^24 − 2
+        assert_eq!(c8.host_at(0), "10.0.0.1".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(c8.host_at(16_777_213), "10.255.255.254".parse::<Ipv4Addr>().unwrap());
+    }
+
+    #[test]
+    fn lazy_reconcile_matches_the_full_pass() {
+        let range = Cidr::parse("10.87.3.0/24").unwrap();
+        let f = vec![
+            facts("10.87.3.11", None, Some("iprotect-keyreader.nfra.nl."), false),
+            facts("10.87.3.90", None, None, true),
+            facts("10.87.3.68", Some(Some("dop21-ipmi.nfra.nl")), Some("dop21-ipmi.nfra.nl."), true),
+        ];
+        let map: HashMap<Ipv4Addr, AddressFacts> = f.iter().cloned().map(|x| (x.addr, x)).collect();
+        let full = reconcile(range, &f);
+        // reconcile_at(i) reproduces the full pass, address by address.
+        for i in 0..range.host_count() {
+            assert_eq!(reconcile_at(range, &map, i), full[i as usize]);
+        }
+        // And counts_from_facts matches the full pass — without enumerating it.
+        let mut expected = Counts::default();
+        for r in &full {
+            tally(&mut expected, r.status);
+        }
+        assert_eq!(counts_from_facts(range.host_count(), &map), expected);
     }
 }
