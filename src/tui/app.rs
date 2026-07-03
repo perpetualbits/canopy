@@ -17,10 +17,36 @@ use super::theme::{s_dim, s_err, s_warn};
 use crate::config::Config;
 use crate::graph::DnsGraph;
 use crate::live;
+use crate::plan::{Allocation, Plan};
 use crate::reconcile::{self, AddressFacts, AddressRow, Cidr, Counts};
+use crate::sources::Vantage;
 
 /// The result the live-gather thread sends back.
 type LiveResult = anyhow::Result<Vec<AddressFacts>>;
+
+/// The result the allocate-apply thread sends back (a log of what it did).
+type ApplyResult = anyhow::Result<String>;
+
+/// Which step of the allocate flow the overlay is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocPhase {
+    /// Typing the FQDN for the address.
+    Naming,
+    /// Reviewing the built plan before applying.
+    Preview,
+}
+
+/// The in-progress "allocate this address" flow.
+pub struct AllocFlow {
+    /// The address being allocated.
+    pub addr: Ipv4Addr,
+    /// The FQDN being typed.
+    pub input: String,
+    /// The plan, once built (Preview phase).
+    pub plan: Option<Plan>,
+    /// Which step we're on.
+    pub phase: AllocPhase,
+}
 
 /// Idle redraw cap (~20 fps) so the UI stays responsive without busy-looping.
 const RENDER_TICK: Duration = Duration::from_millis(50);
@@ -67,10 +93,16 @@ pub struct App {
     pub cfg: Config,
     /// `true` while a background live-gather is running.
     pub loading: bool,
+    /// `true` while a background allocate-apply is running.
+    pub applying: bool,
     /// A short status line (message, is_error) shown in the header.
     pub status: Option<(String, bool)>,
+    /// The in-progress allocate flow, if any.
+    pub alloc: Option<AllocFlow>,
     /// Channel to the in-flight live-gather thread, if any.
     live_rx: Option<mpsc::Receiver<LiveResult>>,
+    /// Channel to the in-flight allocate-apply thread, if any.
+    apply_rx: Option<mpsc::Receiver<ApplyResult>>,
 
     write_mode: bool,
     dry_run: bool,
@@ -102,8 +134,11 @@ impl App {
             pan: (0, 0),
             cfg,
             loading: false,
+            applying: false,
             status: None,
+            alloc: None,
             live_rx: None,
+            apply_rx: None,
             write_mode,
             dry_run,
             quit: false,
@@ -171,6 +206,126 @@ impl App {
         self.facts.iter().find(|f| f.addr == addr)
     }
 
+    /// Begin allocating the selected row — only free addresses qualify.
+    fn start_alloc(&mut self) {
+        let Some(row) = self.rows.get(self.cur.cursor) else {
+            return;
+        };
+        if !row.status.is_free() {
+            self.status = Some(("only free addresses can be allocated".to_string(), true));
+            return;
+        }
+        self.detail = false;
+        self.alloc = Some(AllocFlow { addr: row.addr, input: String::new(), plan: None, phase: AllocPhase::Naming });
+    }
+
+    /// Keys while the allocate overlay is open.
+    fn on_key_alloc(&mut self, code: KeyCode) {
+        let phase = match &self.alloc {
+            Some(f) => f.phase,
+            None => return,
+        };
+        match phase {
+            AllocPhase::Naming => match code {
+                KeyCode::Esc => self.alloc = None,
+                KeyCode::Enter => self.build_alloc_plan(),
+                KeyCode::Backspace => {
+                    if let Some(f) = &mut self.alloc {
+                        f.input.pop();
+                    }
+                }
+                KeyCode::Char(c) => {
+                    if let Some(f) = &mut self.alloc {
+                        f.input.push(c);
+                    }
+                }
+                _ => {}
+            },
+            AllocPhase::Preview => match code {
+                KeyCode::Esc => self.alloc = None,
+                KeyCode::Char('y') | KeyCode::Enter => self.start_apply(),
+                _ => {}
+            },
+        }
+    }
+
+    /// Build the allocation plan from the typed name and move to the Preview phase.
+    fn build_alloc_plan(&mut self) {
+        let (addr, fqdn) = match &self.alloc {
+            Some(f) => (f.addr, f.input.trim().to_string()),
+            None => return,
+        };
+        if fqdn.is_empty() {
+            self.status = Some(("type a name first".to_string(), true));
+            return;
+        }
+        let alloc = Allocation { addr, prefix_len: self.range.prefix_len, fqdn };
+        match Plan::for_allocation(alloc, &self.cfg.netbox_url, Some(&self.rows)) {
+            Ok(plan) => {
+                if let Some(f) = &mut self.alloc {
+                    f.plan = Some(plan);
+                    f.phase = AllocPhase::Preview;
+                }
+            }
+            Err(e) => self.status = Some((format!("{e}"), true)),
+        }
+    }
+
+    /// Whether the TUI may actually push changes: write mode on, dry-run off.
+    #[must_use]
+    pub fn can_apply(&self) -> bool {
+        self.write_mode && !self.dry_run
+    }
+
+    /// Apply the previewed plan on a background thread. Refuses unless writes are
+    /// enabled, so a read-only or dry-run session can preview but never mutate.
+    fn start_apply(&mut self) {
+        if !self.can_apply() {
+            self.status = Some(("read-only — restart with --write to apply".to_string(), true));
+            return;
+        }
+        let plan = match self.alloc.as_ref().and_then(|f| f.plan.clone()) {
+            Some(p) => p,
+            None => return,
+        };
+        let (tx, rx) = mpsc::channel();
+        let vantage = self.cfg.vantage.clone();
+        let token_pass = self.cfg.token_pass.clone();
+        std::thread::spawn(move || {
+            let res = live::get_token(&token_pass).and_then(|tok| plan.apply(&Vantage::new(&vantage), &tok));
+            let _ = tx.send(res);
+        });
+        self.apply_rx = Some(rx);
+        self.applying = true;
+        self.status = Some(("applying…".to_string(), false));
+    }
+
+    /// Poll the allocate-apply thread; on completion report and close the flow.
+    /// Called once per loop tick.
+    pub fn poll_apply(&mut self) {
+        let Some(rx) = &self.apply_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(_log)) => {
+                self.applying = false;
+                self.apply_rx = None;
+                self.alloc = None;
+                self.status = Some(("allocation applied".to_string(), false));
+            }
+            Ok(Err(e)) => {
+                self.applying = false;
+                self.apply_rx = None;
+                self.status = Some((format!("apply failed: {e}"), true));
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.applying = false;
+                self.apply_rx = None;
+            }
+        }
+    }
+
     /// The mode badge shown top-right: colourful because write mode is dangerous.
     #[must_use]
     pub fn mode_label(&self) -> (&'static str, Style) {
@@ -185,6 +340,11 @@ impl App {
 
     /// Route one key press, first handling the global keys (view toggle, live load).
     pub fn on_key(&mut self, code: KeyCode) {
+        // The allocate overlay captures all keys while open.
+        if self.alloc.is_some() {
+            self.on_key_alloc(code);
+            return;
+        }
         match code {
             KeyCode::Tab => {
                 self.view = match self.view {
@@ -219,6 +379,7 @@ impl App {
                 }
             }
             KeyCode::Enter => self.detail = !self.detail,
+            KeyCode::Char('a') => self.start_alloc(),
             KeyCode::Char('j') | KeyCode::Down => self.cur.down(len),
             KeyCode::Char('k') | KeyCode::Up => self.cur.up(),
             KeyCode::Char('g') | KeyCode::Home => self.cur.reset(),
@@ -280,6 +441,7 @@ fn main_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -
     let reader = EventReader::new();
     while !app.quit {
         app.poll_live();
+        app.poll_apply();
         term.draw(|buf| match app.view {
             View::Table => draw::screen(buf, app),
             View::Graph => super::graph::screen(buf, app),
@@ -363,6 +525,39 @@ mod tests {
         assert_eq!(app.counts.dns_only, 1); // the one supplied PTR
         assert!(app.status.as_ref().is_some_and(|(m, e)| m.contains("loaded") && !*e));
     }
+
+    #[test]
+    fn allocate_flow_builds_plan_and_gates_apply() {
+        let (range, facts) = fixture::demo();
+        let mut app = App::new(range, facts, false, false, false, Config::default());
+        // Cursor 0 is 10.87.3.1 (free in the fixture).
+        app.on_key(KeyCode::Char('a'));
+        assert!(app.alloc.is_some());
+        for c in "dop370-ipmi.nfra.nl".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        app.on_key(KeyCode::Enter); // build the plan → Preview
+        let flow = app.alloc.as_ref().unwrap();
+        assert_eq!(flow.phase, AllocPhase::Preview);
+        assert!(flow.plan.is_some());
+        // Read-only: 'y' must NOT apply; it errors and keeps the overlay open.
+        app.on_key(KeyCode::Char('y'));
+        assert!(app.alloc.is_some());
+        assert!(app.status.as_ref().is_some_and(|(_, e)| *e));
+        app.on_key(KeyCode::Esc);
+        assert!(app.alloc.is_none());
+    }
+
+    #[test]
+    fn allocate_refuses_a_taken_row() {
+        let (range, facts) = fixture::demo();
+        let mut app = App::new(range, facts, false, false, false, Config::default());
+        app.cur.cursor = 10; // 10.87.3.11, a dns-only (taken) row
+        app.on_key(KeyCode::Char('a'));
+        assert!(app.alloc.is_none());
+        assert!(app.status.as_ref().is_some_and(|(_, e)| *e));
+    }
+
 
     #[test]
     fn next_free_lands_on_a_free_address() {

@@ -161,7 +161,8 @@ fn run_allocation(range: Cidr, args: &Args, cfg: &Config, facts: &[AddressFacts]
     if args.write && !args.dry_run {
         eprintln!("--write: applying on {} …", cfg.vantage);
         let token = live::get_token(&cfg.token_pass)?;
-        plan.apply(&Vantage::new(&cfg.vantage), &token)?;
+        let log = plan.apply(&Vantage::new(&cfg.vantage), &token)?;
+        print!("{log}");
         eprintln!("done.");
     } else {
         println!("(dry-run — pass --write to apply)");

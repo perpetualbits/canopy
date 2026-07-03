@@ -7,7 +7,7 @@ use mullion::border::{draw_box, BorderStyle, Borders, CornerStyle, LineWeight};
 use mullion::style::Color;
 use mullion::{render_keyhints, render_scrollbar, style::Style, Buffer, Rect, ScrollMetrics, TextCtx};
 
-use super::app::App;
+use super::app::{AllocPhase, App};
 use super::theme::{
     s_accent, s_dim, s_err, s_head, s_normal, s_ok, s_sel, s_title, s_warn, status_label, status_style,
 };
@@ -133,6 +133,7 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
         &[
             ("j/k", "move"),
             ("f", "next free"),
+            ("a", "allocate"),
             ("Enter", "inspect"),
             ("L", "live"),
             ("Tab", "graph"),
@@ -140,9 +141,71 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
         ],
     );
 
-    // ── inspect panel (overlay) ──
-    if app.detail {
+    // ── overlays (allocate takes precedence over inspect) ──
+    if app.alloc.is_some() {
+        alloc_overlay(buf, area, app);
+    } else if app.detail {
         detail_overlay(buf, area, app);
+    }
+}
+
+/// The allocate flow overlay: type a name, then review the plan before applying.
+fn alloc_overlay(buf: &mut Buffer, area: Rect, app: &App) {
+    let Some(flow) = &app.alloc else {
+        return;
+    };
+    match flow.phase {
+        AllocPhase::Naming => {
+            if area.width < 40 || area.height < 10 {
+                return;
+            }
+            let w = 60u16.min(area.width - 4);
+            let h = 7u16;
+            let x = area.x + (area.width - w) / 2;
+            let y = area.y + (area.height - h) / 2;
+            let bgc = Color::Rgb(28, 28, 44);
+            for yy in y..y + h {
+                fill_row(buf, x, yy, w, Style::default().bg(bgc));
+            }
+            let bs = BorderStyle { weight: LineWeight::Heavy, corners: CornerStyle::Rounded, style: s_accent() };
+            draw_box(buf, Rect::new(x, y, w, h), Borders::ALL, &bs);
+            btxt(buf, x + 2, y + 1, &format!("Allocate {}", flow.addr), s_head().bg(bgc));
+            btxt(buf, x + 2, y + 3, "name:", s_dim().bg(bgc));
+            let line = format!("{}\u{2588}", flow.input); // trailing cursor block
+            let line: String = line.chars().take((w - 10) as usize).collect();
+            btxt(buf, x + 8, y + 3, &line, s_normal().bg(bgc));
+            btxt(buf, x + 2, y + 5, "[Enter] preview   [Esc] cancel", s_dim().bg(bgc));
+        }
+        AllocPhase::Preview => {
+            if area.width < 50 || area.height < 14 {
+                return;
+            }
+            let w = (area.width - 4).min(80);
+            let h = (area.height - 4).min(22);
+            let x = area.x + (area.width - w) / 2;
+            let y = area.y + (area.height - h) / 2;
+            let bgc = Color::Rgb(24, 24, 38);
+            for yy in y..y + h {
+                fill_row(buf, x, yy, w, Style::default().bg(bgc));
+            }
+            let bs = BorderStyle { weight: LineWeight::Heavy, corners: CornerStyle::Rounded, style: s_accent() };
+            draw_box(buf, Rect::new(x, y, w, h), Borders::ALL, &bs);
+
+            let text = flow.plan.as_ref().map(|p| p.preview()).unwrap_or_default();
+            let max_lines = (h as usize).saturating_sub(3);
+            for (i, l) in text.lines().take(max_lines).enumerate() {
+                let l: String = l.chars().take((w - 4) as usize).collect();
+                btxt(buf, x + 2, y + 1 + i as u16, &l, s_normal().bg(bgc));
+            }
+            let hint = if app.applying {
+                "applying…"
+            } else if app.can_apply() {
+                "[y] apply   [Esc] cancel"
+            } else {
+                "read-only — restart with --write to apply     [Esc] cancel"
+            };
+            btxt(buf, x + 2, y + h - 2, hint, s_warn().bg(bgc));
+        }
     }
 }
 

@@ -183,10 +183,14 @@ impl Plan {
     ///
     /// # Errors
     /// Propagates the first failing remote command.
-    pub fn apply(&self, default_vantage: &Vantage, token: &str) -> anyhow::Result<()> {
+    ///
+    /// Returns a text log of what was applied/skipped (so a TUI caller can show it
+    /// rather than having it printed to a screen it doesn't control).
+    pub fn apply(&self, default_vantage: &Vantage, token: &str) -> anyhow::Result<String> {
+        let mut log = String::new();
         for a in &self.actions {
             if a.review {
-                println!("[skip: needs review] {} ({})", a.summary, a.target.label());
+                log.push_str(&format!("[skip: needs review] {} ({})\n", a.summary, a.target.label()));
                 continue;
             }
             let host = a.host.clone().unwrap_or_else(|| default_vantage.host.clone());
@@ -196,9 +200,9 @@ impl Plan {
             } else {
                 vantage.run(&a.script)?
             };
-            println!("[applied] {}\n{}", a.summary, out.trim());
+            log.push_str(&format!("[applied] {}\n{}\n", a.summary, out.trim()));
         }
-        Ok(())
+        Ok(log)
     }
 }
 
