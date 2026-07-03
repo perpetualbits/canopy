@@ -67,8 +67,12 @@ pub struct Action {
     pub script: String,
     /// Whether the NetBox token must be fed to `script` via stdin.
     pub needs_token: bool,
-    /// `true` when the step is not yet trustworthy to run automatically (e.g. a zone
-    /// whose file path we have not confirmed). Such steps are shown but never applied.
+    /// `true` when the step cannot be automated at all and must be done by hand
+    /// (e.g. the reverse PTR on the Windows, RDP-only ntserver1). `script` then holds
+    /// a human instruction, not a command. Implies `review`.
+    pub manual: bool,
+    /// `true` when the step is shown but never auto-applied — either it needs review,
+    /// or it is `manual`.
     pub review: bool,
 }
 
@@ -128,6 +132,7 @@ impl Plan {
                  -H 'Content-Type: application/json' -X POST '{base}/api/ipam/ip-addresses/' -d '{payload}'"
             ),
             needs_token: true,
+            manual: false,
             review: false,
         };
 
@@ -141,21 +146,24 @@ impl Plan {
             detail: a_rec.zone_line(&fzone.origin),
             script: fzone.add_record_script(&a_rec),
             needs_token: false,
+            manual: false,
             review: !fzone.is_editable(),
         };
 
-        // 3) Reverse PTR on ntserver1 — same safe edit, but the zone file path there
-        // is still TBD, so this is shown and gated (review) until confirmed.
-        let rzone = Zone::reverse_10();
+        // 3) Reverse PTR — the 10.in-addr.arpa zone is mastered on ntserver1, a
+        // WINDOWS DNS server owned by another team: no SSH/BIND, RDP-only, not
+        // automatable. So this is a MANUAL hand-off — netpush emits the exact record
+        // and where it goes, for a human to add. It is never auto-applied.
         let ptr_rec = Record::ptr(reverse_ptr(alloc.addr), &fqdn);
         let reverse = Action {
             target: Target::DnsReverse,
-            host: Some(rzone.server.clone()),
-            summary: format!("add PTR {} -> {} in {}", alloc.addr, alloc.fqdn, rzone.origin),
-            detail: ptr_rec.to_string(),
-            script: rzone.add_record_script(&ptr_rec),
+            host: Some("ntserver1.nfra.nl".to_string()),
+            summary: format!("add PTR {} -> {} (Windows DNS, apply via RDP)", alloc.addr, alloc.fqdn),
+            detail: format!("{ptr_rec}   (add to the 10.in-addr.arpa zone on ntserver1)"),
+            script: "manual step — apply by hand in the Windows DNS Manager on ntserver1 (RDP); not automatable".to_string(),
             needs_token: false,
-            review: !rzone.is_editable(),
+            manual: true,
+            review: true,
         };
 
         Ok(Plan { alloc, actions: vec![netbox, forward, reverse] })
@@ -167,10 +175,18 @@ impl Plan {
         let mut s = format!("Plan: allocate {} as {}\n", self.alloc.addr, self.alloc.fqdn);
         for (i, a) in self.actions.iter().enumerate() {
             let at = a.host.as_deref().map(|h| format!(" @{h}")).unwrap_or_default();
-            let flag = if a.review { "  [needs review — will NOT auto-apply]" } else { "" };
+            let flag = if a.manual {
+                "  [manual — not automatable]"
+            } else if a.review {
+                "  [needs review — will NOT auto-apply]"
+            } else {
+                ""
+            };
             s.push_str(&format!("\n{}. [{}{}] {}{}\n", i + 1, a.target.label(), at, a.summary, flag));
             s.push_str(&format!("     record: {}\n", a.detail));
-            s.push_str(&format!("     $ {}\n", first_line(&a.script)));
+            // A manual step's `script` is an instruction, not a command — show it as such.
+            let lead = if a.manual { "→" } else { "$" };
+            s.push_str(&format!("     {lead} {}\n", first_line(&a.script)));
         }
         s
     }
@@ -267,10 +283,19 @@ mod tests {
     }
 
     #[test]
-    fn preview_shows_hosts_and_review_gate() {
+    fn preview_shows_hosts_and_manual_reverse() {
         let text = Plan::for_allocation(alloc(), "https://netbox.astron.nl", None).unwrap().preview();
         assert!(text.contains("@dns1.astron.nl"));
         assert!(text.contains("@ntserver1.nfra.nl"));
-        assert!(text.contains("needs review"));
+        // The reverse PTR is a manual hand-off (Windows/RDP), not an auto-applied step.
+        assert!(text.contains("manual — not automatable"));
+    }
+
+    #[test]
+    fn reverse_action_is_manual_and_gated() {
+        let plan = Plan::for_allocation(alloc(), "https://netbox.astron.nl", None).unwrap();
+        let rev = &plan.actions[2];
+        assert_eq!(rev.target, Target::DnsReverse);
+        assert!(rev.manual && rev.review); // manual implies review → never auto-applied
     }
 }

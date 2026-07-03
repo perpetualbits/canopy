@@ -38,15 +38,20 @@ impl Zone {
         }
     }
 
-    /// The `10.in-addr.arpa` reverse zone. It is mastered on ntserver1 with a plain
-    /// integer serial. NOTE: the file path is a placeholder until ntserver1's layout
-    /// is confirmed — the reverse apply must not run until then.
+    /// A generic BIND reverse zone with an integer serial — a template kept for a
+    /// BIND-mastered reverse zone we might edit in future.
+    ///
+    /// NOTE: the real `10.in-addr.arpa` master on this estate is **ntserver1, a
+    /// Windows DNS server** owned by another team — no SSH/BIND, RDP-only, not
+    /// automatable (see `docs/dns-estate.md`). netpush does NOT use this recipe for
+    /// that reverse: the PTR is a manual hand-off (see `Plan::for_allocation`). The
+    /// `file` here is a placeholder because this template is never applied as-is.
     #[must_use]
     pub fn reverse_10() -> Zone {
         Zone {
             origin: DnsName::parse("10.in-addr.arpa"),
             server: "ntserver1.nfra.nl".to_string(),
-            file: "TBD:confirm-on-ntserver1".to_string(),
+            file: "TBD:windows-manual".to_string(),
             scheme: SerialScheme::Counter,
         }
     }

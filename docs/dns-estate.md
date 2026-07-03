@@ -27,11 +27,19 @@ Secondaries for `10.in-addr.arpa`: ntserver8, ntserver16, ns0.jive.nl, ns1.jive.
 - `gen_ptr.py` on dns1 is **IPv6-only** — it does *not* manage the IPv4 reverse. Do
   not use it for `in-addr.arpa`.
 
-## Open items before the reverse can be automated
+## The reverse zone is NOT automatable (Windows, cross-team)
 
-1. SSH access + zone file path on **ntserver1.nfra.nl** for `10.in-addr.arpa`.
-2. Confirm ntserver1 uses BID/`named-checkzone`/`rndc` (so the same safe-edit applies)
-   or a different server that needs its own `Zone` recipe.
+`ntserver1.nfra.nl` is a **Windows DNS server** (the `ntserver*` naming gives it
+away), owned by ASTRON's "windows people". There is no SSH/BIND/`rndc` path there,
+and — org reality — changing anything on it is **slow, needs a remote-desktop (RDP)
+session, and cannot currently be automated** (team territoriality). Things that
+would change this (install `sshd` + PowerShell, or WSL) are not on the table now.
+
+**Consequence for netpush:** the reverse `PTR` is a **manual hand-off**, not an SSH
+apply. netpush emits the exact record and its destination (the `10.in-addr.arpa`
+zone on ntserver1) for a human to add via RDP; it must NOT be modelled as a BIND
+file edit. The forward `A` (dns1, Linux/BIND) and the NetBox object stay fully
+automatable — only the PTR waits on the windows-people.
 
 ## Why this is the node-graph seed
 
