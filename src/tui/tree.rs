@@ -160,7 +160,7 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
             ("j/k", "move"),
             ("Enter/→", "expand/inspect"),
             ("←", "collapse"),
-            ("Tab", "table"),
+            ("Tab", "map"),
             ("q", "quit"),
         ],
     );

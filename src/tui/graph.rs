@@ -74,7 +74,7 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
         area.x,
         area.y + area.height - 1,
         area.width,
-        &[("Tab", "table view"), ("hjkl/arrows", "pan"), ("g", "home"), ("q", "quit")],
+        &[("Tab", "tree"), ("hjkl/arrows", "pan"), ("g", "home"), ("q", "quit")],
     );
 }
 
