@@ -172,13 +172,14 @@ fn run_allocation(range: Cidr, args: &Args, cfg: &Config, facts: &[AddressFacts]
 }
 
 /// The offline demo facts, kept to whatever falls inside `range`.
+///
+/// The fixture describes `10.87.3.0/24`, but people browse it through a wider slice
+/// (e.g. `10.87.0.0/20`), so we keep every demo address that `range` *contains* rather
+/// than demanding an exact match — otherwise a wider range would render as all-free and
+/// look broken. A range that doesn't overlap the fixture simply yields no demo facts.
 fn demo_facts(range: &Cidr) -> Vec<AddressFacts> {
-    let (demo_range, facts) = fixture::demo();
-    if *range == demo_range {
-        facts.into_iter().filter(|f| range.contains(f.addr)).collect()
-    } else {
-        Vec::new()
-    }
+    let (_demo_range, facts) = fixture::demo();
+    facts.into_iter().filter(|f| range.contains(f.addr)).collect()
 }
 
 /// Print the reconciled range as plain text: a status tally, then every address

@@ -158,6 +158,9 @@ pub struct App {
     pub cfg: Config,
     /// `true` while a background live-gather is running.
     pub loading: bool,
+    /// Set by the `L` key; the event loop services it (fetching the token with the
+    /// TUI suspended) and clears it.
+    request_live: bool,
     /// `true` while a background allocate-apply is running.
     pub applying: bool,
     /// A short status line (message, is_error) shown in the header.
@@ -208,6 +211,7 @@ impl App {
             started: Instant::now(),
             cfg,
             loading: false,
+            request_live: false,
             applying: false,
             status: None,
             alloc: None,
@@ -219,11 +223,27 @@ impl App {
         }
     }
 
-    /// Kick off a live gather on a background thread (no-op if one is running).
-    ///
-    /// The SSH sweep takes tens of seconds, so it runs off-thread and reports back
-    /// through a channel; the UI keeps redrawing and stays responsive meanwhile.
-    fn start_live_gather(&mut self) {
+    /// Ask for a live gather. This only *raises a flag*; the event loop
+    /// ([`main_loop`]) picks it up, because the token fetch may need to suspend the
+    /// TUI so `pinentry` gets a clean terminal, and only the loop owns the terminal.
+    fn request_live_gather(&mut self) {
+        if self.loading {
+            return;
+        }
+        self.request_live = true;
+    }
+
+    /// Take (and clear) a pending live-gather request. Called once per loop tick by
+    /// [`main_loop`], which then fetches the token and calls [`spawn_live_gather`].
+    #[must_use]
+    pub fn take_live_request(&mut self) -> bool {
+        std::mem::take(&mut self.request_live)
+    }
+
+    /// Start the background SSH sweep with an already-fetched `token` (no-op if one is
+    /// already running). The sweep takes tens of seconds, so it runs off-thread and
+    /// reports back through a channel; the UI keeps redrawing meanwhile.
+    pub fn spawn_live_gather(&mut self, token: String) {
         if self.loading {
             return;
         }
@@ -231,11 +251,24 @@ impl App {
         let cfg = self.cfg.clone();
         let range = self.range;
         std::thread::spawn(move || {
-            let _ = tx.send(live::gather_live(&range, &cfg));
+            let _ = tx.send(live::gather_live_with_token(&range, &cfg, token));
         });
         self.live_rx = Some(rx);
         self.loading = true;
         self.status = Some(("gathering live data…".to_string(), false));
+    }
+
+    /// The `pass` entry to unlock for the NetBox token — read by [`main_loop`] when it
+    /// services a live request.
+    #[must_use]
+    pub fn token_pass(&self) -> &str {
+        &self.cfg.token_pass
+    }
+
+    /// Set the status line (message, is_error) — used by the loop to report a token
+    /// failure it handled outside the normal key path.
+    pub fn set_status(&mut self, msg: impl Into<String>, is_error: bool) {
+        self.status = Some((msg.into(), is_error));
     }
 
     /// Check whether the background gather has finished; apply or report its result.
@@ -459,7 +492,7 @@ impl App {
                 return;
             }
             KeyCode::Char('L') => {
-                self.start_live_gather();
+                self.request_live_gather();
                 return;
             }
             _ => {}
@@ -702,7 +735,7 @@ pub fn run(range: Cidr, facts: Vec<AddressFacts>, write_mode: bool, dry_run: boo
 
 /// The draw / read-key loop: redraw, then wait up to one tick for a key.
 fn main_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> anyhow::Result<()> {
-    let reader = EventReader::new();
+    let mut reader = EventReader::new();
     while !app.quit {
         app.poll_live();
         app.poll_apply();
@@ -715,8 +748,47 @@ fn main_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -
         if let Some(Event::Key(KeyEvent { code, .. })) = reader.recv_timeout(RENDER_TICK) {
             app.on_key(code);
         }
+        // Service a live request here, where we own the terminal: the token fetch may
+        // launch `pinentry`, which needs a normal tty *and* the keyboard to itself — so
+        // we drop our stdin reader across the prompt, then bring it back.
+        if app.take_live_request() {
+            reader = fetch_token_and_spawn(term, reader, app)?;
+        }
     }
     Ok(())
+}
+
+/// Fetch the NetBox token, then start the background sweep with it.
+///
+/// If the token is in the environment, `get_token` returns without prompting and the
+/// screen is left untouched. Otherwise `pass`→`gpg`→`pinentry` needs the real terminal:
+/// we drop the [`EventReader`] (so its thread stops consuming stdin and the passphrase
+/// reaches pinentry), leave raw/alternate-screen mode, prompt, then restore both and
+/// return a fresh reader. On failure the status line reports it and nothing is spawned.
+fn fetch_token_and_spawn(
+    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    reader: EventReader,
+    app: &mut App,
+) -> anyhow::Result<EventReader> {
+    let env_token = std::env::var("NETPUSH_NETBOX_TOKEN").is_ok_and(|v| !v.trim().is_empty());
+    if env_token {
+        match live::get_token(app.token_pass()) {
+            Ok(tok) => app.spawn_live_gather(tok),
+            Err(e) => app.set_status(format!("live load failed: {e}"), true),
+        }
+        return Ok(reader);
+    }
+
+    drop(reader); // stop the stdin-polling thread so pinentry gets the keystrokes
+    term.leave()?; // cooked mode + main screen: pinentry owns the terminal
+    eprintln!("netpush: unlocking the NetBox token (pass/gpg) — enter your passphrase…");
+    let token = live::get_token(app.token_pass());
+    term.enter()?; // back into the TUI; the next loop iteration repaints
+    match token {
+        Ok(tok) => app.spawn_live_gather(tok),
+        Err(e) => app.set_status(format!("live load failed: {e}"), true),
+    }
+    Ok(EventReader::new())
 }
 
 #[cfg(test)]

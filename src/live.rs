@@ -10,17 +10,31 @@ use crate::config::Config;
 use crate::reconcile::{AddressFacts, Cidr};
 use crate::sources::{self, dns::DnsSource, netbox::NetboxSource, probe::ProbeSource, FactSource, Vantage};
 
-/// Gather NetBox + DNS + probe facts and merge them.
+/// Gather NetBox + DNS + probe facts and merge them, fetching the token first.
+///
+/// Used by the CLI (`--live`), where prompting for the token inline is fine because
+/// no TUI owns the terminal yet. The in-TUI path instead fetches the token separately
+/// (with the screen suspended so `pinentry` gets a clean tty) and calls
+/// [`gather_live_with_token`].
+///
+/// # Errors
+/// Propagates a token failure, or the first source that fails (SSH, HTTP, DNS).
+pub fn gather_live(range: &Cidr, cfg: &Config) -> anyhow::Result<Vec<AddressFacts>> {
+    let token = get_token(&cfg.token_pass)?;
+    gather_live_with_token(range, cfg, token)
+}
+
+/// Gather and merge the sources using an already-fetched NetBox `token`.
 ///
 /// NetBox and DNS run on `cfg.vantage` (they need internal reachability); the ping
-/// probe runs on `cfg.probe_host`, which must sit on the target L2.
+/// probe runs on `cfg.probe_host`, which must sit on the target L2. This does no
+/// interactive prompting, so it is safe to run on a background thread while the TUI
+/// holds the terminal.
 ///
 /// # Errors
 /// Propagates the first source that fails (SSH, HTTP, DNS).
-pub fn gather_live(range: &Cidr, cfg: &Config) -> anyhow::Result<Vec<AddressFacts>> {
+pub fn gather_live_with_token(range: &Cidr, cfg: &Config, token: String) -> anyhow::Result<Vec<AddressFacts>> {
     let vantage = Vantage::new(&cfg.vantage);
-    let token = get_token(&cfg.token_pass)?;
-
     let netbox = NetboxSource { vantage: vantage.clone(), base_url: cfg.netbox_url.clone(), token };
     let dns = DnsSource { vantage: vantage.clone() };
     let probe = ProbeSource { vantage: Vantage::new(&cfg.probe_host) };
