@@ -8,7 +8,7 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::rc::Rc;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyEvent};
 use mullion::{backend::CrosstermBackend, style::Style, EventReader, GraphCanvas, KeyCode, RangeSource, Terminal};
@@ -85,6 +85,29 @@ impl View {
     }
 }
 
+/// How the IP map shades a cell by how used it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DensityStyle {
+    /// A scrolling `▪`/`▫` bitstream (borrowed from aerie's `spiral_stress` surf
+    /// field via [`mullion::FlowStyle`]): the fraction of solid squares equals the
+    /// cell's used fraction, each cell its own golden-angle hue, set bits glowing.
+    Bitstream,
+    /// A single accent-coloured shade block `░▒▓█` deepening with density — calm,
+    /// static, and friendly to low-colour terminals.
+    Shade,
+}
+
+impl DensityStyle {
+    /// Flip between the two styles (the `s` key on the map).
+    #[must_use]
+    fn toggle(self) -> DensityStyle {
+        match self {
+            DensityStyle::Bitstream => DensityStyle::Shade,
+            DensityStyle::Shade => DensityStyle::Bitstream,
+        }
+    }
+}
+
 /// The whole application state.
 pub struct App {
     /// The range being browsed.
@@ -126,6 +149,10 @@ pub struct App {
     pub map_order: u32,
     /// Parent scopes to return to on zoom-out (each a range + its facts).
     zoom_stack: Vec<ZoomFrame>,
+    /// How the map shades cells by occupancy.
+    pub density: DensityStyle,
+    /// When the app started — the clock the map's bitstream animation reads.
+    started: Instant,
 
     /// Connection settings, used to gather live data on demand.
     pub cfg: Config,
@@ -177,6 +204,8 @@ impl App {
             map_cur: (0, 0),
             map_order: 0,
             zoom_stack: Vec::new(),
+            density: DensityStyle::Bitstream,
+            started: Instant::now(),
             cfg,
             loading: false,
             applying: false,
@@ -463,8 +492,16 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.map_cur.1 = (self.map_cur.1 + 1).min(last),
             KeyCode::Enter | KeyCode::Char('+') => self.zoom_into_cursor(),
             KeyCode::Backspace | KeyCode::Char('-') => self.zoom_out(),
+            KeyCode::Char('s') => self.density = self.density.toggle(),
             _ => {}
         }
+    }
+
+    /// Seconds since start — the animation clock the map's scrolling bitstream reads.
+    /// (The redraw loop ticks ~20×/s, so the stream stays smooth without input.)
+    #[must_use]
+    pub fn anim_t(&self) -> f32 {
+        self.started.elapsed().as_secs_f32()
     }
 
     /// How many levels the map is zoomed in — 0 at the top range. Used by the map
@@ -881,6 +918,18 @@ mod tests {
         assert_eq!(app.range, range);
         assert_eq!(app.total, parent_total);
         assert_eq!(app.zoom_depth(), 0);
+    }
+
+    #[test]
+    fn map_density_style_defaults_to_bitstream_and_s_toggles_it() {
+        let range = Cidr::parse("10.87.3.0/24").unwrap();
+        let mut app = App::new(range, Vec::new(), false, false, false, Config::default());
+        app.view = View::Map;
+        assert_eq!(app.density, DensityStyle::Bitstream); // the requested look, by default
+        app.on_key(KeyCode::Char('s'));
+        assert_eq!(app.density, DensityStyle::Shade);
+        app.on_key(KeyCode::Char('s'));
+        assert_eq!(app.density, DensityStyle::Bitstream);
     }
 
     #[test]

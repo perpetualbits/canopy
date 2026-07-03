@@ -66,11 +66,33 @@ each cell is a real `/k`. Zoom targets a *cell* (clean `/k`), not an arbitrary
 rectangle. Legend: "each cell = `/k`", plus the address span. Much less code than
 Hilbert; loses only whole-rectangle zoom.
 
+## Density style: the bitstream (shipped)
+
+Sub-question #2 (below) is settled: the default is a **scrolling `▪`/`▫` bitstream**,
+the look from aerie's `spiral_stress` "surf field", with the old shade block kept as a
+toggle (`s`). The mechanism is lifted straight from the demo via the mullion primitive
+`FlowStyle::color(pos, t, active)` (§ socket / §3.12 `BorderGap`):
+
+- **Free cells** stay a calm dim `·` — the map still reads "where is stuff" at a
+  glance, and a mostly-empty range doesn't shimmer everywhere.
+- **Used cells** stream `▪` (set bit) / `▫` (clear bit). The share of solid squares
+  equals the cell's used fraction (`stream_bit`: a fixed per-cell hash pattern with
+  ~`frac` of its bit-cells solid, windowed by a time-scrolled index), so **density
+  stays honest** — this is the answer to "shade vs heat": neither, the *fill ratio*
+  carries occupancy, and set bits glow brighter on top (the demo's `active` lift).
+- **Colour** is a golden-angle hue per cell (`FlowStyle.band = d`), so cells read as
+  distinct data channels; hue sweeps across the row and shimmers on its own cycle.
+- **Animation** rides the existing ~20 fps redraw loop (`App::anim_t`); no new timer.
+
+Open follow-ups if we want to push it further: seed the hue by subnet identity (so a
+block keeps its colour across zoom), or let the payload be the cell's *real* bytes
+(CIDR / used-count) so a wide-enough gap decodes back to telemetry like the demo does —
+at 2 columns per cell that's an easter egg, not a feature, so it's deferred.
+
 ## Open sub-questions
 
 1. ~~Layout: Hilbert vs block-aligned raster vs keep raster.~~ **Decided: Hilbert.**
-2. Shade vs colour for density — the current `░▒▓█` in one accent colour is neutral;
-   a green→red heat would read "fuller = hotter" (no free space). Which reading do we
-   want? **Still open.**
+2. ~~Shade vs colour for density.~~ **Decided: scrolling bitstream (fill ratio =
+   occupancy), shade block kept as the `s` toggle.** See above.
 3. ~~Cell aspect.~~ Cells are 2 terminal columns wide (squarer), which keeps the
    Hilbert quadrant structure readable. **Settled.**
