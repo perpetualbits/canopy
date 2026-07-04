@@ -18,6 +18,9 @@
 //! out, so a few steps take a `/8` down to a `/24` the table and tree resolve to
 //! single addresses.
 
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
+
 use mullion::style::{Color, Style};
 use mullion::{Buffer, Rect};
 
@@ -25,6 +28,7 @@ use super::app::{App, DensityStyle};
 use super::draw::{btxt, keyhints};
 use super::theme::{s_accent, s_dim, s_ok, s_sel, s_title, s_warn};
 use crate::map::MapGrid;
+use crate::reconcile::{self, AddressFacts, Cidr};
 
 /// Empty IP space: a grey hollow square. The small `▫` (not the full-size `□`) reads
 /// better on a dense grid — the look from aerie's `spiral_stress`.
@@ -123,6 +127,38 @@ fn draw_legend_key(buf: &mut Buffer, x: u16, y: u16, style: DensityStyle) {
     }
 }
 
+/// The last address of the block that starts at `base` and holds `block` addresses
+/// (`base + block − 1`), for showing a cell's address span.
+fn last_of(base: Ipv4Addr, block: u64) -> Ipv4Addr {
+    Ipv4Addr::from(u32::from(base).wrapping_add((block - 1) as u32))
+}
+
+/// A short, comma-separated list of the hostnames inside `sub` — what lives in the
+/// block under the cursor. Shows up to `max` names, then `+N` for the rest; `—` when
+/// the block is empty. Names come from the reconciled facts (PTR or NetBox name).
+fn names_in(facts: &HashMap<Ipv4Addr, AddressFacts>, sub: Cidr, max: usize) -> String {
+    let mut names: Vec<String> = facts
+        .values()
+        .filter(|f| sub.contains(f.addr))
+        .filter_map(|f| reconcile::row_from_facts(f).name)
+        .collect();
+    if names.is_empty() {
+        return "—".to_string();
+    }
+    names.sort();
+    let extra = names.len().saturating_sub(max);
+    let mut shown = names.into_iter().take(max).collect::<Vec<_>>().join(", ");
+    if extra > 0 {
+        shown.push_str(&format!(", +{extra}"));
+    }
+    shown
+}
+
+/// Clip `text` to at most `w` columns (so an info line never overruns the screen).
+fn clip(text: &str, w: u16) -> String {
+    text.chars().take(w as usize).collect()
+}
+
 /// Paint the map view for the current [`App`] state.
 pub fn screen(buf: &mut Buffer, app: &mut App) {
     let area = buf.area;
@@ -136,8 +172,8 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
     let (data, dstyle) = if app.live { ("LIVE", s_ok()) } else { ("DEMO", s_warn()) };
     btxt(buf, area.x + title.chars().count() as u16 + 2, area.y, data, dstyle);
 
-    // ── grid ──
-    let body = Rect::new(area.x, area.y + 2, area.width, area.height.saturating_sub(3));
+    // ── grid ── (top: title, legend; bottom three rows: cursor info, scope, footer)
+    let body = Rect::new(area.x, area.y + 2, area.width, area.height.saturating_sub(5));
     let grid = MapGrid::build(app.range, &app.facts, fit_order(body));
     let side = grid.side();
     let used_total: u32 = grid.used.iter().sum();
@@ -168,29 +204,49 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
         }
     }
 
-    // ── footer ──
-    // Show the block the cursor sits over — what `Enter` would zoom into — and the
-    // key hints (zoom only offered while there's a finer subnet to reach).
-    if let Some(sub) = app.cursor_subnet() {
-        let depth = app.zoom_depth();
-        let crumb = if depth > 0 { format!("  (depth {depth}, Bksp: out)") } else { String::new() };
-        btxt(buf, area.x, body.y + body.height, &format!("▸ {}/{}{crumb}", sub.base, sub.prefix_len), s_accent());
-        keyhints(
-            buf,
-            area.x,
-            area.y + area.height - 1,
-            area.width,
-            &[("hjkl", "move"), ("↵", "zoom in"), ("Bksp", "out"), ("s", "style"), ("Tab", "table"), ("q", "quit")],
-        );
+    // ── cursor info · scope breadcrumb · footer (bottom three rows) ──
+    let info_y = area.y + area.height - 3;
+    let scope_y = area.y + area.height - 2;
+    let foot_y = area.y + area.height - 1;
+
+    // The block the cursor sits over: its CIDR, address span, occupancy and hostnames.
+    // When the grid is a single cell (order 0), that block is the whole current scope.
+    let zoomable = app.cursor_subnet().is_some();
+    let (cell, used, block) = match app.cursor_subnet() {
+        Some(sub) => {
+            let d = crate::map::hilbert_xy2d(grid.order, app.map_cur.0, app.map_cur.1) as usize;
+            (sub, grid.used.get(d).copied().unwrap_or(0), grid.block)
+        }
+        None => (app.range, used_total, grid.range.block_len()),
+    };
+    let info = format!(
+        "▸ {}/{}   {} – {}   {}/{} used   {}",
+        cell.base,
+        cell.prefix_len,
+        cell.base,
+        last_of(cell.base, block),
+        used,
+        block,
+        names_in(&app.facts, cell, 3),
+    );
+    btxt(buf, area.x, info_y, &clip(&info, area.width), s_accent());
+
+    // Scope breadcrumb: outermost range › … › current, so you never lose your place.
+    let crumb = app
+        .scope_chain()
+        .iter()
+        .map(|c| format!("{}/{}", c.base, c.prefix_len))
+        .collect::<Vec<_>>()
+        .join(" › ");
+    btxt(buf, area.x, scope_y, &clip(&format!("scope: {crumb}"), area.width), s_dim());
+
+    // Footer key hints (zoom only offered while there's a finer subnet to reach).
+    let hints: &[(&str, &str)] = if zoomable {
+        &[("hjkl", "move"), ("↵", "zoom in"), ("Bksp", "out"), ("s", "style"), ("Tab", "table"), ("q", "quit")]
     } else {
-        keyhints(
-            buf,
-            area.x,
-            area.y + area.height - 1,
-            area.width,
-            &[("s", "style"), ("Tab", "table"), ("q", "quit")],
-        );
-    }
+        &[("s", "style"), ("Tab", "table"), ("q", "quit")]
+    };
+    keyhints(buf, area.x, foot_y, area.width, hints);
 }
 
 #[cfg(test)]

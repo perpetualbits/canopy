@@ -526,11 +526,14 @@ impl App {
         }
     }
 
-    /// How many levels the map is zoomed in — 0 at the top range. Used by the map
-    /// footer to show a breadcrumb depth.
+    /// The chain of ranges from the outermost scope down to the current one — the map's
+    /// zoom breadcrumb. The first entry is where you started; the last is the current
+    /// scope. Each parent came from a `ZoomFrame` pushed on the way in.
     #[must_use]
-    pub fn zoom_depth(&self) -> usize {
-        self.zoom_stack.len()
+    pub fn scope_chain(&self) -> Vec<Cidr> {
+        let mut chain: Vec<Cidr> = self.zoom_stack.iter().map(|f| f.range).collect();
+        chain.push(self.range);
+        chain
     }
 
     /// The subnet the map cursor sits over — the block that cell covers, a
@@ -970,7 +973,7 @@ mod tests {
         assert!(target.contains(host));
         app.on_key(KeyCode::Enter);
         assert_eq!(app.range, target);
-        assert_eq!(app.zoom_depth(), 1);
+        assert_eq!(app.scope_chain(), vec![range, target]); // parent › current
         assert!(app.total < parent_total);
         // The one host survived the narrowing (it lies inside the zoomed subnet).
         assert_eq!(app.counts.dns_only, 1);
@@ -980,7 +983,7 @@ mod tests {
         app.on_key(KeyCode::Backspace);
         assert_eq!(app.range, range);
         assert_eq!(app.total, parent_total);
-        assert_eq!(app.zoom_depth(), 0);
+        assert_eq!(app.scope_chain(), vec![range]); // back to just the top scope
     }
 
     #[test]
