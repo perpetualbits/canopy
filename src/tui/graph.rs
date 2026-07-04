@@ -19,8 +19,8 @@ use crate::graph::NodeKind;
 
 /// Paint the graph view for the current [`App`] state.
 pub fn screen(buf: &mut Buffer, app: &mut App) {
-    let area = buf.area;
-    if area.width < 24 || area.height < 6 {
+    let full = buf.area;
+    if full.width < 26 || full.height < 8 {
         return;
     }
     let (cw, ch) = app.graph_canvas.size();
@@ -28,13 +28,14 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
     app.pan.0 = app.pan.0.min(cw.saturating_sub(1));
     app.pan.1 = app.pan.1.min(ch.saturating_sub(1));
 
-    // ── header ──
-    btxt(buf, area.x, area.y, &format!("netpush — graph: {}/{}", app.range.base, app.range.prefix_len), s_title());
+    // ── frame + header ──
+    let title = format!("netpush — graph: {}/{}", app.range.base, app.range.prefix_len);
+    let area = super::draw::frame(buf, full, &title, s_title(), Some(super::draw::data_badge(app)));
     let hosts = app.graph.nodes.len().saturating_sub(app.graph.cluster_count());
     btxt(
         buf,
         area.x,
-        area.y + 1,
+        area.y,
         &format!(
             "{} clusters · {} hosts    canvas {cw}×{ch}  pan {},{}",
             app.graph.cluster_count(),
@@ -45,7 +46,7 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
         s_dim(),
     );
 
-    let body = Rect::new(area.x, area.y + 2, area.width, area.height.saturating_sub(3));
+    let body = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(2));
 
     // Positions in canvas space (window = the whole canvas).
     let solved = app.graph_canvas.solve(Rect::new(0, 0, cw, ch));
@@ -77,6 +78,9 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
         &[("Tab", "tree"), ("hjkl/arrows", "pan"), ("g", "home"), ("q", "quit")],
     );
 }
+
+// Note: the outer frame/title is drawn by `super::draw::frame`; this view lays its
+// content out inside the returned inner rect.
 
 /// Draw one node box plus its (truncated) label; clusters get a heavy accent border.
 fn draw_node(buf: &mut Buffer, r: Rect, label: &str, cluster: bool) {

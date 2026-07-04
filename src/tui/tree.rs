@@ -123,8 +123,8 @@ pub fn rows(app: &App) -> Vec<TreeRowView> {
 
 /// Paint the tree view for the current [`App`] state.
 pub fn screen(buf: &mut Buffer, app: &mut App) {
-    let area = buf.area;
-    if area.width < 24 || area.height < 6 {
+    let full = buf.area;
+    if full.width < 26 || full.height < 8 {
         return;
     }
     let rows = rows(app);
@@ -132,12 +132,13 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
         app.tree_cur = app.tree_cur.min(rows.len() - 1);
     }
 
-    // ── header ──
-    btxt(buf, area.x, area.y, "netpush — tree", s_title());
-    btxt(buf, area.x, area.y + 1, "network → cluster → host", s_dim());
+    // ── frame + header ──
+    let title = format!("netpush — tree: {}/{}", app.range.base, app.range.prefix_len);
+    let area = super::draw::frame(buf, full, &title, s_title(), Some(super::draw::data_badge(app)));
+    btxt(buf, area.x, area.y, "network → cluster → host", s_dim());
 
     // ── body: the visible slice of the tree ──
-    let body = Rect::new(area.x, area.y + 2, area.width, area.height.saturating_sub(3));
+    let body = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(2));
     let vis = body.height as usize;
     // Keep the cursor in view with a simple top offset.
     let top = app.tree_cur.saturating_sub(vis.saturating_sub(1)).min(app.tree_cur);

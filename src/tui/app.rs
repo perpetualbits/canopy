@@ -946,6 +946,31 @@ mod tests {
 
 
     #[test]
+    fn every_view_draws_the_outer_frame() {
+        use mullion::{Buffer, Rect};
+        let (range, facts) = fixture::demo();
+        let mut app = App::new(range, facts, false, false, false, Config::default());
+        for view in [View::Table, View::Graph, View::Tree, View::Map] {
+            app.view = view;
+            let mut buf = Buffer::empty(Rect::new(0, 0, 90, 24));
+            match view {
+                View::Table => draw::screen(&mut buf, &mut app),
+                View::Graph => crate::tui::graph::screen(&mut buf, &mut app),
+                View::Tree => crate::tui::tree::screen(&mut buf, &mut app),
+                View::Map => crate::tui::map::screen(&mut buf, &mut app),
+            }
+            // Rounded corners on all four corners of the frame.
+            assert_eq!(buf.get(0, 0).symbol, "╭", "{view:?} top-left corner");
+            assert_eq!(buf.get(89, 0).symbol, "╮", "{view:?} top-right corner");
+            assert_eq!(buf.get(0, 23).symbol, "╰", "{view:?} bottom-left corner");
+            // The title is bookended into the top edge (┤ … ├).
+            let top: String = (0..90).map(|x| buf.get(x, 0).symbol.clone()).collect();
+            assert!(top.contains("netpush"), "{view:?} title in the top border: {top:?}");
+            assert!(top.contains('┤') && top.contains('├'), "{view:?} bookend caps");
+        }
+    }
+
+    #[test]
     fn map_zoom_narrows_scope_and_zoom_out_restores_it() {
         // A /8 with one host outside the top-left cell; render sets the grid order,
         // then Enter zooms into the cursor cell and everything narrows to that subnet.

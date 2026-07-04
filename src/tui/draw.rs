@@ -5,17 +5,65 @@
 
 use mullion::border::{draw_box, BorderStyle, Borders, CornerStyle, LineWeight};
 use mullion::style::Color;
-use mullion::{render_keyhints, render_scrollbar, style::Style, Buffer, Rect, RecordSource, ScrollMetrics, TextCtx};
+use mullion::{
+    bookends, render_keyhints, render_scrollbar, style::Style, Buffer, Rect, RecordSource, ScrollMetrics, Side, TextCtx,
+};
 
 use super::app::{AllocPhase, App};
 use super::theme::{
-    s_accent, s_dim, s_err, s_head, s_normal, s_ok, s_sel, s_title, s_warn, status_label, status_style,
+    s_accent, s_border, s_dim, s_err, s_head, s_normal, s_ok, s_sel, s_title, s_warn, status_label, status_style,
 };
 use crate::reconcile::{AddressStatus, Counts};
 
 /// Write `text` at `(x, y)` in `style`.
 pub fn btxt(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
     buf.set_string(x, y, text, style);
+}
+
+/// Draw the program's outer border around `area`, seating `title` in a bookended gap
+/// (`┤ title ├`) at the top-left and, if given, `right` (e.g. the mode badge) in one at
+/// the top-right. Return the content rect — `area` inset one cell on every side.
+///
+/// The bookended-gap look is mullion's socket convention: the border line is capped by
+/// `┤`/`├` on each side of an opening, here used to seat a caption in the frame. The
+/// same gaps can later carry a progress bar or other status.
+pub fn frame(buf: &mut Buffer, area: Rect, title: &str, title_style: Style, right: Option<(&str, Style)>) -> Rect {
+    let bs = BorderStyle { weight: LineWeight::Light, corners: CornerStyle::Rounded, style: s_border() };
+    draw_box(buf, area, Borders::ALL, &bs);
+    let (lcap, rcap) = bookends(Side::Top);
+    let top = area.y;
+
+    // Left title, seated a couple of cells in from the corner.
+    if area.width > 10 && !title.is_empty() {
+        let mut x = buf.set_string(area.x + 2, top, lcap, s_border());
+        x = buf.set_string(x, top, &format!(" {title} "), title_style);
+        buf.set_string(x, top, rcap, s_border());
+    }
+
+    // Right caption, ending a couple of cells before the far corner.
+    if let Some((text, st)) = right {
+        let w = text.chars().count() as u16 + 4; // ┤ + spaces + text + ├
+        if area.width > w + 8 {
+            let mut x = buf.set_string(area.right().saturating_sub(2 + w), top, lcap, s_border());
+            x = buf.set_string(x, top, &format!(" {text} "), st);
+            buf.set_string(x, top, rcap, s_border());
+        }
+    }
+
+    Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), area.height.saturating_sub(2))
+}
+
+/// The data-source badge: `LOADING…` while a live gather runs, else `LIVE` or `DEMO`.
+/// Shown in every view's frame so the source (and a running load) is always visible.
+#[must_use]
+pub fn data_badge(app: &App) -> (&'static str, Style) {
+    if app.loading {
+        ("LOADING…", s_warn())
+    } else if app.live {
+        ("LIVE", s_ok())
+    } else {
+        ("DEMO", s_warn())
+    }
 }
 
 /// Fill `w` cells from `(x, y)` with spaces in `style` — used for the row highlight.
@@ -52,42 +100,27 @@ pub fn vscroll(buf: &mut Buffer, area: Rect, offset: usize, len: usize, vis: usi
 /// address table, and a key-hint footer. Mutates `app` only to keep the cursor's
 /// scroll offset in view for the body height we just measured.
 pub fn screen(buf: &mut Buffer, app: &mut App) {
-    let area = buf.area;
-    if area.width < 24 || area.height < 6 {
-        return; // too small to draw anything meaningful
+    let full = buf.area;
+    if full.width < 26 || full.height < 8 {
+        return; // too small to draw the frame and anything meaningful inside it
     }
 
-    // ── title row ──
+    // ── outer frame: title + mode badge live in the border; content goes inside ──
     let mode = app.mode_label();
     let title = format!("netpush — {}/{}", app.range.base, app.range.prefix_len);
-    btxt(buf, area.x, area.y, &title, s_title());
-    // DEMO / LIVE / LOADING badge just after the title, so the data source is obvious.
-    let (data, data_style) = if app.loading {
-        ("LOADING…", s_warn())
-    } else if app.live {
-        ("LIVE", s_ok())
-    } else {
-        ("DEMO", s_warn())
-    };
-    let badge_x = area.x + title.chars().count() as u16 + 2;
-    btxt(buf, badge_x, area.y, data, data_style);
-    // Optional status message after the badge (dim, or red on error).
+    let area = frame(buf, full, &title, s_title(), Some((mode.0, mode.1)));
+
+    // ── status row (inside the frame): data-source badge, then any status message ──
+    let (data, data_style) = data_badge(app);
+    btxt(buf, area.x, area.y, data, data_style);
     if let Some((msg, err)) = &app.status {
-        let sx = badge_x + data.chars().count() as u16 + 2;
-        let room = area.width.saturating_sub(sx - area.x + 12); // leave space for the mode badge
+        let sx = area.x + data.chars().count() as u16 + 2;
+        let room = area.width.saturating_sub(sx - area.x);
         if room > 8 {
             let text: String = msg.chars().take(room as usize).collect();
             btxt(buf, sx, area.y, &text, if *err { s_err() } else { s_dim() });
         }
     }
-    // Mode badge at the right.
-    btxt(
-        buf,
-        area.x + area.width.saturating_sub(mode.0.len() as u16 + 1),
-        area.y,
-        mode.0,
-        mode.1,
-    );
 
     // ── count bar ──
     count_bar(buf, area.x, area.y + 1, &app.counts);

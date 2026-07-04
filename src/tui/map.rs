@@ -26,7 +26,7 @@ use mullion::{Buffer, Rect};
 
 use super::app::{App, DensityStyle};
 use super::draw::{btxt, keyhints};
-use super::theme::{s_accent, s_dim, s_ok, s_sel, s_title, s_warn};
+use super::theme::{s_accent, s_dim, s_sel, s_title};
 use crate::map::MapGrid;
 use crate::reconcile::{self, AddressFacts, Cidr};
 
@@ -161,19 +161,17 @@ fn clip(text: &str, w: u16) -> String {
 
 /// Paint the map view for the current [`App`] state.
 pub fn screen(buf: &mut Buffer, app: &mut App) {
-    let area = buf.area;
-    if area.width < 24 || area.height < 6 {
+    let full = buf.area;
+    if full.width < 26 || full.height < 8 {
         return;
     }
 
-    // ── header ──
+    // ── frame (title + data badge in the border) ──
     let title = format!("netpush — map: {}/{}", app.range.base, app.range.prefix_len);
-    btxt(buf, area.x, area.y, &title, s_title());
-    let (data, dstyle) = if app.live { ("LIVE", s_ok()) } else { ("DEMO", s_warn()) };
-    btxt(buf, area.x + title.chars().count() as u16 + 2, area.y, data, dstyle);
+    let area = super::draw::frame(buf, full, &title, s_title(), Some(super::draw::data_badge(app)));
 
-    // ── grid ── (top: title, legend; bottom three rows: cursor info, scope, footer)
-    let body = Rect::new(area.x, area.y + 2, area.width, area.height.saturating_sub(5));
+    // ── grid ── (row 0: legend; bottom three rows: cursor info, scope, footer)
+    let body = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(4));
     let grid = MapGrid::build(app.range, &app.facts, fit_order(body));
     let side = grid.side();
     let used_total: u32 = grid.used.iter().sum();
@@ -191,8 +189,8 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
         grid.block,
         grid.range.block_len()
     );
-    btxt(buf, area.x, area.y + 1, &head, s_dim());
-    draw_legend_key(buf, area.x + head.chars().count() as u16, area.y + 1, app.density);
+    btxt(buf, area.x, area.y, &head, s_dim());
+    draw_legend_key(buf, area.x + head.chars().count() as u16, area.y, app.density);
 
     for d in 0..grid.cells() {
         let (gx, gy) = grid.cell_xy(d);
