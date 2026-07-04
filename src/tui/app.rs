@@ -772,7 +772,9 @@ fn fetch_token_and_spawn(
     term.leave()?; // cooked mode + main screen: pinentry owns the terminal
     eprintln!("netpush: unlocking the NetBox token (pass/gpg) — enter your passphrase…");
     let token = live::get_token(app.token_pass());
-    term.enter()?; // back into the TUI; the next loop iteration repaints
+    term.enter()?; // back into the TUI …
+    term.clear()?; // … and force a full repaint: pinentry scribbled over the screen,
+                   // so mullion's cached model of it is stale and the diff would skip cells.
     match token {
         Ok(tok) => app.spawn_live_gather(tok),
         Err(e) => app.set_status(format!("live load failed: {e}"), true),

@@ -26,10 +26,12 @@ use super::draw::{btxt, keyhints};
 use super::theme::{s_accent, s_dim, s_ok, s_sel, s_title, s_warn};
 use crate::map::MapGrid;
 
-/// Empty IP space: a grey hollow square.
-const EMPTY_GLYPH: char = '□';
+/// Empty IP space: a grey hollow square. The small `▫` (not the full-size `□`) reads
+/// better on a dense grid — the look from aerie's `spiral_stress`.
+const EMPTY_GLYPH: char = '▫';
 /// A used block: a filled square (coloured by [`heat_color`], or the shade accent).
-const USED_GLYPH: char = '■';
+/// The small `▪` to match [`EMPTY_GLYPH`].
+const USED_GLYPH: char = '▪';
 
 /// A Planck-style blackbody heat ramp, low → high occupancy: deep red, red, orange,
 /// yellow, yellow-white, white, white-blue, hot-blue. Colouring a block by how full it

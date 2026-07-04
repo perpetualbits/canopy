@@ -2,8 +2,8 @@
 // Copyright (C) 2026  Epsilon Null Operation
 //! DNS as a fact source: the PTR records actually served. This is the most reliable
 //! "is it allocated?" signal we found — it caught addresses NetBox never recorded.
-//! We run one reverse lookup per host on the vantage (its resolver knows the
-//! internal zones) and collect the answers.
+//! We reverse-resolve every host on the vantage (its resolver knows the internal
+//! zones), in parallel with bounded fan-out, and collect the answers.
 
 use super::{FactSource, Vantage};
 use crate::reconcile::{AddressFacts, Cidr};
@@ -18,11 +18,15 @@ pub struct DnsSource {
 impl FactSource for DnsSource {
     fn gather(&self, range: &Cidr) -> anyhow::Result<Vec<AddressFacts>> {
         let ips = host_list(range);
-        // One `host` per address; print "ip name" only when a PTR exists. The
-        // trailing `true` guarantees a zero exit even when the last address (or any)
-        // has no PTR — otherwise the loop's final `&&` would fail the whole ssh call.
+        // Reverse-resolve in parallel with bounded fan-out. A serial `for` loop does one
+        // blocking `host` per address — for a /20 that is ~4000 lookups back-to-back,
+        // each waiting out a timeout when there is no PTR, so it took minutes. `xargs -P`
+        // runs up to 128 at once (bounding load on the resolver) and `host -W1` caps each
+        // lookup at ~1 s, so the whole sweep finishes in tens of seconds. `sed` pulls the
+        // name after "pointer "; addresses without a PTR print nothing. `$0` inside the
+        // `sh -c` body is the address xargs handed it.
         let remote = format!(
-            "for ip in {ips}; do p=$(host \"$ip\" 2>/dev/null | awk '/pointer/{{print $NF}}'); [ -n \"$p\" ] && echo \"$ip $p\"; done; true"
+            "printf '%s\\n' {ips} | xargs -P128 -n1 sh -c 'h=$(host -W1 \"$0\" 2>/dev/null | sed -n \"s/.*pointer //p\"); [ -n \"$h\" ] && echo \"$0 $h\"'"
         );
         let out = self.vantage.run(&remote)?;
         Ok(parse_ptrs(&out))
