@@ -24,6 +24,10 @@ pub struct Config {
     pub netbox_url: String,
     /// The `pass` entry holding the NetBox API token.
     pub token_pass: String,
+    /// How many reverse-DNS lookups to run at once during a sweep. Bounds the burst we
+    /// put on the resolver (and the authoritative reverse server behind it); a gentler
+    /// value is kinder to a shared DNS server at the cost of a slower sweep.
+    pub dns_concurrency: usize,
 }
 
 impl Default for Config {
@@ -34,6 +38,10 @@ impl Default for Config {
             probe_host: "takkie.astron.nl".into(),
             netbox_url: "https://netbox.astron.nl".into(),
             token_pass: "astron/netbox.astron.nl/dns_api_token".into(),
+            // A moderate default: gentle on a shared reverse-DNS server, still finishing
+            // a /20 in ~a minute. Raise it in the config for a faster sweep on a resolver
+            // you know can take it.
+            dns_concurrency: 64,
         }
     }
 }

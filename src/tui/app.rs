@@ -8,10 +8,11 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::rc::Rc;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyEvent};
-use mullion::{backend::CrosstermBackend, style::Style, EventReader, GraphCanvas, KeyCode, RangeSource, Terminal};
+use mullion::style::{Color, Style};
+use mullion::{backend::CrosstermBackend, EventReader, GraphCanvas, KeyCode, RangeSource, Terminal};
 
 use super::draw;
 use super::focus::ListCursor;
@@ -107,6 +108,21 @@ impl DensityStyle {
     }
 }
 
+/// The program's connection state, shown by the orbiting heartbeat on the frame:
+/// it keeps travelling as long as the UI is responsive (a liveness signal), and its
+/// colour says how we stand with the endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Link {
+    /// Not connected yet — demo data, or waiting to be pointed at live sources (blue).
+    Waiting,
+    /// A gather is in flight — talking to NetBox/DNS/the probe right now (yellow).
+    Working,
+    /// Live data loaded cleanly; the endpoints answered (green).
+    Connected,
+    /// The last gather failed — an endpoint is unreachable or errored (red, pulsing).
+    Broken,
+}
+
 /// The whole application state.
 pub struct App {
     /// The range being browsed.
@@ -153,6 +169,10 @@ pub struct App {
     /// NetBox-defined subnets (variable-length) covering the range — used to label the
     /// real subnet the map cursor sits in. Empty until live data (or demo) supplies them.
     pub subnets: Vec<Subnet>,
+    /// Connection state, driving the heartbeat's colour.
+    link: Link,
+    /// When the app started — the clock the orbiting heartbeat reads for its phase.
+    started: Instant,
 
     /// Connection settings, used to gather live data on demand.
     pub cfg: Config,
@@ -214,6 +234,10 @@ impl App {
             zoom_stack: Vec::new(),
             density: DensityStyle::Heatmap,
             subnets: Vec::new(),
+            // Live CLI start means the endpoints already answered; otherwise we are on
+            // demo data, not yet connected.
+            link: if live { Link::Connected } else { Link::Waiting },
+            started: Instant::now(),
             cfg,
             loading: false,
             request_live: false,
@@ -238,6 +262,7 @@ impl App {
             return;
         }
         self.request_live = true;
+        self.link = Link::Working;
     }
 
     /// Take (and clear) a pending live-gather request. Called once per loop tick by
@@ -290,6 +315,28 @@ impl App {
         self.subnets = subnets;
     }
 
+    /// Seconds since start — the clock the orbiting heartbeat reads. The render loop
+    /// ticks ~20×/s even with no input, so the heartbeat keeps moving as long as the UI
+    /// is responsive; it only pauses if the main thread blocks (e.g. the passphrase
+    /// prompt), which is precisely the "am I frozen?" signal it exists to give.
+    #[must_use]
+    pub fn anim_t(&self) -> f32 {
+        self.started.elapsed().as_secs_f32()
+    }
+
+    /// The heartbeat to draw on the frame this tick: its phase (from the clock) and the
+    /// colour + pulse for the current [`Link`] state.
+    #[must_use]
+    pub fn heartbeat(&self) -> draw::Heartbeat {
+        let (color, pulse) = match self.link {
+            Link::Waiting => (Color::Rgb(80, 150, 255), false),   // blue — waiting to connect
+            Link::Working => (Color::Rgb(230, 200, 60), false),   // yellow — talking to endpoints
+            Link::Connected => (Color::Rgb(90, 205, 110), false), // green — connected cleanly
+            Link::Broken => (Color::Rgb(225, 70, 70), true),      // red, pulsing — link down
+        };
+        draw::Heartbeat { t: self.anim_t(), color, pulse }
+    }
+
     /// Check whether the background gather has finished; apply or report its result.
     /// Called once per loop tick.
     pub fn poll_live(&mut self) {
@@ -310,6 +357,7 @@ impl App {
                 self.live_rx = None;
                 self.progress = None;
                 self.progress_rx = None;
+                self.link = Link::Broken; // an endpoint failed — heartbeat goes red
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
@@ -317,6 +365,7 @@ impl App {
                 self.live_rx = None;
                 self.progress = None;
                 self.progress_rx = None;
+                self.link = Link::Broken;
             }
         }
     }
@@ -334,6 +383,7 @@ impl App {
         self.live_rx = None;
         self.progress = None;
         self.progress_rx = None;
+        self.link = Link::Connected; // endpoints answered — heartbeat goes green
         self.pan = (0, 0);
         self.cur.clamp(self.total);
         self.status = Some(("live data loaded".to_string(), false));
@@ -894,6 +944,8 @@ mod tests {
         let (range, demo) = fixture::demo();
         let mut app = App::new(range, demo, false, false, false, Config::default());
         assert!(!app.live);
+        // Demo start: not connected yet → the heartbeat is blue.
+        assert!(matches!(app.heartbeat().color, Color::Rgb(80, 150, 255)));
         app.apply_live(LiveData {
             facts: vec![AddressFacts {
                 addr: "10.87.3.5".parse().unwrap(),
@@ -906,6 +958,8 @@ mod tests {
         assert!(app.live && !app.loading);
         assert_eq!(app.counts.dns_only, 1); // the one supplied PTR
         assert_eq!(app.subnets.len(), 1); // subnets carried in from the gather
+        // The heartbeat goes green once the endpoints have answered.
+        assert!(matches!(app.heartbeat().color, Color::Rgb(90, 205, 110)));
         assert!(app.status.as_ref().is_some_and(|(m, e)| m.contains("loaded") && !*e));
     }
 
@@ -993,6 +1047,21 @@ mod tests {
         assert_eq!(app.view, View::Table);
     }
 
+
+    #[test]
+    fn heartbeat_glows_a_bump_on_the_border() {
+        use mullion::{Buffer, Rect};
+        let area = Rect::new(0, 0, 24, 6);
+        let mut buf = Buffer::empty(area);
+        // t = 0 → the bump sits at the top-left corner (perimeter position 0).
+        let beat = draw::Heartbeat { t: 0.0, color: Color::Rgb(90, 205, 110), pulse: false };
+        let _ = draw::frame(&mut buf, area, "x", crate::tui::theme::s_title(), None, None, &beat);
+        // The corner is tinted green (high G), while a far cell keeps the dim border.
+        let corner = buf.get(0, 0).style.fg;
+        assert!(matches!(corner, Color::Rgb(_, g, _) if g > 150), "bump greens the corner: {corner:?}");
+        let far = buf.get(12, 5).style.fg; // opposite side of the ring
+        assert!(matches!(far, Color::Rgb(70, 70, 100)), "far border stays dim: {far:?}");
+    }
 
     #[test]
     fn every_view_draws_the_outer_frame() {

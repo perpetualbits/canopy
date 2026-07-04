@@ -53,7 +53,7 @@ pub fn gather_live_with_token(
 ) -> anyhow::Result<LiveData> {
     let vantage = Vantage::new(&cfg.vantage);
     let netbox = NetboxSource { vantage: vantage.clone(), base_url: cfg.netbox_url.clone(), token };
-    let dns = DnsSource { vantage: vantage.clone() };
+    let dns = DnsSource { vantage: vantage.clone(), concurrency: cfg.dns_concurrency };
     let probe = ProbeSource { vantage: Vantage::new(&cfg.probe_host) };
 
     on_progress(0.0, "querying NetBox…");

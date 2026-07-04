@@ -13,6 +13,9 @@ use crate::reconcile::{AddressFacts, Cidr};
 pub struct DnsSource {
     /// A host whose resolver can see the internal reverse zones.
     pub vantage: Vantage,
+    /// Max concurrent lookups (the `xargs -P` fan-out) — bounds the burst on the
+    /// resolver and the authoritative reverse server behind it.
+    pub concurrency: usize,
 }
 
 impl FactSource for DnsSource {
@@ -39,8 +42,9 @@ impl DnsSource {
     /// Propagates SSH failures.
     pub fn gather_with_progress(&self, range: &Cidr, mut on_tick: impl FnMut(u64)) -> anyhow::Result<Vec<AddressFacts>> {
         let ips = host_list(range);
+        let par = self.concurrency.max(1);
         let remote = format!(
-            "printf '%s\\n' {ips} | xargs -P128 -n1 sh -c 'h=$(host -W1 \"$0\" 2>/dev/null | sed -n \"s/.*pointer //p\"); printf \"T\\n\"; [ -n \"$h\" ] && printf \"R %s %s\\n\" \"$0\" \"$h\"'"
+            "printf '%s\\n' {ips} | xargs -P{par} -n1 sh -c 'h=$(host -W1 \"$0\" 2>/dev/null | sed -n \"s/.*pointer //p\"); printf \"T\\n\"; [ -n \"$h\" ] && printf \"R %s %s\\n\" \"$0\" \"$h\"'"
         );
         let mut done = 0u64;
         let mut results = String::new();

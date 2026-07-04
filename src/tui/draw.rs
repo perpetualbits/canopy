@@ -6,14 +6,80 @@
 use mullion::border::{draw_box, BorderStyle, Borders, CornerStyle, LineWeight};
 use mullion::style::Color;
 use mullion::{
-    bookends, render_keyhints, render_scrollbar, style::Style, Buffer, Rect, RecordSource, ScrollMetrics, Side, TextCtx,
+    bookends, gaussian, render_keyhints, render_scrollbar, style::Style, Buffer, Rect, RecordSource, ScrollMetrics,
+    Side, TextCtx,
 };
 
 use super::app::{AllocPhase, App};
 use super::theme::{
     s_accent, s_border, s_dim, s_err, s_head, s_normal, s_ok, s_sel, s_title, s_warn, status_label, status_style,
+    C_BORDER,
 };
 use crate::reconcile::{AddressStatus, Counts};
+
+/// One lap of the orbiting heartbeat around the frame, in seconds — a calm pace so it
+/// reads as a pulse, not a spin.
+const HEARTBEAT_LAP: f32 = 6.0;
+
+/// The travelling heartbeat drawn on the frame: a colour bump that orbits the border as
+/// long as the UI is responsive (so a frozen program is obvious — it stops), its hue
+/// reflecting the connection state.
+pub struct Heartbeat {
+    /// Seconds since start — sets the bump's position around the ring (and pulse phase).
+    pub t: f32,
+    /// The bump's colour, from the connection state.
+    pub color: Color,
+    /// Whether to throb the brightness (a broken link).
+    pub pulse: bool,
+}
+
+/// Blend `a`→`b` by `t ∈ [0, 1]`, component-wise. Non-RGB colours fall back to the dim
+/// border colour so the heartbeat still has something sensible to lerp from.
+fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+    let rgb = |c: Color| match c {
+        Color::Rgb(r, g, b) => (r, g, b),
+        _ => (70, 70, 100),
+    };
+    let (ar, ag, ab) = rgb(a);
+    let (br, bg, bb) = rgb(b);
+    let m = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round().clamp(0.0, 255.0) as u8;
+    Color::Rgb(m(ar, br), m(ag, bg), m(ab, bb))
+}
+
+/// Paint the heartbeat: a Gaussian colour bump travelling clockwise around `area`'s
+/// border, blended up from the dim border colour toward `beat.color`.
+///
+/// How: the bump's head is at normalised perimeter position `t / lap (mod 1)`; each
+/// border cell's distance to the head (wrapping at the seam) feeds `ease::gaussian`, so
+/// only a few cells around the head glow. A broken link additionally throbs via a
+/// squared sine. Because the caller redraws every ~50 ms, the bump keeps moving whenever
+/// the program is alive — its stopping is the "I'm frozen" tell.
+fn draw_heartbeat(buf: &mut Buffer, area: Rect, beat: &Heartbeat) {
+    let len = area.border_len();
+    if len < 8 {
+        return;
+    }
+    let head = (beat.t / HEARTBEAT_LAP).rem_euclid(1.0);
+    let sigma = 2.5 / len as f32; // bump ~2–3 cells wide
+    let pulse = if beat.pulse {
+        0.35 + 0.65 * (beat.t * std::f32::consts::TAU / 1.2).sin().powi(2)
+    } else {
+        1.0
+    };
+    for (x, y) in area.border_cells() {
+        let s = area.border_pos(x, y);
+        let mut d = (s - head).abs();
+        if d > 0.5 {
+            d = 1.0 - d; // shorter way around the ring
+        }
+        let g = gaussian(d, sigma) * pulse;
+        if g < 0.10 {
+            continue; // outside the bump — leave the plain border colour
+        }
+        let sym = buf.get(x, y).symbol.clone();
+        buf.set_string(x, y, &sym, Style::default().fg(lerp_color(C_BORDER, beat.color, g)));
+    }
+}
 
 /// Write `text` at `(x, y)` in `style`.
 pub fn btxt(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
@@ -34,9 +100,13 @@ pub fn frame(
     title_style: Style,
     right: Option<(&str, Style)>,
     progress: Option<(f32, &str)>,
+    beat: &Heartbeat,
 ) -> Rect {
     let bs = BorderStyle { weight: LineWeight::Light, corners: CornerStyle::Rounded, style: s_border() };
     draw_box(buf, area, Borders::ALL, &bs);
+    // The heartbeat glows on the plain border; captions below draw over it so text stays
+    // legible while the bump still sweeps the rest of the ring.
+    draw_heartbeat(buf, area, beat);
     let (lcap, rcap) = bookends(Side::Top);
     let top = area.y;
 
@@ -147,7 +217,7 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
     let mode = app.mode_label();
     let title = format!("netpush — {}/{}", app.range.base, app.range.prefix_len);
     let prog = app.progress.as_ref().map(|(f, l)| (*f, l.as_str()));
-    let area = frame(buf, full, &title, s_title(), Some((mode.0, mode.1)), prog);
+    let area = frame(buf, full, &title, s_title(), Some((mode.0, mode.1)), prog, &app.heartbeat());
 
     // ── status row (inside the frame): data-source badge, then any status message ──
     let (data, data_style) = data_badge(app);
