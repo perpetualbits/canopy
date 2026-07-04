@@ -66,33 +66,39 @@ each cell is a real `/k`. Zoom targets a *cell* (clean `/k`), not an arbitrary
 rectangle. Legend: "each cell = `/k`", plus the address span. Much less code than
 Hilbert; loses only whole-rectangle zoom.
 
-## Density style: the bitstream (shipped)
+## Density style: the heat map (shipped)
 
-Sub-question #2 (below) is settled: the default is a **scrolling `▪`/`▫` bitstream**,
-the look from aerie's `spiral_stress` "surf field", with the old shade block kept as a
-toggle (`s`). The mechanism is lifted straight from the demo via the mullion primitive
-`FlowStyle::color(pos, t, active)` (§ socket / §3.12 `BorderGap`):
+Sub-question #2 (below) is settled: the default is a **static occupancy heat map**.
+Every cell is a square — empty IP space is a grey hollow `□`, a used block is a filled
+`■` — and the block's colour tells you how full it is on a smooth blackbody/Planck
+ramp: **deep red = barely used → hot blue = full**. No motion, no per-cell hues: the
+one thing colour encodes is occupancy, so the map reads like a thermal image.
 
-- **Free cells** stay a calm dim `·` — the map still reads "where is stuff" at a
-  glance, and a mostly-empty range doesn't shimmer everywhere.
-- **Used cells** stream `▪` (set bit) / `▫` (clear bit). The share of solid squares
-  equals the cell's used fraction (`stream_bit`: a fixed per-cell hash pattern with
-  ~`frac` of its bit-cells solid, windowed by a time-scrolled index), so **density
-  stays honest** — this is the answer to "shade vs heat": neither, the *fill ratio*
-  carries occupancy, and set bits glow brighter on top (the demo's `active` lift).
-- **Colour** is a golden-angle hue per cell (`FlowStyle.band = d`), so cells read as
-  distinct data channels; hue sweeps across the row and shimmers on its own cycle.
-- **Animation** rides the existing ~20 fps redraw loop (`App::anim_t`); no new timer.
+- **`heat_color(f)`** interpolates an 8-stop ramp (deep red, red, orange, yellow,
+  yellow-white, white, white-blue, hot-blue) for a used fraction `f = used / block`.
+  Smooth, so neighbouring fill levels differ only slightly — a gradient, not banding.
+- **Empty vs used** is a hard split: `f == 0` → grey `□` (structure still visible, but
+  recessive); `f > 0` → coloured `■`. So "nothing here" and "barely something here"
+  never blur together.
+- The **legend** draws the actual ramp as a swatch (`emptier ■■■■■■■■ fuller`), so it
+  is self-documenting.
+- **Shade** (`░▒▓█`, the old monochrome block) is kept as the `s` toggle for terminals
+  where the ramp's colours would be lost.
 
-Open follow-ups if we want to push it further: seed the hue by subnet identity (so a
-block keeps its colour across zoom), or let the payload be the cell's *real* bytes
-(CIDR / used-count) so a wide-enough gap decodes back to telemetry like the demo does —
-at 2 columns per cell that's an easter egg, not a feature, so it's deferred.
+An earlier cut used an animated `▪`/`▫` **bitstream** (aerie's `spiral_stress` surf
+field, via `mullion::FlowStyle`). It looked striking but the colour *cycled* and the
+motion competed with the data; the heat map trades the spectacle for a reading you can
+trust at a glance. The bitstream code is gone; `FlowStyle` remains available in mullion
+if a future *wire/flow* view wants it (see the node-graph vision).
+
+Possible follow-up: fill the cell **background** instead of the glyph so contiguous
+full blocks merge into solid regions (a truer heat map, exploiting Hilbert locality) —
+deferred because "discrete squares" is the look asked for.
 
 ## Open sub-questions
 
 1. ~~Layout: Hilbert vs block-aligned raster vs keep raster.~~ **Decided: Hilbert.**
-2. ~~Shade vs colour for density.~~ **Decided: scrolling bitstream (fill ratio =
-   occupancy), shade block kept as the `s` toggle.** See above.
+2. ~~Shade vs colour for density.~~ **Decided: a static blackbody/Planck heat map
+   (deep red → hot blue by occupancy), shade block kept as the `s` toggle.** See above.
 3. ~~Cell aspect.~~ Cells are 2 terminal columns wide (squarer), which keeps the
    Hilbert quadrant structure readable. **Settled.**

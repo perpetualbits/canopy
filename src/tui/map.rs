@@ -1,104 +1,92 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026  Epsilon Null Operation
 //! The IP-map view: the range laid on a Hilbert curve as a grid of little squares,
-//! each a `/(prefix + 2·order)` block shaded by how used it is. Built from
+//! each a `/(prefix + 2·order)` block coloured by how full it is. Built from
 //! [`crate::map::MapGrid`] each frame (`O(facts)`), so a `/8` maps as cheaply as a
 //! `/24`. The legend labels the block structure — the covered CIDR and the per-cell
 //! subnet size — not linear x/y ticks, which a Hilbert layout has no use for.
 //!
-//! Free cells are a calm dim `·`; used cells shade by
-//! [`DensityStyle`](super::app::DensityStyle) — either a static block `░▒▓█`, or a
-//! scrolling `▪`/`▫` **bitstream** where the share of solid squares equals the cell's
-//! occupancy, each cell its own golden-angle hue via [`mullion::FlowStyle`] (the surf
-//! field from aerie's `spiral_stress`). `s` toggles the two.
+//! Every cell is a square: empty IP space is a grey hollow `□`; a used block is a
+//! filled `■`. How it is coloured depends on
+//! [`DensityStyle`](super::app::DensityStyle):
+//! - **Heatmap** (default) — a smooth blackbody/Planck ramp, deep red = barely used →
+//!   hot blue = full, so a glance reads occupancy like a thermal image.
+//! - **Shade** — a monochrome accent block `░▒▓█`, for low-colour terminals.
 //!
-//! A highlighted cursor moves over the grid (`hjkl`); `Enter` zooms into the cell
-//! under it — always a clean subnet — and `Backspace` zooms back out, so a few steps
-//! take a `/8` down to a `/24` the table and tree resolve to single addresses.
+//! `s` toggles the two. A highlighted cursor moves over the grid (`hjkl`); `Enter`
+//! zooms into the cell under it — always a clean subnet — and `Backspace` zooms back
+//! out, so a few steps take a `/8` down to a `/24` the table and tree resolve to
+//! single addresses.
 
-use mullion::style::Style;
-use mullion::{Buffer, FlowStyle, Rect};
+use mullion::style::{Color, Style};
+use mullion::{Buffer, Rect};
 
 use super::app::{App, DensityStyle};
 use super::draw::{btxt, keyhints};
 use super::theme::{s_accent, s_dim, s_ok, s_sel, s_title, s_warn};
 use crate::map::MapGrid;
 
-/// Bit-cells the map's bitstream scrolls past per second — its scroll speed
-/// (aerie's `spiral_stress` uses 5.0 on its border gaps; a touch slower reads
-/// calmer on a dense grid).
-const BIT_SPEED: f32 = 4.0;
+/// Empty IP space: a grey hollow square.
+const EMPTY_GLYPH: char = '□';
+/// A used block: a filled square (coloured by [`heat_color`], or the shade accent).
+const USED_GLYPH: char = '■';
 
-/// Glyph + style for a *shade*-style cell of used-fraction `f`: `·` (dim) when empty,
-/// otherwise a shade block `░▒▓█` deepening with density, in the accent colour.
-fn cell_glyph(f: f32) -> (&'static str, Style) {
-    if f <= 0.0 {
-        return ("·", s_dim());
-    }
+/// A Planck-style blackbody heat ramp, low → high occupancy: deep red, red, orange,
+/// yellow, yellow-white, white, white-blue, hot-blue. Colouring a block by how full it
+/// is lets the eye read occupancy the way a thermal image reads temperature.
+const HEAT: [(u8, u8, u8); 8] = [
+    (120, 0, 0),     // deep red — barely used
+    (220, 30, 20),   // red
+    (255, 120, 20),  // orange
+    (255, 200, 40),  // yellow
+    (255, 240, 150), // yellow-white
+    (245, 245, 245), // white
+    (185, 210, 255), // white-blue
+    (90, 150, 255),  // hot-blue — full
+];
+
+/// The heat colour for a used fraction `f ∈ (0, 1]` — an interpolation of the [`HEAT`]
+/// ramp. `f` near 0 gives deep red (a nearly-empty block), `f = 1` hot blue (full).
+///
+/// How: place `f` on the ramp at position `p = f·(N−1)` over the `N` stops, then blend
+/// the two stops straddling `p` by the leftover fraction. Because the ramp is smooth,
+/// neighbouring fill levels differ only slightly — the eye reads a gradient, not bands.
+fn heat_color(f: f32) -> Color {
+    let n = HEAT.len();
+    let p = f.clamp(0.0, 1.0) * (n - 1) as f32;
+    let i = (p.floor() as usize).min(n - 2);
+    let t = p - i as f32;
+    let (r0, g0, b0) = HEAT[i];
+    let (r1, g1, b1) = HEAT[i + 1];
+    let lerp = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
+    Color::Rgb(lerp(r0, r1), lerp(g0, g1), lerp(b0, b1))
+}
+
+/// Shade-style glyph for a used fraction `f ∈ (0, 1]`: a block `░▒▓█` that deepens with
+/// density, in the accent colour. The monochrome fallback for terminals where the heat
+/// ramp's colours would be lost. (Empty cells are handled by the caller.)
+fn shade_glyph(f: f32) -> (char, Style) {
     let level = ((f * 4.0).ceil() as usize).clamp(1, 4);
-    let glyph = ["░", "▒", "▓", "█"][level - 1];
-    (glyph, s_accent())
-}
-
-/// Hash a `(cell, bit-index)` pair to a value in `[0, 1)` — the fixed per-cell bit
-/// pattern the scrolling window reads. It is deterministic, so a solid bit travels
-/// smoothly along as the window advances. (A standard integer-mix hash — SplitMix-ish.)
-fn hash01(cell: u64, k: i64) -> f32 {
-    let mut x = cell.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (k as u64).wrapping_mul(0xD1B5_4A32_D192_ED03);
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-    x ^= x >> 33;
-    // Top 24 bits → [0, 1); 2^24 = 16_777_216 keeps full f32 mantissa precision.
-    (x >> 40) as f32 / 16_777_216.0
-}
-
-/// Is the bit at continuous stream position `s` set, for a cell whose used fraction
-/// is `frac`? The fixed per-cell pattern (see [`hash01`]) has about `frac` of its
-/// bit-cells solid; flooring `s` picks one, so advancing the window (via time) scrolls
-/// the pattern. `frac = 0` → never set (all `▫`), `frac = 1` → always (all `▪`). This
-/// keeps density honest: the share of solid squares equals the cell's occupancy.
-fn stream_bit(cell: u64, s: f32, frac: f32) -> bool {
-    frac > 0.0 && hash01(cell, s.floor() as i64) < frac
+    (['░', '▒', '▓', '█'][level - 1], s_accent())
 }
 
 /// Paint one map cell (2 columns wide) at buffer position `(x, y)`.
 ///
-/// Free cells (`frac == 0`) stay a calm dim `·` in either style, so the map still
-/// reads "where is stuff" at a glance. Used cells render per [`DensityStyle`]: a
-/// static shade block, or the scrolling `▪`/`▫` bitstream. `selected` paints the
-/// whole cell in the cursor style so the highlight always wins.
-#[allow(clippy::too_many_arguments)]
-fn paint_cell(buf: &mut Buffer, x: u16, y: u16, d: usize, side: usize, frac: f32, style: DensityStyle, t: f32, selected: bool) {
-    if frac <= 0.0 {
-        let s = if selected { s_sel() } else { s_dim() };
-        buf.set_char(x, y, '·', s);
-        buf.set_char(x + 1, y, '·', s);
-        return;
-    }
-    match style {
-        DensityStyle::Shade => {
-            let (glyph, base) = cell_glyph(frac);
-            let ch = glyph.chars().next().unwrap_or('█');
-            let s = if selected { s_sel() } else { base };
-            buf.set_char(x, y, ch, s);
-            buf.set_char(x + 1, y, ch, s);
+/// Empty blocks (`frac == 0`) are a grey hollow square `□`. Used blocks are a filled
+/// square `■`, coloured per [`DensityStyle`] — the heat ramp, or the monochrome shade
+/// block. `selected` paints the cell in the cursor style so the highlight always wins.
+fn paint_cell(buf: &mut Buffer, x: u16, y: u16, frac: f32, style: DensityStyle, selected: bool) {
+    let (ch, cell_style) = if frac <= 0.0 {
+        (EMPTY_GLYPH, s_dim()) // empty IP space: a grey hollow square
+    } else {
+        match style {
+            DensityStyle::Heatmap => (USED_GLYPH, Style::default().fg(heat_color(frac))),
+            DensityStyle::Shade => shade_glyph(frac),
         }
-        DensityStyle::Bitstream => {
-            // Each cell is its own data channel: a golden-angle hue band, alternating
-            // scroll direction, streaming its occupancy as bits. Set bits glow.
-            let cell = d as u64;
-            let dir = if cell % 2 == 0 { 1.0 } else { -1.0 };
-            let flow = FlowStyle { band: d, speed: 0.55, sweep: 90.0, direction: dir };
-            for j in 0..2u16 {
-                let coord = f32::from(x) + f32::from(j);
-                let bit = stream_bit(cell, coord - t * BIT_SPEED * dir, frac);
-                let ch = if bit { '▪' } else { '▫' }; // solid square = set bit, open = clear
-                let pos = coord / (2.0 * side as f32); // hue sweeps across the row
-                let s = if selected { s_sel() } else { flow.color(pos, t, bit) };
-                buf.set_char(x + j, y, ch, s);
-            }
-        }
-    }
+    };
+    let s = if selected { s_sel() } else { cell_style };
+    buf.set_char(x, y, ch, s);
+    buf.set_char(x + 1, y, ch, s);
 }
 
 /// The largest Hilbert order whose `2^order × 2^order` grid of 2-wide cells fits in
@@ -109,6 +97,27 @@ fn fit_order(body: Rect) -> u32 {
         0
     } else {
         u32::BITS - 1 - u32::from(side_max).leading_zeros()
+    }
+}
+
+/// Draw the density key at `(x, y)`: `□ empty`, then for the heatmap an
+/// `emptier → fuller` gradient swatch of the actual [`HEAT`] colours (so the ramp is
+/// self-documenting), or for shade the `░▒▓█` blocks.
+fn draw_legend_key(buf: &mut Buffer, x: u16, y: u16, style: DensityStyle) {
+    let mut cx = buf.set_string(x, y, "□ empty   ", s_dim());
+    match style {
+        DensityStyle::Heatmap => {
+            cx = buf.set_string(cx, y, "emptier ", s_dim());
+            for k in 0..8u16 {
+                // Sample the ramp at each stop's centre so the swatch spans deep-red→hot-blue.
+                let f = (f32::from(k) + 0.5) / 8.0;
+                buf.set_char(cx + k, y, USED_GLYPH, Style::default().fg(heat_color(f)));
+            }
+            buf.set_string(cx + 8, y, " fuller", s_dim());
+        }
+        DensityStyle::Shade => {
+            buf.set_string(cx, y, "░▒▓█ fuller", s_dim());
+        }
     }
 }
 
@@ -139,29 +148,21 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
     app.map_cur = (app.map_cur.0.min(last), app.map_cur.1.min(last));
 
     // Legend: block structure, not linear ticks (Hilbert has no meaningful x/y axis).
-    let key = match app.density {
-        DensityStyle::Bitstream => "[· free  ▫▪ used bitstream]",
-        DensityStyle::Shade => "[· free  ░▒▓█ used]",
-    };
-    btxt(
-        buf,
-        area.x,
-        area.y + 1,
-        &format!(
-            "Hilbert · {side}×{side} · cell = /{cell_prefix} ({} addrs) · {used_total} used / {} total   {key}",
-            grid.block, grid.range.block_len()
-        ),
-        s_dim(),
+    let head = format!(
+        "Hilbert · {side}×{side} · cell = /{cell_prefix} ({} addrs) · {used_total} used / {} total   ",
+        grid.block,
+        grid.range.block_len()
     );
+    btxt(buf, area.x, area.y + 1, &head, s_dim());
+    draw_legend_key(buf, area.x + head.chars().count() as u16, area.y + 1, app.density);
 
-    let t = app.anim_t();
     for d in 0..grid.cells() {
         let (gx, gy) = grid.cell_xy(d);
         let selected = (gx, gy) == app.map_cur;
         let x = body.x + (gx as u16) * 2; // 2-wide cells for a squarer aspect
         let y = body.y + gy as u16;
         if x + 1 < body.x + body.width && y < body.y + body.height {
-            paint_cell(buf, x, y, d, side, grid.fraction(d), app.density, t, selected);
+            paint_cell(buf, x, y, grid.fraction(d), app.density, selected);
         }
     }
 
@@ -195,34 +196,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hash01_stays_in_the_unit_interval() {
-        for cell in 0..64u64 {
-            for k in -50..50i64 {
-                let r = hash01(cell, k);
-                assert!((0.0..1.0).contains(&r), "hash01({cell},{k}) = {r} out of [0,1)");
-            }
-        }
+    fn heat_ramp_runs_deep_red_to_hot_blue() {
+        // Emptiest used block is reddish (r dominates), fullest is bluish (b dominates).
+        let Color::Rgb(r_lo, _, b_lo) = heat_color(0.001) else { panic!("expected rgb") };
+        assert!(r_lo > b_lo, "low occupancy should be red-dominant, got r={r_lo} b={b_lo}");
+        let Color::Rgb(r_hi, _, b_hi) = heat_color(1.0) else { panic!("expected rgb") };
+        assert!(b_hi > r_hi, "full block should be blue-dominant, got r={r_hi} b={b_hi}");
+        // Endpoints match the ramp exactly.
+        assert_eq!(heat_color(0.0), Color::Rgb(HEAT[0].0, HEAT[0].1, HEAT[0].2));
+        assert_eq!(heat_color(1.0), Color::Rgb(HEAT[7].0, HEAT[7].1, HEAT[7].2));
     }
 
     #[test]
-    fn stream_bit_honours_the_fraction_extremes() {
-        // An empty cell is never solid; a full cell always is — whatever the phase.
-        for s in [-3.5, 0.0, 2.2, 17.9, 100.0] {
-            assert!(!stream_bit(7, s, 0.0), "frac 0 must be all ▫");
-            assert!(stream_bit(7, s, 1.0), "frac 1 must be all ▪");
-        }
-    }
-
-    #[test]
-    fn stream_bit_solid_share_tracks_occupancy() {
-        // The whole point of the density-honest bitstream: over the stream, the
-        // share of solid squares should be close to the cell's used fraction.
-        for &frac in &[0.25_f32, 0.5, 0.75] {
-            let cell = 42;
-            let n = 4000;
-            let set = (0..n).filter(|&k| stream_bit(cell, f32::from(k as u16) + 0.5, frac)).count();
-            let share = set as f32 / n as f32;
-            assert!((share - frac).abs() < 0.05, "frac {frac}: solid share {share} drifted too far");
+    fn heat_color_is_stable_and_bounded_across_the_range() {
+        // Every fraction resolves to some RGB (no panic, no out-of-band index).
+        for k in 0..=100 {
+            let f = k as f32 / 100.0;
+            assert!(matches!(heat_color(f), Color::Rgb(_, _, _)));
         }
     }
 
@@ -239,7 +229,7 @@ mod tests {
                 let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
                 screen(&mut buf, &mut app);
             }
-            app.on_key(KeyCode::Char('s')); // flip Bitstream ↔ Shade and render again
+            app.on_key(KeyCode::Char('s')); // flip Heatmap ↔ Shade and render again
         }
     }
 }
