@@ -28,6 +28,14 @@ pub struct Config {
     /// put on the resolver (and the authoritative reverse server behind it); a gentler
     /// value is kinder to a shared DNS server at the cost of a slower sweep.
     pub dns_concurrency: usize,
+    /// How many ping probes to run at once. Bounds the concurrent processes on the probe
+    /// host and the ARP burst on the target L2 — the ping equivalent of `dns_concurrency`.
+    pub probe_concurrency: usize,
+    /// Authoritative server to attempt reverse-DNS **zone transfers** (AXFR) from, e.g.
+    /// the reverse-zone master. When set (and transfer is permitted) one AXFR per `/24`
+    /// replaces hundreds of per-address `host` lookups — far lighter on the DNS server.
+    /// Empty (the default) keeps the per-address sweep.
+    pub reverse_axfr_server: String,
 }
 
 impl Default for Config {
@@ -42,6 +50,8 @@ impl Default for Config {
             // a /20 in ~a minute. Raise it in the config for a faster sweep on a resolver
             // you know can take it.
             dns_concurrency: 64,
+            probe_concurrency: 64,
+            reverse_axfr_server: String::new(), // off by default; needs allow-transfer
         }
     }
 }

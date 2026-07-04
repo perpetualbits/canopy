@@ -12,15 +12,22 @@ use crate::reconcile::{AddressFacts, Cidr};
 pub struct ProbeSource {
     /// A host on the same L2 as the target range.
     pub vantage: Vantage,
+    /// Max concurrent pings — bounds the processes spawned on the probe host and the
+    /// ARP burst on the target L2.
+    pub concurrency: usize,
 }
 
 impl FactSource for ProbeSource {
     fn gather(&self, range: &Cidr) -> anyhow::Result<Vec<AddressFacts>> {
         let ips = range.hosts().map(|a| a.to_string()).collect::<Vec<_>>().join(" ");
-        // Fire all pings in parallel (`&` … `wait`) so a /24 finishes in ~1s, not
-        // the ~254s a serial 1-second-timeout sweep would take. Print each responder.
+        let par = self.concurrency.max(1);
+        // Ping with bounded fan-out (`xargs -P`). An unbounded `for … &` would spawn one
+        // process per address at once — thousands for a /20 — and blast that many ARP
+        // requests simultaneously; capping the parallelism keeps a big sweep from
+        // storming the subnet while still finishing a /24 in ~a second. `$0` is the
+        // address xargs handed the shell. Each responder prints its own address.
         let remote = format!(
-            "for ip in {ips}; do (ping -c1 -W1 \"$ip\" >/dev/null 2>&1 && echo \"$ip\") & done; wait; true"
+            "printf '%s\\n' {ips} | xargs -P{par} -n1 sh -c 'ping -c1 -W1 \"$0\" >/dev/null 2>&1 && echo \"$0\"'"
         );
         let out = self.vantage.run(&remote)?;
         Ok(parse_live(&out))

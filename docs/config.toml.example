@@ -19,3 +19,16 @@ netbox_url = "https://netbox.astron.nl"
 
 # `pass` entry holding the NetBox API token.
 token_pass = "astron/netbox.astron.nl/dns_api_token"
+
+# Max concurrent reverse-DNS lookups during a sweep. Lower is gentler on the DNS
+# server (and the authoritative reverse server behind it); higher is faster.
+dns_concurrency = 64
+
+# Max concurrent ping probes. Bounds processes on probe_host and the ARP burst on
+# the target L2.
+probe_concurrency = 64
+
+# Authoritative server to try reverse-DNS zone transfers (AXFR) from. When set and
+# transfer is permitted, one AXFR per /24 replaces hundreds of per-address lookups —
+# far lighter on the DNS server. Empty (default) keeps the per-address sweep.
+# reverse_axfr_server = "ntserver1.astron.nl"

@@ -20,22 +20,24 @@ pub struct NetboxSource {
     pub token: String,
 }
 
+/// Safety cap on how many pages we will follow — 1000 pages × 1000/page = 1M objects,
+/// far beyond any real range, so a pagination bug can't loop forever.
+const MAX_PAGES: usize = 1000;
+
 impl FactSource for NetboxSource {
     fn gather(&self, range: &Cidr) -> anyhow::Result<Vec<AddressFacts>> {
         // `parent=<network>/<len>` returns every IP object inside the prefix.
-        let url = format!(
+        let first = format!(
             "{}/api/ipam/ip-addresses/?parent={}/{}&limit=1000",
             self.base_url.trim_end_matches('/'),
             range.network(),
             range.prefix_len
         );
-        // `read TOK` pulls the token from stdin so it is never a command argument.
-        let remote = format!("read TOK; curl -sS --max-time 25 -H \"Authorization: Token $TOK\" '{url}'");
-        let json = self
-            .vantage
-            .run_with_stdin(&remote, &format!("{}\n", self.token))
-            .context("querying NetBox from the vantage host")?;
-        parse_ip_addresses(&json, range)
+        let mut out = Vec::new();
+        for json in self.paginate(first)? {
+            out.extend(parse_ip_addresses(&json, range)?);
+        }
+        Ok(out)
     }
 }
 
@@ -49,19 +51,58 @@ impl NetboxSource {
     /// # Errors
     /// Propagates SSH/HTTP failures or a non-JSON body.
     pub fn gather_prefixes(&self, range: &Cidr) -> anyhow::Result<Vec<Subnet>> {
-        let url = format!(
+        let first = format!(
             "{}/api/ipam/prefixes/?within_include={}/{}&limit=1000",
             self.base_url.trim_end_matches('/'),
             range.network(),
             range.prefix_len
         );
-        let remote = format!("read TOK; curl -sS --max-time 25 -H \"Authorization: Token $TOK\" '{url}'");
-        let json = self
-            .vantage
-            .run_with_stdin(&remote, &format!("{}\n", self.token))
-            .context("querying NetBox prefixes from the vantage host")?;
-        parse_prefixes(&json)
+        let mut out = Vec::new();
+        for json in self.paginate(first)? {
+            out.extend(parse_prefixes(&json)?);
+        }
+        Ok(out)
     }
+
+    /// Follow NetBox's `next` links from `first`, returning every page's raw JSON body.
+    ///
+    /// NetBox paginates list endpoints (`{count, next, results}`); a single `limit=1000`
+    /// page silently drops the overflow, so we walk the `next` URLs until there are none.
+    /// Capped at [`MAX_PAGES`] so a malformed `next` can't loop forever.
+    ///
+    /// # Errors
+    /// Propagates SSH/HTTP failures, or bails if the page cap is hit.
+    fn paginate(&self, first: String) -> anyhow::Result<Vec<String>> {
+        let mut pages = Vec::new();
+        let mut url = Some(first);
+        while let Some(u) = url {
+            anyhow::ensure!(pages.len() < MAX_PAGES, "NetBox returned more than {MAX_PAGES} pages");
+            let json = self.curl(&u)?;
+            url = next_url(&json);
+            pages.push(json);
+        }
+        Ok(pages)
+    }
+
+    /// Run an authenticated `curl` for `url` on the vantage, returning the body. The
+    /// token is fed via stdin (`read TOK`) so it is never a command argument.
+    ///
+    /// # Errors
+    /// Propagates SSH failures.
+    fn curl(&self, url: &str) -> anyhow::Result<String> {
+        let remote = format!("read TOK; curl -sS --max-time 25 -H \"Authorization: Token $TOK\" '{url}'");
+        self.vantage
+            .run_with_stdin(&remote, &format!("{}\n", self.token))
+            .context("querying NetBox from the vantage host")
+    }
+}
+
+/// The `next` page URL from a NetBox list response, or `None` at the last page (also
+/// `None` on a body that doesn't parse — the per-page parser reports that error).
+fn next_url(json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| v.get("next").and_then(|n| n.as_str()).map(str::to_string))
 }
 
 /// Parse a NetBox `prefixes` list response into [`Subnet`]s.
@@ -169,6 +210,15 @@ mod tests {
     fn rejects_non_json() {
         let range = Cidr::parse("10.87.3.0/24").unwrap();
         assert!(parse_ip_addresses("<html>403</html>", &range).is_err());
+    }
+
+    #[test]
+    fn next_url_follows_then_stops() {
+        let mid = r#"{"count": 1500, "next": "https://nb/api/ipam/ip-addresses/?limit=1000&offset=1000", "results": []}"#;
+        let last = r#"{"count": 1500, "next": null, "results": []}"#;
+        assert_eq!(next_url(mid).as_deref(), Some("https://nb/api/ipam/ip-addresses/?limit=1000&offset=1000"));
+        assert_eq!(next_url(last), None);
+        assert_eq!(next_url("<html>oops</html>"), None); // unparseable → no next (parser reports the error)
     }
 
     #[test]

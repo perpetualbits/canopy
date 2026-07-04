@@ -53,24 +53,21 @@ pub fn gather_live_with_token(
 ) -> anyhow::Result<LiveData> {
     let vantage = Vantage::new(&cfg.vantage);
     let netbox = NetboxSource { vantage: vantage.clone(), base_url: cfg.netbox_url.clone(), token };
-    let dns = DnsSource { vantage: vantage.clone(), concurrency: cfg.dns_concurrency };
-    let probe = ProbeSource { vantage: Vantage::new(&cfg.probe_host) };
+    let dns = DnsSource {
+        vantage: vantage.clone(),
+        concurrency: cfg.dns_concurrency,
+        axfr_server: cfg.reverse_axfr_server.clone(),
+    };
+    let probe = ProbeSource { vantage: Vantage::new(&cfg.probe_host), concurrency: cfg.probe_concurrency };
 
     on_progress(0.0, "querying NetBox…");
     let nb = netbox.gather(range).context("NetBox source")?;
     let subnets = netbox.gather_prefixes(range).context("NetBox prefixes")?;
 
-    // DNS reverse sweep — the long pole. Map its per-address ticks onto 5 %–92 % of the
-    // bar, updating only ~every percent so we don't spam a message per address.
-    let total = range.host_count().max(1);
-    let step = (total / 100).max(1);
+    // DNS reverse resolution — the long pole. It reports its own 0–1 fraction (per
+    // address for the sweep, per zone for AXFR); map that onto 5 %–92 % of the bar.
     let dns_facts = dns
-        .gather_with_progress(range, |done| {
-            if done % step == 0 || done == total {
-                let frac = 0.05 + 0.87 * (done as f32 / total as f32);
-                on_progress(frac, &format!("DNS reverse sweep {done}/{total}"));
-            }
-        })
+        .gather_with_progress(range, |frac, label| on_progress(0.05 + 0.87 * frac, label))
         .context("DNS source")?;
 
     on_progress(0.93, "probing the wire…");
