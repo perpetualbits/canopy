@@ -404,11 +404,21 @@ fn explain(s: AddressStatus) -> &'static str {
     }
 }
 
+/// Format an address count compactly: plain up to ~100 M, else scientific (an IPv6
+/// `free` count is astronomically large — `1.84e19` reads better than 20 digits).
+fn fmt_count(n: u128) -> String {
+    if n < 100_000_000 {
+        n.to_string()
+    } else {
+        format!("{:.2e}", n as f64)
+    }
+}
+
 /// The one-line status tally: each non-zero bucket in its own colour.
 fn count_bar(buf: &mut Buffer, x: u16, y: u16, c: &Counts) {
     let mut cx = x;
-    let seg = |buf: &mut Buffer, cx: &mut u16, label: &str, n: usize, style: Style| {
-        let text = format!("{label} {n}  ");
+    let seg = |buf: &mut Buffer, cx: &mut u16, label: &str, n: u128, style: Style| {
+        let text = format!("{label} {}  ", fmt_count(n));
         btxt(buf, *cx, y, &text, style);
         *cx += text.len() as u16;
     };

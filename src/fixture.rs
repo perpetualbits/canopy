@@ -6,7 +6,7 @@
 //! and a DNS/probe reader) will replace this behind the same fact shape.
 
 use crate::reconcile::{AddressFacts, Cidr, NetBoxRecord};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 /// Build the demo range and facts exactly as reconnaissance found them.
 ///
@@ -70,6 +70,6 @@ pub fn demo() -> (Cidr, Vec<AddressFacts>) {
 }
 
 /// Make `10.87.3.<oct>`.
-fn v4(oct: u8) -> Ipv4Addr {
-    Ipv4Addr::new(10, 87, 3, oct)
+fn v4(oct: u8) -> IpAddr {
+    IpAddr::V4(Ipv4Addr::new(10, 87, 3, oct))
 }

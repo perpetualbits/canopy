@@ -5,6 +5,8 @@
 //! We reverse-resolve every host on the vantage (its resolver knows the internal
 //! zones), in parallel with bounded fan-out, and collect the answers.
 
+use std::net::IpAddr;
+
 use super::{FactSource, Vantage};
 use crate::reconcile::{AddressFacts, Cidr};
 
@@ -47,9 +49,15 @@ impl DnsSource {
         range: &Cidr,
         mut on_progress: impl FnMut(f32, &str),
     ) -> anyhow::Result<Vec<AddressFacts>> {
-        if !self.axfr_server.is_empty() {
-            // AXFR is the light path — but only if the server actually lets us transfer;
-            // if not, quietly fall back so a locked-down server is never a hard failure.
+        // A per-address sweep needs to enumerate the range; a huge (IPv6) range cannot be
+        // enumerated. IPv6 reverse-by-AXFR (`ip6.arpa`) is a follow-up, so for now such a
+        // range gets no reverse DNS here and relies on NetBox alone.
+        if !range.is_enumerable() {
+            return Ok(Vec::new());
+        }
+        // AXFR is the light path (IPv4 `in-addr.arpa` only for now) — but only if the
+        // server actually lets us transfer; if not, quietly fall back to the sweep.
+        if !self.axfr_server.is_empty() && !range.is_v6() {
             if let Some(facts) = self.try_axfr(range, &mut on_progress)? {
                 return Ok(facts);
             }
@@ -75,7 +83,7 @@ impl DnsSource {
         );
         let total = range.host_count().max(1);
         let step = (total / 100).max(1); // update ~every 1 % rather than per address
-        let mut done = 0u64;
+        let mut done = 0u128;
         let mut results = String::new();
         self.vantage.run_streaming(&remote, |line| {
             if line == "T" {
@@ -151,8 +159,12 @@ impl DnsSource {
 /// `/24` boundaries. Empty when the range would need more than [`MAX_ZONES`] zones (the
 /// signal to skip AXFR and sweep instead).
 fn reverse_zones(range: &Cidr) -> Vec<String> {
-    let start = u64::from(u32::from(range.network()));
-    let end = start + range.block_len(); // exclusive
+    // IPv4 `in-addr.arpa` only; IPv6 `ip6.arpa` transfer is a follow-up.
+    let IpAddr::V4(net) = range.network() else {
+        return Vec::new();
+    };
+    let start = u64::from(u32::from(net));
+    let end = start + range.block_len() as u64; // exclusive (v4 block_len fits u64)
     let first = start & !0xFF; // align down to a /24 boundary
     let count = (end - first).div_ceil(256) as usize;
     if count > MAX_ZONES {
@@ -192,9 +204,10 @@ pub fn parse_axfr(output: &str, range: &Cidr) -> Vec<AddressFacts> {
         let (Some(owner), Some(target)) = (f.first(), f.get(pi + 1)) else {
             continue;
         };
-        let Some(addr) = ptr_owner_to_ip(owner) else {
+        let Some(v4) = ptr_owner_to_ip(owner) else {
             continue;
         };
+        let addr = IpAddr::V4(v4);
         if !range.contains(addr) {
             continue;
         }
@@ -244,7 +257,7 @@ garbage line without ip
 10.87.3.90";
         let facts = parse_ptrs(sample);
         assert_eq!(facts.len(), 2); // the garbage and the ip-only line are skipped
-        assert_eq!(facts[0].addr, std::net::Ipv4Addr::new(10, 87, 3, 68));
+        assert_eq!(facts[0].addr, std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 87, 3, 68)));
         assert_eq!(facts[0].ptr.as_deref(), Some("dop21-ipmi.nfra.nl."));
         assert!(facts[0].netbox.is_none() && !facts[0].live);
     }
@@ -273,7 +286,7 @@ garbage line without ip
     #[test]
     fn ptr_owner_maps_back_to_its_address() {
         let ip = ptr_owner_to_ip("1.3.87.10.in-addr.arpa.").unwrap();
-        assert_eq!(ip, std::net::Ipv4Addr::new(10, 87, 3, 1));
+        assert_eq!(ip, std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 87, 3, 1)));
         assert!(ptr_owner_to_ip("nonsense.example.com.").is_none());
     }
 
@@ -288,7 +301,7 @@ garbage line without ip
         let facts = parse_axfr(answer, &range);
         // SOA/NS skipped; the out-of-range .99 host dropped; only the /24 PTR kept.
         assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0].addr, std::net::Ipv4Addr::new(10, 87, 3, 68));
+        assert_eq!(facts[0].addr, std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 87, 3, 68)));
         assert_eq!(facts[0].ptr.as_deref(), Some("dop21-ipmi.nfra.nl."));
     }
 }

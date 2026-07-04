@@ -37,7 +37,7 @@ pub trait FactSource {
 /// out (via `BTreeMap`), ready to reconcile.
 #[must_use]
 pub fn merge(sources: Vec<Vec<AddressFacts>>) -> Vec<AddressFacts> {
-    let mut map: BTreeMap<std::net::Ipv4Addr, AddressFacts> = BTreeMap::new();
+    let mut map: BTreeMap<std::net::IpAddr, AddressFacts> = BTreeMap::new();
     for facts in sources {
         for f in facts {
             let e = map.entry(f.addr).or_insert_with(|| AddressFacts {
@@ -65,8 +65,8 @@ mod tests {
     use super::*;
     use crate::reconcile::{classify, AddressStatus, NetBoxRecord};
 
-    fn addr(oct: u8) -> std::net::Ipv4Addr {
-        std::net::Ipv4Addr::new(10, 87, 3, oct)
+    fn addr(oct: u8) -> std::net::IpAddr {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 87, 3, oct))
     }
 
     #[test]

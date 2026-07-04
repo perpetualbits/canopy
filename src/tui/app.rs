@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -42,13 +42,13 @@ pub enum AllocPhase {
 /// A saved map scope for zoom-out: a range and the facts within it.
 struct ZoomFrame {
     range: Cidr,
-    facts: Rc<HashMap<Ipv4Addr, AddressFacts>>,
+    facts: Rc<HashMap<IpAddr, AddressFacts>>,
 }
 
 /// The in-progress "allocate this address" flow.
 pub struct AllocFlow {
     /// The address being allocated.
-    pub addr: Ipv4Addr,
+    pub addr: IpAddr,
     /// The FQDN being typed.
     pub input: String,
     /// The plan, once built (Preview phase).
@@ -133,7 +133,7 @@ pub struct App {
     /// The raw per-address facts, keyed by address. Bounded by what the sources
     /// reported (never the whole range), so it also backs inspect and the graph/tree.
     /// Shared (`Rc`) so a [`RangeSource`] closure can borrow it.
-    pub facts: Rc<HashMap<Ipv4Addr, AddressFacts>>,
+    pub facts: Rc<HashMap<IpAddr, AddressFacts>>,
     /// Cached status tally for the header (derived from `facts` + `total`).
     pub counts: Counts,
     /// Whether `facts` came from the live sources (`true`) or the demo fixture.
@@ -209,10 +209,10 @@ impl App {
     /// (bounded) and the row count are kept.
     #[must_use]
     pub fn new(range: Cidr, facts: Vec<AddressFacts>, write_mode: bool, dry_run: bool, live: bool, cfg: Config) -> Self {
-        let total = range.host_count() as usize;
-        let facts: Rc<HashMap<Ipv4Addr, AddressFacts>> =
+        let total = range.host_count().min(usize::MAX as u128) as usize;
+        let facts: Rc<HashMap<IpAddr, AddressFacts>> =
             Rc::new(facts.into_iter().map(|f| (f.addr, f)).collect());
-        let counts = reconcile::counts_from_facts(total as u64, &facts);
+        let counts = reconcile::counts_from_facts(total as u128, &facts);
         let (graph, graph_canvas) = build_graph(&facts);
         App {
             range,
@@ -374,7 +374,7 @@ impl App {
     fn apply_live(&mut self, data: LiveData) {
         self.subnets = data.subnets;
         self.facts = Rc::new(data.facts.into_iter().map(|f| (f.addr, f)).collect());
-        self.counts = reconcile::counts_from_facts(self.total as u64, &self.facts);
+        self.counts = reconcile::counts_from_facts(self.total as u128, &self.facts);
         let (graph, canvas) = build_graph(&self.facts);
         self.graph = graph;
         self.graph_canvas = canvas;
@@ -391,7 +391,7 @@ impl App {
 
     /// The raw facts for `addr`, if any source reported it (free addresses have none).
     #[must_use]
-    pub fn facts_for(&self, addr: Ipv4Addr) -> Option<&AddressFacts> {
+    pub fn facts_for(&self, addr: IpAddr) -> Option<&AddressFacts> {
         self.facts.get(&addr)
     }
 
@@ -399,7 +399,7 @@ impl App {
     /// lazy core that lets the table browse a huge range without materializing it.
     #[must_use]
     pub fn row_at(&self, i: usize) -> AddressRow {
-        reconcile::reconcile_at(self.range, &self.facts, i as u64)
+        reconcile::reconcile_at(self.range, &self.facts, i as u128)
     }
 
     /// A `mullion::RangeSource` over the whole range, each row built lazily from its
@@ -409,7 +409,7 @@ impl App {
     pub fn table_source(&self) -> RangeSource<AddressRow, impl Fn(u64) -> AddressRow> {
         let range = self.range;
         let facts = Rc::clone(&self.facts);
-        RangeSource::new(self.total as u64, move |i| reconcile::reconcile_at(range, &facts, i))
+        RangeSource::new(self.total as u64, move |i| reconcile::reconcile_at(range, &facts, u128::from(i)))
     }
 
     /// The reconciled rows for the **known** addresses only (those any source
@@ -476,7 +476,12 @@ impl App {
             self.status = Some(("type a name first".to_string(), true));
             return;
         }
-        let alloc = Allocation { addr, prefix_len: self.range.prefix_len, fqdn };
+        // The allocate/write path (A record + reverse PTR) is IPv4-only for now.
+        let IpAddr::V4(v4) = addr else {
+            self.status = Some(("IPv6 allocation is not supported yet".to_string(), true));
+            return;
+        };
+        let alloc = Allocation { addr: v4, prefix_len: self.range.prefix_len, fqdn };
         // The plan only needs the target address's current row for its free-check.
         let target = self
             .facts
@@ -638,7 +643,7 @@ impl App {
     fn zoom_into_cursor(&mut self) {
         if let Some(sub) = self.cursor_subnet() {
             self.zoom_stack.push(ZoomFrame { range: self.range, facts: Rc::clone(&self.facts) });
-            let sub_facts: HashMap<Ipv4Addr, AddressFacts> = self
+            let sub_facts: HashMap<IpAddr, AddressFacts> = self
                 .facts
                 .iter()
                 .filter(|(a, _)| sub.contains(**a))
@@ -659,10 +664,10 @@ impl App {
 
     /// Point the whole app at `range` with `facts` (already narrowed to it), rebuilding
     /// every derived view. Used by both zoom directions so all four views stay in sync.
-    fn set_scope(&mut self, range: Cidr, facts: Rc<HashMap<Ipv4Addr, AddressFacts>>) {
+    fn set_scope(&mut self, range: Cidr, facts: Rc<HashMap<IpAddr, AddressFacts>>) {
         self.range = range;
-        self.total = range.host_count() as usize;
-        self.counts = reconcile::counts_from_facts(self.total as u64, &facts);
+        self.total = range.host_count().min(usize::MAX as u128) as usize;
+        self.counts = reconcile::counts_from_facts(self.total as u128, &facts);
         let (graph, canvas) = build_graph(&facts);
         self.graph = graph;
         self.graph_canvas = canvas;
@@ -722,7 +727,7 @@ impl App {
     }
 
     /// Open the inspect panel for `addr` by pointing the table cursor at its row.
-    fn inspect_addr(&mut self, addr: Ipv4Addr) {
+    fn inspect_addr(&mut self, addr: IpAddr) {
         if let Some(i) = self.range.host_index(addr) {
             self.cur.cursor = i as usize;
             self.detail = true;
@@ -790,7 +795,7 @@ impl App {
 
 /// Build the cluster graph and its laid-out canvas from the known facts (bounded —
 /// only addresses a source reported, never the whole range).
-fn build_graph(facts: &HashMap<Ipv4Addr, AddressFacts>) -> (DnsGraph, GraphCanvas) {
+fn build_graph(facts: &HashMap<IpAddr, AddressFacts>) -> (DnsGraph, GraphCanvas) {
     let mut rows: Vec<AddressRow> = facts.values().map(reconcile::row_from_facts).collect();
     rows.sort_by_key(|r| r.addr);
     let graph = DnsGraph::from_rows(&rows);
@@ -1022,7 +1027,7 @@ mod tests {
         app.tree_cur = 4; // first dop host (10.87.3.68)
         app.on_key(KeyCode::Enter);
         assert!(app.detail);
-        assert_eq!(app.row_at(app.cur.cursor).addr, "10.87.3.68".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(app.row_at(app.cur.cursor).addr, "10.87.3.68".parse::<IpAddr>().unwrap());
 
         // Left collapses the group the cursor sits in.
         app.detail = false;
@@ -1061,6 +1066,36 @@ mod tests {
         assert!(matches!(corner, Color::Rgb(_, g, _) if g > 150), "bump greens the corner: {corner:?}");
         let far = buf.get(12, 5).style.fg; // opposite side of the ring
         assert!(matches!(far, Color::Rgb(70, 70, 100)), "far border stays dim: {far:?}");
+    }
+
+    #[test]
+    fn ipv6_range_renders_every_view_without_panicking() {
+        use mullion::{Buffer, Rect};
+        let range = Cidr::parse("2001:db8::/48").unwrap();
+        // A couple of v6 hosts near the network address.
+        let facts: Vec<AddressFacts> = (1..=4u128)
+            .map(|i| AddressFacts {
+                addr: IpAddr::V6(std::net::Ipv6Addr::from(u128::from(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0)) + i)),
+                netbox: None,
+                ptr: Some(format!("h{i}.nfra.nl.")),
+                live: false,
+            })
+            .collect();
+        let mut app = App::new(range, facts, false, false, false, Config::default());
+        assert!(!app.range.is_enumerable()); // a /48 is sparse
+        assert_eq!(app.counts.dns_only, 4);
+        for view in [View::Table, View::Graph, View::Tree, View::Map] {
+            app.view = view;
+            for (w, h) in [(90u16, 24u16), (40, 12)] {
+                let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
+                match view {
+                    View::Table => draw::screen(&mut buf, &mut app),
+                    View::Graph => crate::tui::graph::screen(&mut buf, &mut app),
+                    View::Tree => crate::tui::tree::screen(&mut buf, &mut app),
+                    View::Map => crate::tui::map::screen(&mut buf, &mut app),
+                }
+            }
+        }
     }
 
     #[test]
@@ -1127,10 +1162,10 @@ mod tests {
         let parent_total = app.total;
 
         // Move the cursor onto the cell that actually holds the host, then zoom in.
-        let host: Ipv4Addr = "10.1.0.5".parse().unwrap();
+        let host: IpAddr = "10.1.0.5".parse().unwrap();
         let off = range.offset_of(host).unwrap();
         let block = range.block_len() >> (2 * app.map_order);
-        app.map_cur = crate::map::hilbert_d2xy(app.map_order, off / block);
+        app.map_cur = crate::map::hilbert_d2xy(app.map_order, (off / block) as u64);
         let target = app.cursor_subnet().unwrap();
         assert!(target.contains(host));
         app.on_key(KeyCode::Enter);
@@ -1218,7 +1253,7 @@ mod tests {
 
         // row_at anywhere is O(1); a deep index is free.
         assert!(app.row_at(10_000_000).status.is_free());
-        assert_eq!(app.row_at(4).addr, "10.0.0.5".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(app.row_at(4).addr, "10.0.0.5".parse::<IpAddr>().unwrap());
 
         // The RangeSource drives a VirtualList over the /8, materializing only a window.
         let mut list = VirtualList::new(app.table_source(), 20, 32);

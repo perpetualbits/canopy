@@ -15,7 +15,7 @@
 //! This module does **no I/O**, so the rule stays trivial to test against known cases.
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// What NetBox knows about one address — for now just the forward DNS name it
 /// claims (`None` if reserved without a name).
@@ -29,8 +29,8 @@ pub struct NetBoxRecord {
 /// `None`/`false` means "that source does not claim this address".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddressFacts {
-    /// The address these facts describe.
-    pub addr: Ipv4Addr,
+    /// The address these facts describe (IPv4 or IPv6).
+    pub addr: IpAddr,
     /// NetBox's record, or `None` if NetBox has no object for this address.
     pub netbox: Option<NetBoxRecord>,
     /// The reverse-DNS (PTR) name, or `None` if the resolver returned nothing.
@@ -69,8 +69,8 @@ impl AddressStatus {
 /// know for it (NetBox's name if present, otherwise the PTR).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddressRow {
-    /// The address.
-    pub addr: Ipv4Addr,
+    /// The address (IPv4 or IPv6).
+    pub addr: IpAddr,
     /// The merged verdict.
     pub status: AddressStatus,
     /// The most authoritative name we have, normalized (lower-case, no trailing dot).
@@ -136,7 +136,7 @@ pub fn row_from_facts(facts: &AddressFacts) -> AddressRow {
 /// caller can render just the visible window of a `/8` without building 16M rows.
 /// An address absent from `facts` is `Free`.
 #[must_use]
-pub fn reconcile_at(range: Cidr, facts: &HashMap<Ipv4Addr, AddressFacts>, index: u64) -> AddressRow {
+pub fn reconcile_at(range: Cidr, facts: &HashMap<IpAddr, AddressFacts>, index: u128) -> AddressRow {
     let addr = range.host_at(index);
     match facts.get(&addr) {
         Some(f) => row_from_facts(f),
@@ -151,7 +151,7 @@ pub fn reconcile_at(range: Cidr, facts: &HashMap<Ipv4Addr, AddressFacts>, index:
 /// for small ranges and tests — large ranges use [`reconcile_at`] lazily.
 #[must_use]
 pub fn reconcile(range: Cidr, facts: &[AddressFacts]) -> Vec<AddressRow> {
-    let by_addr: HashMap<Ipv4Addr, &AddressFacts> =
+    let by_addr: HashMap<IpAddr, &AddressFacts> =
         facts.iter().map(|f| (f.addr, f)).collect();
 
     range
@@ -164,20 +164,23 @@ pub fn reconcile(range: Cidr, facts: &[AddressFacts]) -> Vec<AddressRow> {
 }
 
 /// A tally of how many addresses fall into each status — for the header bar.
+///
+/// Counts are `u128` because a sparse IPv6 range's `free` count can reach `2^128`; the
+/// non-free buckets are bounded by the (small) fact set but share the type for uniformity.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Counts {
     /// Number of `Free` addresses.
-    pub free: usize,
+    pub free: u128,
     /// Number of `Allocated` addresses.
-    pub allocated: usize,
+    pub allocated: u128,
     /// Number of `NetBoxOnly` addresses.
-    pub netbox_only: usize,
+    pub netbox_only: u128,
     /// Number of `DnsOnly` addresses.
-    pub dns_only: usize,
+    pub dns_only: u128,
     /// Number of `LiveUnregistered` addresses.
-    pub live_unregistered: usize,
+    pub live_unregistered: u128,
     /// Number of `Conflict` addresses.
-    pub conflict: usize,
+    pub conflict: u128,
 }
 
 /// Tally one status into `c`.
@@ -198,9 +201,9 @@ fn tally(c: &mut Counts, status: AddressStatus) {
 /// `free = total − known-non-free`, so a mostly-empty `/8` is counted in O(facts),
 /// not O(16M). A stray fact that itself classifies `Free` is handled correctly.
 #[must_use]
-pub fn counts_from_facts(total: u64, facts: &HashMap<Ipv4Addr, AddressFacts>) -> Counts {
+pub fn counts_from_facts(total: u128, facts: &HashMap<IpAddr, AddressFacts>) -> Counts {
     let mut c = Counts::default();
-    let mut free_known = 0u64;
+    let mut free_known = 0u128;
     for f in facts.values() {
         let status = classify(f);
         tally(&mut c, status);
@@ -209,8 +212,8 @@ pub fn counts_from_facts(total: u64, facts: &HashMap<Ipv4Addr, AddressFacts>) ->
         }
     }
     // The addresses no source mentioned are all free; add them to any already tallied.
-    let unknown = total - facts.len() as u64;
-    c.free = (unknown + free_known) as usize;
+    let unknown = total.saturating_sub(facts.len() as u128);
+    c.free = unknown + free_known;
     c
 }
 
@@ -234,7 +237,7 @@ impl Subnet {
     /// largest `prefix_len`. Longest-prefix-match is the standard rule — the tightest
     /// real subnet an address sits in is the most useful "where am I".
     #[must_use]
-    pub fn most_specific(subnets: &[Subnet], addr: Ipv4Addr) -> Option<&Subnet> {
+    pub fn most_specific(subnets: &[Subnet], addr: IpAddr) -> Option<&Subnet> {
         subnets
             .iter()
             .filter(|s| s.cidr.contains(addr))
@@ -242,140 +245,271 @@ impl Subnet {
     }
 }
 
-/// An IPv4 CIDR block, e.g. `10.87.3.0/24`, stored as base address + prefix length.
+/// A CIDR block — **IPv4 or IPv6** — as base address + prefix length, e.g.
+/// `10.87.3.0/24` or `2001:db8::/48`.
+///
+/// All the arithmetic runs on the address as a `u128` (IPv4 lives in the low 32 bits),
+/// so a single code path serves both families; the `base`'s variant records the width
+/// (32 vs 128 bits). Counts are `u128` because an IPv6 block can hold up to `2^128`
+/// addresses — far more than any list could hold, so views treat a block bigger than
+/// [`ENUMERATION_CAP`] as *sparse* (see [`is_enumerable`](Cidr::is_enumerable)) and show
+/// only the addresses some source actually reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cidr {
     /// The base address as written (not necessarily the network address).
-    pub base: Ipv4Addr,
-    /// The prefix length in bits, 0..=32.
+    pub base: IpAddr,
+    /// The prefix length in bits: `0..=32` for IPv4, `0..=128` for IPv6.
     pub prefix_len: u8,
 }
 
+/// Above this many addresses a block is **sparse**: too large to list every address, so
+/// views show only the known ones. `2^32` keeps every IPv4 block enumerable (a `/0` is
+/// 4 G rows, still lazy-cheap) while any IPv6 block wider than a `/96` goes sparse.
+pub const ENUMERATION_CAP: u128 = 1 << 32;
+
 impl Cidr {
-    /// Parse a CIDR string like `"10.87.3.0/24"`.
+    /// Parse a CIDR string like `"10.87.3.0/24"` or `"2001:db8::/48"`.
     ///
     /// # Errors
-    /// Returns a human-readable message if the address or prefix length is invalid.
+    /// Returns a human-readable message if the address or prefix length is invalid, or
+    /// the prefix exceeds the address family's width (32 for IPv4, 128 for IPv6).
     pub fn parse(s: &str) -> Result<Cidr, String> {
-        let (addr, len) = s
-            .split_once('/')
-            .ok_or_else(|| format!("missing '/prefix' in {s:?}"))?;
-        let base: Ipv4Addr = addr
-            .parse()
-            .map_err(|_| format!("invalid IPv4 address {addr:?}"))?;
-        let prefix_len: u8 = len
-            .parse()
-            .map_err(|_| format!("invalid prefix length {len:?}"))?;
-        if prefix_len > 32 {
-            return Err(format!("prefix length {prefix_len} exceeds 32"));
+        let (addr, len) = s.split_once('/').ok_or_else(|| format!("missing '/prefix' in {s:?}"))?;
+        let base: IpAddr = addr.parse().map_err(|_| format!("invalid IP address {addr:?}"))?;
+        let prefix_len: u8 = len.parse().map_err(|_| format!("invalid prefix length {len:?}"))?;
+        let max = if base.is_ipv6() { 128 } else { 32 };
+        if u32::from(prefix_len) > max {
+            return Err(format!("prefix length {prefix_len} exceeds {max}"));
         }
         Ok(Cidr { base, prefix_len })
     }
 
-    /// The subnet mask as a `u32` (`/20` → `0xFFFF_F000`). A `/0` needs a special
-    /// case because shifting a `u32` by 32 is undefined in Rust.
-    fn mask(self) -> u32 {
-        if self.prefix_len == 0 {
-            0
+    /// Whether this is an IPv6 block.
+    #[must_use]
+    pub fn is_v6(self) -> bool {
+        self.base.is_ipv6()
+    }
+
+    /// The address width in bits — 32 for IPv4, 128 for IPv6.
+    #[must_use]
+    pub fn width(self) -> u32 {
+        if self.is_v6() {
+            128
         } else {
-            u32::MAX << (32 - self.prefix_len)
+            32
         }
+    }
+
+    /// The number of host bits below the prefix (`width − prefix`).
+    #[must_use]
+    pub fn host_bits(self) -> u32 {
+        self.width() - u32::from(self.prefix_len)
+    }
+
+    /// The base address as a `u128` (IPv4 in the low 32 bits).
+    fn value(self) -> u128 {
+        match self.base {
+            IpAddr::V4(a) => u128::from(u32::from(a)),
+            IpAddr::V6(a) => u128::from(a),
+        }
+    }
+
+    /// Rebuild an address of this block's family from a `u128` value.
+    fn to_addr(self, v: u128) -> IpAddr {
+        if self.is_v6() {
+            IpAddr::V6(Ipv6Addr::from(v))
+        } else {
+            IpAddr::V4(Ipv4Addr::from(v as u32))
+        }
+    }
+
+    /// The host mask: the low `host_bits` bits set (`block_len − 1`), saturating for a
+    /// `/0` where the whole width is host bits.
+    fn hostmask(self) -> u128 {
+        let hb = self.host_bits();
+        if hb >= 128 {
+            u128::MAX
+        } else {
+            (1u128 << hb) - 1
+        }
+    }
+
+    /// The network mask over the address width (host bits cleared, upper bits beyond the
+    /// family's width left zero).
+    fn mask(self) -> u128 {
+        let width_mask = if self.is_v6() { u128::MAX } else { u128::from(u32::MAX) };
+        width_mask & !self.hostmask()
     }
 
     /// The network address (base with the host bits cleared).
     #[must_use]
-    pub fn network(self) -> Ipv4Addr {
-        Ipv4Addr::from(u32::from(self.base) & self.mask())
+    pub fn network(self) -> IpAddr {
+        self.to_addr(self.value() & self.mask())
     }
 
-    /// Whether `ip` lies inside this block.
+    /// The last address of the block (network with all host bits set).
     #[must_use]
-    pub fn contains(self, ip: Ipv4Addr) -> bool {
-        u32::from(ip) & self.mask() == u32::from(self.base) & self.mask()
+    pub fn last(self) -> IpAddr {
+        self.to_addr((self.value() & self.mask()) | self.hostmask())
     }
 
-    /// The total number of addresses in the block — `2^(32−prefix)`, a clean power of
-    /// two (network and broadcast included). This is the **map's** addressing space:
-    /// unlike the usable-host count it tiles evenly into CIDR quadrants, which the
-    /// space-filling map layout needs.
+    /// Whether `ip` lies inside this block. A mismatched address family is never inside.
     #[must_use]
-    pub fn block_len(self) -> u64 {
-        1u64 << (32 - u32::from(self.prefix_len))
+    pub fn contains(self, ip: IpAddr) -> bool {
+        if ip.is_ipv6() != self.is_v6() {
+            return false;
+        }
+        let v = match ip {
+            IpAddr::V4(a) => u128::from(u32::from(a)),
+            IpAddr::V6(a) => u128::from(a),
+        };
+        (v & self.mask()) == (self.value() & self.mask())
     }
 
-    /// The offset of `addr` within the block (`addr − network`), or `None` if `addr`
-    /// is outside the block.
+    /// The total number of addresses in the block — `2^host_bits`, a clean power of two
+    /// (all addresses, no host/broadcast exclusion). This is the **map's** addressing
+    /// space; it tiles evenly into CIDR quadrants, which the space-filling layout needs.
+    /// Saturates to `u128::MAX` for a `/0`, whose `2^128` does not fit.
     #[must_use]
-    pub fn offset_of(self, addr: Ipv4Addr) -> Option<u64> {
-        let net = u32::from(self.base) & self.mask();
-        self.contains(addr).then(|| u64::from(u32::from(addr) - net))
-    }
-
-    /// The address at `offset` within the block (`network + offset`), clamped to the
-    /// last address of the block.
-    #[must_use]
-    pub fn address_at_offset(self, offset: u64) -> Ipv4Addr {
-        let net = u64::from(u32::from(self.base) & self.mask());
-        let last = net | u64::from(!self.mask());
-        Ipv4Addr::from((net + offset).min(last) as u32)
-    }
-
-    /// The inclusive `(first, last)` usable-host address bounds, as `u32`.
-    ///
-    /// For `/1`–`/30` the network and broadcast addresses are skipped; `/31` uses
-    /// both (RFC 3021) and `/32` the single address. This is the arithmetic shared by
-    /// [`hosts`](Cidr::hosts), [`host_count`](Cidr::host_count) and
-    /// [`host_at`](Cidr::host_at), so none of them needs to iterate.
-    fn host_bounds(self) -> (u32, u32) {
-        let net = u32::from(self.base) & self.mask();
-        let bcast = net | !self.mask();
-        match self.prefix_len {
-            32 => (net, net),
-            31 => (net, bcast),
-            _ => (net + 1, bcast - 1),
+    pub fn block_len(self) -> u128 {
+        let hb = self.host_bits();
+        if hb >= 128 {
+            u128::MAX
+        } else {
+            1u128 << hb
         }
     }
 
-    /// How many usable host addresses the block has — computed by arithmetic, so a
-    /// `/8` (16,777,214 hosts) is as cheap to size as a `/24`.
+    /// The offset of `addr` within the block (`addr − network`), or `None` if `addr` is
+    /// outside the block (including a mismatched family).
     #[must_use]
-    pub fn host_count(self) -> u64 {
+    pub fn offset_of(self, addr: IpAddr) -> Option<u128> {
+        if !self.contains(addr) {
+            return None;
+        }
+        let v = match addr {
+            IpAddr::V4(a) => u128::from(u32::from(a)),
+            IpAddr::V6(a) => u128::from(a),
+        };
+        Some(v - (self.value() & self.mask()))
+    }
+
+    /// The address at `offset` within the block (`network + offset`), clamped to the last
+    /// address of the block.
+    #[must_use]
+    pub fn address_at_offset(self, offset: u128) -> IpAddr {
+        let net = self.value() & self.mask();
+        let last = net | self.hostmask();
+        self.to_addr(net.saturating_add(offset).min(last))
+    }
+
+    /// The inclusive `(first, last)` usable-host address bounds, as `u128`.
+    ///
+    /// IPv6 has no broadcast, so every address in the block is usable. For IPv4, `/1`–`/30`
+    /// skip the network and broadcast addresses; `/31` uses both (RFC 3021) and `/32` the
+    /// single address. This is the arithmetic shared by [`hosts`](Cidr::hosts),
+    /// [`host_count`](Cidr::host_count) and [`host_at`](Cidr::host_at).
+    fn host_bounds(self) -> (u128, u128) {
+        let net = self.value() & self.mask();
+        let last = net | self.hostmask();
+        if self.is_v6() {
+            return (net, last);
+        }
+        match self.prefix_len {
+            32 => (net, net),
+            31 => (net, last),
+            _ => (net + 1, last - 1),
+        }
+    }
+
+    /// How many usable host addresses the block has — computed by arithmetic, so a `/8`
+    /// (16 M hosts) is as cheap to size as a `/24`. Saturates for enormous IPv6 blocks.
+    #[must_use]
+    pub fn host_count(self) -> u128 {
         let (s, e) = self.host_bounds();
-        u64::from(e) - u64::from(s) + 1
+        (e - s).saturating_add(1)
+    }
+
+    /// Whether the block is small enough to list every address (≤ [`ENUMERATION_CAP`]).
+    /// Large IPv6 blocks are not: views fall back to showing only the known addresses.
+    #[must_use]
+    pub fn is_enumerable(self) -> bool {
+        self.host_count() <= ENUMERATION_CAP
     }
 
     /// The `index`-th usable host address (0-based), clamped to the last host.
     ///
-    /// `O(1)` — the basis for lazily rendering only the visible slice of a huge
-    /// range without ever materializing all of it.
+    /// `O(1)` — the basis for lazily rendering only the visible slice of a range without
+    /// ever materializing all of it.
     #[must_use]
-    pub fn host_at(self, index: u64) -> Ipv4Addr {
+    pub fn host_at(self, index: u128) -> IpAddr {
         let (s, e) = self.host_bounds();
-        let addr = (u64::from(s) + index).min(u64::from(e)) as u32;
-        Ipv4Addr::from(addr)
+        self.to_addr(s.saturating_add(index).min(e))
     }
 
     /// The 0-based host index of `addr`, or `None` if it is not a usable host of the
-    /// block — the inverse of [`host_at`](Cidr::host_at), used to select an address
-    /// in the lazy table.
+    /// block — the inverse of [`host_at`](Cidr::host_at).
     #[must_use]
-    pub fn host_index(self, addr: Ipv4Addr) -> Option<u64> {
+    pub fn host_index(self, addr: IpAddr) -> Option<u128> {
+        if addr.is_ipv6() != self.is_v6() {
+            return None;
+        }
         let (s, e) = self.host_bounds();
-        let a = u32::from(addr);
-        (a >= s && a <= e).then(|| u64::from(a) - u64::from(s))
+        let a = match addr {
+            IpAddr::V4(x) => u128::from(u32::from(x)),
+            IpAddr::V6(x) => u128::from(x),
+        };
+        (a >= s && a <= e).then_some(a - s)
     }
 
     /// Iterate the usable host addresses of the block.
+    ///
+    /// **Only call this on an [enumerable](Cidr::is_enumerable) block** — a large IPv6
+    /// block would yield astronomically many addresses. Callers that sweep addresses
+    /// (DNS, probe) must gate on `is_enumerable` first.
     #[must_use]
-    pub fn hosts(self) -> impl Iterator<Item = Ipv4Addr> {
+    pub fn hosts(self) -> impl Iterator<Item = IpAddr> {
         let (start, end) = self.host_bounds();
-        (start..=end).map(Ipv4Addr::from)
+        (start..=end).map(move |v| self.to_addr(v))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipv6_parse_contains_and_counts() {
+        let c = Cidr::parse("2001:db8::/48").unwrap();
+        assert!(c.is_v6());
+        assert_eq!(c.width(), 128);
+        assert_eq!(c.host_bits(), 80);
+        assert_eq!(c.network(), "2001:db8::".parse::<IpAddr>().unwrap());
+        assert!(c.contains("2001:db8:0:1234::5".parse().unwrap()));
+        assert!(!c.contains("2001:db9::1".parse().unwrap())); // outside
+        assert!(!c.contains("10.0.0.1".parse().unwrap())); // wrong family
+        assert_eq!(c.block_len(), 1u128 << 80);
+        assert!(!c.is_enumerable()); // 2^80 addresses → sparse
+    }
+
+    #[test]
+    fn ipv6_small_prefix_is_enumerable_with_all_addresses_usable() {
+        let c = Cidr::parse("2001:db8::/126").unwrap(); // 4 addresses
+        assert!(c.is_enumerable());
+        assert_eq!(c.host_count(), 4); // IPv6 keeps the network/all-ones addresses
+        assert_eq!(c.host_at(0), "2001:db8::".parse::<IpAddr>().unwrap());
+        assert_eq!(c.host_at(3), "2001:db8::3".parse::<IpAddr>().unwrap());
+        assert_eq!(c.last(), "2001:db8::3".parse::<IpAddr>().unwrap());
+        assert_eq!(c.host_index("2001:db8::2".parse().unwrap()), Some(2));
+    }
+
+    #[test]
+    fn slash_zero_ipv6_saturates_rather_than_overflowing() {
+        let c = Cidr::parse("::/0").unwrap();
+        assert_eq!(c.host_count(), u128::MAX); // 2^128 doesn't fit — saturates
+        assert!(!c.is_enumerable());
+        assert!(c.contains("2001:db8::1".parse().unwrap()));
+    }
 
     #[test]
     fn most_specific_subnet_is_the_longest_prefix_match() {
@@ -458,7 +592,7 @@ mod tests {
         assert_eq!(c20.hosts().count(), 4094); // 4096 − network − broadcast
         assert!(c20.contains("10.87.3.69".parse().unwrap()));
         assert!(!c20.contains("10.87.16.1".parse().unwrap()));
-        assert_eq!(c24.network(), "10.87.3.0".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(c24.network(), "10.87.3.0".parse::<IpAddr>().unwrap());
     }
 
     #[test]
@@ -479,7 +613,7 @@ mod tests {
         let rows = reconcile(range, &f);
         assert_eq!(rows.len(), 254);
 
-        let map: HashMap<Ipv4Addr, AddressFacts> = f.iter().cloned().map(|x| (x.addr, x)).collect();
+        let map: HashMap<IpAddr, AddressFacts> = f.iter().cloned().map(|x| (x.addr, x)).collect();
         let c = counts_from_facts(range.host_count(), &map);
         assert_eq!(c.dns_only, 1);
         assert_eq!(c.live_unregistered, 1);
@@ -494,16 +628,16 @@ mod tests {
     fn host_arithmetic_is_cheap_and_consistent() {
         let c24 = Cidr::parse("10.87.3.0/24").unwrap();
         assert_eq!(c24.host_count() as usize, c24.hosts().count());
-        assert_eq!(c24.host_at(0), "10.87.3.1".parse::<Ipv4Addr>().unwrap());
-        assert_eq!(c24.host_at(67), "10.87.3.68".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(c24.host_at(0), "10.87.3.1".parse::<IpAddr>().unwrap());
+        assert_eq!(c24.host_at(67), "10.87.3.68".parse::<IpAddr>().unwrap());
         assert_eq!(c24.host_index("10.87.3.68".parse().unwrap()), Some(67));
         assert_eq!(c24.host_index("10.87.4.1".parse().unwrap()), None); // outside
 
         // A /8 is sized and addressed by arithmetic — no iteration.
         let c8 = Cidr::parse("10.0.0.0/8").unwrap();
         assert_eq!(c8.host_count(), 16_777_214); // 2^24 − 2
-        assert_eq!(c8.host_at(0), "10.0.0.1".parse::<Ipv4Addr>().unwrap());
-        assert_eq!(c8.host_at(16_777_213), "10.255.255.254".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(c8.host_at(0), "10.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(c8.host_at(16_777_213), "10.255.255.254".parse::<IpAddr>().unwrap());
     }
 
     #[test]
@@ -514,7 +648,7 @@ mod tests {
             facts("10.87.3.90", None, None, true),
             facts("10.87.3.68", Some(Some("dop21-ipmi.nfra.nl")), Some("dop21-ipmi.nfra.nl."), true),
         ];
-        let map: HashMap<Ipv4Addr, AddressFacts> = f.iter().cloned().map(|x| (x.addr, x)).collect();
+        let map: HashMap<IpAddr, AddressFacts> = f.iter().cloned().map(|x| (x.addr, x)).collect();
         let full = reconcile(range, &f);
         // reconcile_at(i) reproduces the full pass, address by address.
         for i in 0..range.host_count() {

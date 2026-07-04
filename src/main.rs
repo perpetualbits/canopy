@@ -18,7 +18,7 @@ mod reconcile;
 mod sources;
 mod tui;
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -144,7 +144,7 @@ fn run_allocation(range: Cidr, args: &Args, cfg: &Config, facts: &[AddressFacts]
         .parse()
         .context("invalid --addr")?;
     anyhow::ensure!(
-        range.contains(addr),
+        range.contains(std::net::IpAddr::V4(addr)),
         "{addr} is not inside {}/{}",
         range.base,
         range.prefix_len
@@ -197,8 +197,45 @@ fn demo_subnets(range: &Cidr) -> Vec<reconcile::Subnet> {
 /// than demanding an exact match — otherwise a wider range would render as all-free and
 /// look broken. A range that doesn't overlap the fixture simply yields no demo facts.
 fn demo_facts(range: &Cidr) -> Vec<AddressFacts> {
+    if range.is_v6() {
+        return demo_v6_facts(range);
+    }
     let (_demo_range, facts) = fixture::demo();
     facts.into_iter().filter(|f| range.contains(f.addr)).collect()
+}
+
+/// Synthetic IPv6 demo hosts — a few clusters spread across `range` — so browsing a v6
+/// prefix offline shows the sparse table, tree and relative-density map actually working
+/// (the v4 fixture has no v6 addresses). Names mirror the v4 demo's clusters.
+fn demo_v6_facts(range: &Cidr) -> Vec<AddressFacts> {
+    let IpAddr::V6(base) = range.network() else {
+        return Vec::new();
+    };
+    let net = u128::from(base);
+    let hb = range.host_bits();
+    let mid = if hb >= 1 { 1u128 << (hb - 1) } else { 0 }; // ~halfway across the space
+    let far = if hb >= 2 { 3u128 << (hb - 2) } else { 0 }; // ~three-quarters across
+    let mut out = Vec::new();
+    let mut push = |off: u128, name: String| {
+        if off < range.block_len() {
+            out.push(AddressFacts {
+                addr: IpAddr::V6(Ipv6Addr::from(net + off)),
+                netbox: None,
+                ptr: Some(format!("{name}.nfra.nl.")),
+                live: false,
+            });
+        }
+    };
+    for i in 1..=10u128 {
+        push(i, format!("dop{i:02}-mgmt"));
+    }
+    for i in 0..5u128 {
+        push(mid + i, format!("netapp-dw{}", i + 1));
+    }
+    for i in 0..3u128 {
+        push(far + i, format!("iprotect-{}", i + 1));
+    }
+    out
 }
 
 /// Print the reconciled range as plain text: a status tally, then every address
@@ -209,7 +246,7 @@ fn list_table(range: Cidr, facts: &[reconcile::AddressFacts]) {
     // the bounded facts; the first free address is found by scanning host indices
     // (instant on a mostly-empty range).
     let total = range.host_count();
-    let map: std::collections::HashMap<std::net::Ipv4Addr, reconcile::AddressFacts> =
+    let map: std::collections::HashMap<std::net::IpAddr, reconcile::AddressFacts> =
         facts.iter().cloned().map(|f| (f.addr, f)).collect();
     let c = reconcile::counts_from_facts(total, &map);
     println!(

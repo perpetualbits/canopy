@@ -9,7 +9,7 @@
 //! browsed range the whole tree is built each frame, which is cheap.
 
 use std::collections::BTreeMap;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 
 use mullion::{Buffer, Rect};
 
@@ -34,7 +34,7 @@ pub struct TreeRowView {
     /// The group key this row acts on: its own for a group, its parent's for a host.
     pub key: Option<String>,
     /// The address, for host rows (drives inspect + colour).
-    pub addr: Option<Ipv4Addr>,
+    pub addr: Option<IpAddr>,
     /// The verdict, for host rows.
     pub status: Option<AddressStatus>,
 }

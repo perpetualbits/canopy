@@ -19,7 +19,7 @@
 //! single addresses.
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 
 use mullion::style::{Color, Style};
 use mullion::{Buffer, Rect};
@@ -127,16 +127,10 @@ fn draw_legend_key(buf: &mut Buffer, x: u16, y: u16, style: DensityStyle) {
     }
 }
 
-/// The last address of the block that starts at `base` and holds `block` addresses
-/// (`base + block − 1`), for showing a cell's address span.
-fn last_of(base: Ipv4Addr, block: u64) -> Ipv4Addr {
-    Ipv4Addr::from(u32::from(base).wrapping_add((block - 1) as u32))
-}
-
 /// A short, comma-separated list of the hostnames inside `sub` — what lives in the
 /// block under the cursor. Shows up to `max` names, then `+N` for the rest; `—` when
 /// the block is empty. Names come from the reconciled facts (PTR or NetBox name).
-fn names_in(facts: &HashMap<Ipv4Addr, AddressFacts>, sub: Cidr, max: usize) -> String {
+fn names_in(facts: &HashMap<IpAddr, AddressFacts>, sub: Cidr, max: usize) -> String {
     let mut names: Vec<String> = facts
         .values()
         .filter(|f| sub.contains(f.addr))
@@ -218,14 +212,15 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
         }
         None => (app.range, used_total, grid.range.block_len()),
     };
+    // For a sparse (huge) block, the "/block" denominator is astronomically large and
+    // unhelpful, so show just the used count; for an enumerable block show used/total.
+    let occ = if cell.is_enumerable() { format!("{used}/{block} used") } else { format!("{used} used") };
     let info = format!(
-        "▸ {}/{}   {} – {}   {}/{} used   {}",
+        "▸ {}/{}   {} – {}   {occ}   {}",
         cell.base,
         cell.prefix_len,
         cell.base,
-        last_of(cell.base, block),
-        used,
-        block,
+        cell.last(),
         names_in(&app.facts, cell, 3),
     );
     btxt(buf, area.x, info_y, &clip(&info, area.width), s_accent());

@@ -161,7 +161,7 @@ mod tests {
 
     fn ptr_row(oct: u8, name: &str) -> AddressFacts {
         AddressFacts {
-            addr: std::net::Ipv4Addr::new(10, 87, 3, oct),
+            addr: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 87, 3, oct)),
             netbox: None,
             ptr: Some(format!("{name}.")),
             live: false,

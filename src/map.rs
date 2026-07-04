@@ -5,13 +5,16 @@
 //! a clean subnet — while consecutive addresses stay spatially adjacent (the curve
 //! never jumps, unlike Z-order), so a contiguous allocation reads as one blob.
 //!
-//! A range is mapped over its **full** `2^(32−prefix)` address block (not the usable
-//! hosts, whose count isn't a power of two) so the quadrant tiling is exact. The grid
-//! is `2^order × 2^order`; each cell covers a `/(prefix + 2·order)` block, shaded by
-//! how used it is. Building is `O(facts)`. Rendering lives in `tui::map`.
+//! A range is mapped over its **full** `2^host_bits` address block (not the usable
+//! hosts, whose count isn't a power of two) so the quadrant tiling is exact. Works for
+//! IPv4 and IPv6 alike — all the offset arithmetic is `u128`. The grid is
+//! `2^order × 2^order`; each cell covers a `/(prefix + 2·order)` block. An enumerable
+//! range is shaded by absolute occupancy; a sparse IPv6 range by *relative* density (the
+//! busiest cell is hottest) since absolute occupancy of a `2^128` block is meaningless.
+//! Building is `O(facts)`. Rendering lives in `tui::map`.
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 
 use crate::reconcile::{AddressFacts, Cidr};
 
@@ -74,12 +77,14 @@ pub fn hilbert_xy2d(order: u32, x: u32, y: u32) -> u64 {
 /// a `/(prefix + 2·order)`. This is the "a zoomed square is always a subnet" guarantee
 /// made concrete, and the single source of truth for both the grid and the map cursor.
 ///
-/// A cell holds `block = block_len / 4^order` addresses, so cell `d` starts at offset
-/// `d · block` from the range's network address; its prefix grows by `2·order` bits.
+/// A cell holds `block = 2^(host_bits − 2·order)` addresses, so cell `d` starts at offset
+/// `d · block` from the range's network address; its prefix grows by `2·order` bits. The
+/// offset is a shift (not a multiply) so it never overflows even for a `/0` IPv6 block.
 #[must_use]
 pub fn block_cidr(range: Cidr, order: u32, d: u64) -> Cidr {
-    let block = range.block_len() >> (2 * order);
-    Cidr { base: range.address_at_offset(d * block), prefix_len: range.prefix_len + 2 * order as u8 }
+    let shift = range.host_bits() - 2 * order; // host bits below the cell
+    let offset = if shift >= 128 { 0 } else { u128::from(d) << shift };
+    Cidr { base: range.address_at_offset(offset), prefix_len: range.prefix_len + 2 * order as u8 }
 }
 
 /// A Hilbert-laid map of a CIDR range: a `2^order × 2^order` grid whose cells, in
@@ -91,10 +96,16 @@ pub struct MapGrid {
     pub range: Cidr,
     /// Grid order — side is `2^order`, cell count `4^order`.
     pub order: u32,
-    /// Addresses per cell — `2^(host_bits − 2·order)`, a power of two.
-    pub block: u64,
+    /// Addresses per cell — `2^(host_bits − 2·order)`, a power of two (`u128` because an
+    /// IPv6 cell can span up to `2^128` addresses).
+    pub block: u128,
     /// Used-address count per cell, indexed by **Hilbert distance** `d`.
     pub used: Vec<u32>,
+    /// `true` when the range is too large to reason about absolute occupancy (a sparse
+    /// IPv6 block): [`fraction`](MapGrid::fraction) then reports *relative* density.
+    sparse: bool,
+    /// The busiest cell's used count — the denominator for relative density.
+    max_used: u32,
 }
 
 impl MapGrid {
@@ -102,23 +113,25 @@ impl MapGrid {
     /// to `max_order` that still gives at least one address per cell.
     ///
     /// The order is capped at `host_bits / 2` so `2·order ≤ host_bits` (a cell is a
-    /// real, ≥1-address CIDR). Each known address is bucketed into cell
-    /// `offset / block` (its Hilbert distance). `O(facts)`.
+    /// real, ≥1-address CIDR). Each known address is bucketed into cell `offset ≫ shift`
+    /// (its Hilbert distance), all in `u128` so an IPv6 range works the same. `O(facts)`.
     #[must_use]
-    pub fn build(range: Cidr, facts: &HashMap<Ipv4Addr, AddressFacts>, max_order: u32) -> MapGrid {
-        let host_bits = 32 - u32::from(range.prefix_len);
+    pub fn build(range: Cidr, facts: &HashMap<IpAddr, AddressFacts>, max_order: u32) -> MapGrid {
+        let host_bits = range.host_bits();
         let order = max_order.min(host_bits / 2);
         let cells = 1u64 << (2 * order);
-        let block = (range.block_len() / cells).max(1);
+        let shift = host_bits - 2 * order; // host bits below one cell
+        let block = if shift >= 128 { u128::MAX } else { 1u128 << shift };
 
         let mut used = vec![0u32; cells as usize];
         for addr in facts.keys() {
             if let Some(off) = range.offset_of(*addr) {
-                let d = (off / block).min(cells - 1) as usize;
+                let d = if shift >= 128 { 0 } else { (off >> shift).min(u128::from(cells) - 1) as usize };
                 used[d] += 1;
             }
         }
-        MapGrid { range, order, block, used }
+        let max_used = used.iter().copied().max().unwrap_or(0);
+        MapGrid { range, order, block, used, sparse: !range.is_enumerable(), max_used }
     }
 
     /// Grid side length (`2^order`).
@@ -133,10 +146,27 @@ impl MapGrid {
         1usize << (2 * self.order)
     }
 
-    /// The used fraction of cell `d` in `[0, 1]` (used addresses over `block`).
+    /// The heat value of cell `d` in `[0, 1]`.
+    ///
+    /// For an enumerable range this is **absolute** occupancy (used addresses over the
+    /// cell's `block`) — "how full is this block". For a sparse IPv6 range, where a cell
+    /// spans up to `2^128` addresses and absolute occupancy is always ≈0, it is instead
+    /// **relative** density on a log scale (busiest cell = 1), so the map shows *where*
+    /// allocations cluster rather than a uniform near-empty field.
     #[must_use]
     pub fn fraction(&self, d: usize) -> f32 {
-        (f64::from(self.used[d]) / self.block as f64).clamp(0.0, 1.0) as f32
+        let used = self.used[d];
+        if used == 0 {
+            return 0.0;
+        }
+        if self.sparse {
+            if self.max_used <= 1 {
+                return 1.0;
+            }
+            (f64::from(used).ln_1p() / f64::from(self.max_used).ln_1p()) as f32
+        } else {
+            (f64::from(used) / self.block as f64).clamp(0.0, 1.0) as f32
+        }
     }
 
     /// The grid position `(x, y)` of cell `d` (its Hilbert placement).
@@ -153,6 +183,26 @@ mod tests {
 
     fn fact(addr: &str) -> AddressFacts {
         AddressFacts { addr: addr.parse().unwrap(), netbox: None, ptr: Some("x.".into()), live: false }
+    }
+
+    #[test]
+    fn ipv6_map_buckets_and_uses_relative_density() {
+        // A /32 is far too big for absolute occupancy; the heat must be *relative* so a
+        // busy cell stands out. Two clusters land in two different Hilbert cells.
+        let range = Cidr::parse("2001:db8::/32").unwrap();
+        let facts: HashMap<_, _> =
+            [fact("2001:db8::1"), fact("2001:db8::2"), fact("2001:db8::3"), fact("2001:db8:ffff::1")]
+                .into_iter()
+                .map(|f| (f.addr, f))
+                .collect();
+        let g = MapGrid::build(range, &facts, 4);
+        assert_eq!(g.used.iter().sum::<u32>(), 4); // all four bucketed
+        assert_eq!(g.used.iter().filter(|&&u| u > 0).count(), 2); // in two cells
+        let heats: Vec<f32> = (0..g.cells()).map(|d| g.fraction(d)).collect();
+        let max = heats.iter().copied().fold(0.0_f32, f32::max);
+        assert!((max - 1.0).abs() < 1e-6, "busiest cell should be full heat");
+        // The lone-host cell is warm but not maxed (relative log scale).
+        assert!(heats.iter().any(|&h| h > 0.0 && h < 0.99));
     }
 
     #[test]
@@ -200,9 +250,9 @@ mod tests {
         assert_eq!(g.block, 65_536); // 2^16
         let c0 = block_cidr(g.range, g.order, 0);
         assert_eq!(c0.prefix_len, 16);
-        assert_eq!(c0.base, "10.0.0.0".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(c0.base, "10.0.0.0".parse::<IpAddr>().unwrap());
         // Cell 1 (next Hilbert step) is the adjacent /16.
-        assert_eq!(block_cidr(g.range, g.order, 1).base, "10.1.0.0".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(block_cidr(g.range, g.order, 1).base, "10.1.0.0".parse::<IpAddr>().unwrap());
     }
 
     #[test]
