@@ -126,9 +126,11 @@ pub fn render_dns_servers(servers: &[DnsServer]) -> String {
     s
 }
 
-/// The short label for a server: the first label of its hostname (`dns1.astron.nl` → `dns1`).
-fn short_name(host: &str) -> String {
-    host.split('.').next().unwrap_or(host).to_string()
+/// A label for a server built from the first `labels` of its hostname, joined by `-`
+/// (`lcs020.control.lofar`, 2 → `lcs020-control`). Used to name servers uniquely when the
+/// bare first label collides (two `lcs020.*` hosts).
+fn label_name(host: &str, labels: usize) -> String {
+    host.split('.').take(labels.max(1)).collect::<Vec<_>>().join("-")
 }
 
 /// Whether `host` belongs to the site — its name sits under one of the `owned` domains
@@ -143,13 +145,20 @@ fn is_ours(host: &str, owned: &[String]) -> bool {
     owned.iter().any(|d| h == *d || h.ends_with(&format!(".{d}")))
 }
 
-/// Assemble the per-master forward and reverse zone maps into sorted [`DnsServer`] entries.
+/// Assemble the per-master forward and reverse zone maps into sorted [`DnsServer`] entries,
+/// naming each server uniquely: its bare first label, or more labels when that would
+/// collide (`lcs020.control.lofar` / `lcs020.offline.lofar` → `lcs020-control` / `lcs020-offline`).
 fn assemble(fwd: &BTreeMap<String, BTreeSet<String>>, rev: &BTreeMap<String, BTreeSet<String>>) -> Vec<DnsServer> {
-    let hosts: BTreeSet<&String> = fwd.keys().chain(rev.keys()).collect();
+    let hosts: Vec<&String> = fwd.keys().chain(rev.keys()).collect::<BTreeSet<_>>().into_iter().collect();
+    // How many hosts share each bare first label — >1 means we must disambiguate.
+    let mut first_label_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for h in &hosts {
+        *first_label_counts.entry(label_name(h, 1)).or_default() += 1;
+    }
     hosts
         .into_iter()
         .map(|host| DnsServer {
-            name: short_name(host),
+            name: if first_label_counts[&label_name(host, 1)] > 1 { label_name(host, 2) } else { label_name(host, 1) },
             host: host.clone(),
             vantage: String::new(),
             jump: String::new(),

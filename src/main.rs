@@ -17,6 +17,7 @@ mod live;
 mod map;
 mod plan;
 mod reconcile;
+mod site_write;
 mod sources;
 mod tui;
 
@@ -58,6 +59,11 @@ struct Args {
     /// vantage, and print it as a [[dns_servers]] block for conf.d/<site>.toml. Read-only.
     #[arg(long)]
     discover_dns: bool,
+
+    /// Discover the DNS estate and merge it into conf.d/<site>.toml (preserving comments and
+    /// each server's vantage/jump). Shows a diff; only writes with --write.
+    #[arg(long)]
+    save_estate: bool,
 
     /// SSH host to run NetBox + DNS queries from. Overrides the config's `vantage`.
     #[arg(long)]
@@ -126,6 +132,11 @@ fn main() -> anyhow::Result<()> {
         return run_discover_dns(&cfg);
     }
 
+    // Discover the DNS estate and merge it into the site file (diff; --write to save).
+    if args.save_estate {
+        return run_save_estate(&args, &cfg);
+    }
+
     // The range to survey: `--range` wins, else the config's `range`. `None` means
     // "not pinned" — live runs then discover the address space from the sources.
     let pinned_range = args.range.clone().or_else(|| cfg.range.clone());
@@ -177,6 +188,38 @@ fn run_discover_dns(cfg: &Config) -> anyhow::Result<()> {
         return Ok(());
     }
     print!("{}", dns_discovery::render_dns_servers(&servers));
+    Ok(())
+}
+
+/// Discover the DNS estate and merge it into `conf.d/<site>.toml`, preserving the file's
+/// comments and each server's hand-set `vantage`/`jump`. Prints the diff; writes only with
+/// `--write` (and not `--dry-run`), matching canopy's read-only-by-default posture.
+///
+/// # Errors
+/// Propagates the token/discovery failures, a merge (TOML) error, or a write failure.
+fn run_save_estate(args: &Args, cfg: &Config) -> anyhow::Result<()> {
+    let path = config::site_path(&args.site);
+    let current = std::fs::read_to_string(&path).unwrap_or_default(); // empty ⇒ a fresh file
+
+    let token = live::get_token(&cfg.token_pass)?;
+    let blocks: Vec<Cidr> = discover::discover(cfg, &token)?.into_iter().map(|b| b.cidr).collect();
+    eprintln!("Probing SOA for {} block(s) and their forward domains …", blocks.len());
+    let servers = dns_discovery::discover_dns_servers(cfg, &token, &blocks)?;
+    anyhow::ensure!(!servers.is_empty(), "discovered no DNS servers; nothing to save");
+
+    let merged = site_write::merge_estate(&current, &servers)?;
+    println!("--- {} (proposed) ---", path.display());
+    print!("{}", site_write::diff(&current, &merged));
+
+    if args.write && !args.dry_run {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, &merged)?;
+        eprintln!("wrote {}", path.display());
+    } else {
+        eprintln!("(dry-run — pass --write to save to {})", path.display());
+    }
     Ok(())
 }
 
