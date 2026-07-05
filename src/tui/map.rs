@@ -26,57 +26,12 @@ use std::net::IpAddr;
 use mullion::style::{Color, Style};
 use mullion::{Buffer, Rect};
 
-use super::app::{App, DensityStyle};
+use super::app::App;
 use super::draw::{btxt, keyhints};
+use super::palette::{Knobs, Scheme, KNOBS};
 use super::theme::{s_accent, s_dim, s_sel, s_title};
 use crate::map::MapGrid;
 use crate::reconcile::{self, AddressFacts, Cidr, Subnet};
-
-/// Background of an empty (unused) cell — a near-black, so occupancy reads straight off the
-/// cell background: dark = empty, deep-red → white = fuller.
-const EMPTY_BG: Color = Color::Rgb(22, 22, 26);
-
-/// A heat ramp, low → high occupancy: deep-red → red → orange-red → orange → orange-yellow
-/// → yellow → yellow-white → white. No blue — a fuller block is simply *hotter*, and a
-/// genuinely full block is white. Interpolated to a smooth gradient (not eight bands).
-const HEAT: [(u8, u8, u8); 8] = [
-    (100, 0, 0),     // deep red
-    (200, 0, 0),     // red
-    (255, 60, 0),    // orange-red
-    (255, 130, 0),   // orange
-    (255, 180, 0),   // orange-yellow
-    (255, 230, 0),   // yellow
-    (255, 250, 180), // yellow-white
-    (255, 255, 255), // white — full
-];
-
-/// How many decades of occupancy the log scale spans: a block filled below `10^-DECADES`
-/// reads as the deep-red floor, a full block (fraction 1) as white.
-const HEAT_DECADES: f32 = 3.0;
-
-/// A colour at position `t ∈ [0, 1]` along the [`HEAT`] ramp (linear over the stops).
-/// Used directly for the self-documenting legend swatch.
-fn ramp_color(t: f32) -> Color {
-    let n = HEAT.len();
-    let p = t.clamp(0.0, 1.0) * (n - 1) as f32;
-    let i = (p.floor() as usize).min(n - 2);
-    let frac = p - i as f32;
-    let (r0, g0, b0) = HEAT[i];
-    let (r1, g1, b1) = HEAT[i + 1];
-    let lerp = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * frac).round() as u8;
-    Color::Rgb(lerp(r0, r1), lerp(g0, g1), lerp(b0, b1))
-}
-
-/// The heat colour for a used fraction `f ∈ (0, 1]` on a **logarithmic** scale: full → white,
-/// and each factor-of-ten emptier steps a decade down the ramp toward deep red.
-///
-/// Why logarithmic — almost every block is barely used, so a linear scale would paint the
-/// whole map deep red and waste the palette. `t = 1 + log₁₀(f)/DECADES` spreads the sparse
-/// low end across the reds/oranges and reserves white for a genuinely full block.
-fn heat_color(f: f32) -> Color {
-    let t = if f <= 0.0 { 0.0 } else { (1.0 + f.log10() / HEAT_DECADES).clamp(0.0, 1.0) };
-    ramp_color(t)
-}
 
 /// A grid direction from one cell to an adjacent one.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -129,44 +84,13 @@ fn curve_glyph(a: Option<Dir>, b: Option<Dir>) -> (char, bool) {
     (ch, r)
 }
 
-/// A foreground colour that stays legible on background `bg`: a dark line on a bright
-/// (near-full) cell, a light line on a dark (near-empty) one. Rec. 601 luma decides.
-fn contrast_fg(bg: Color) -> Color {
-    let Color::Rgb(r, g, b) = bg else { return Color::Rgb(230, 230, 230) };
-    let luma = 0.30 * f32::from(r) + 0.59 * f32::from(g) + 0.11 * f32::from(b);
-    if luma > 150.0 {
-        Color::Rgb(20, 20, 20)
-    } else {
-        Color::Rgb(225, 225, 225)
-    }
-}
-
-/// The monochrome (shade-style) background for a used fraction — a grey that lightens
-/// logarithmically with occupancy, for terminals where the heat colours would be lost.
-fn shade_bg(f: f32) -> Color {
-    let t = if f <= 0.0 { 0.0 } else { (1.0 + f.log10() / HEAT_DECADES).clamp(0.0, 1.0) };
-    let g = (45.0 + t * 195.0).round() as u8; // 45 → 240 grey
-    Color::Rgb(g, g, g)
-}
-
-/// Paint one map cell at `(x, y)`: the Hilbert-curve `glyph` in column `x` on a background
-/// coloured by occupancy, then a spacer in `x + 1` — a `─` when the curve continues right
-/// (`connects_right`) so the line is unbroken, otherwise blank.
-///
-/// The occupancy is the **background**: near-black when empty, up the deep-red→white heat
-/// ramp as the block fills (or a grey ramp in shade mode); the curve line sits on top in a
-/// contrasting colour. `selected` paints both columns in the cursor style so it always wins.
-fn paint_cell(buf: &mut Buffer, x: u16, y: u16, frac: f32, style: DensityStyle, selected: bool, curve: (char, bool)) {
+/// Paint one map cell at `(x, y)`: the Hilbert-curve `glyph` in column `x` on background
+/// `bg`, foreground `fg`, then a spacer in `x + 1` — a `─` when the curve continues right so
+/// the line is unbroken, otherwise blank. The colours come from the active
+/// [`Scheme`](super::palette::Scheme); `selected` paints both columns in the cursor style.
+fn paint_cell(buf: &mut Buffer, x: u16, y: u16, bg: Color, fg: Color, selected: bool, curve: (char, bool)) {
     let (glyph, connects_right) = curve;
-    let bg = if frac <= 0.0 {
-        EMPTY_BG
-    } else {
-        match style {
-            DensityStyle::Heatmap => heat_color(frac),
-            DensityStyle::Shade => shade_bg(frac),
-        }
-    };
-    let cell = if selected { s_sel() } else { Style::default().fg(contrast_fg(bg)).bg(bg) };
+    let cell = if selected { s_sel() } else { Style::default().fg(fg).bg(bg) };
     buf.set_char(x, y, glyph, cell);
     buf.set_char(x + 1, y, if connects_right { '─' } else { ' ' }, cell);
 }
@@ -182,29 +106,22 @@ fn fit_order(body: Rect) -> u32 {
     }
 }
 
-/// Draw the density key at `(x, y)`: `□ empty`, then for the heatmap an
-/// `emptier → fuller` gradient swatch of the actual [`HEAT`] colours (so the ramp is
-/// self-documenting), or for shade the `░▒▓█` blocks.
-fn draw_legend_key(buf: &mut Buffer, x: u16, y: u16, style: DensityStyle) {
-    let mut cx = buf.set_string(x, y, "curve on bg · empty ", s_dim());
-    buf.set_char(cx, y, ' ', Style::default().bg(EMPTY_BG)); // the empty swatch
-    cx += 2;
-    match style {
-        DensityStyle::Heatmap => {
-            for k in 0..12u16 {
-                // Background swatches spread evenly along the ramp (deep-red → white).
-                buf.set_char(cx + k, y, ' ', Style::default().bg(ramp_color(f32::from(k) / 11.0)));
-            }
-            buf.set_string(cx + 12, y, " full (log)", s_dim());
-        }
-        DensityStyle::Shade => {
-            for k in 0..12u16 {
-                let g = (45.0 + f32::from(k) / 11.0 * 195.0) as u8;
-                buf.set_char(cx + k, y, ' ', Style::default().bg(Color::Rgb(g, g, g)));
-            }
-            buf.set_string(cx + 12, y, " full", s_dim());
-        }
+/// Draw the palette key at `(x, y)`: the scheme name, an `empty → full` swatch strip
+/// generated from the scheme itself (so it is self-documenting under any knob setting), and
+/// the currently-selected knob and its value.
+fn draw_legend_key(buf: &mut Buffer, x: u16, y: u16, scheme: Scheme, knobs: &Knobs, active_knob: usize) {
+    let cx = buf.set_string(x, y, &format!("scheme: {} [p] · ", scheme.name()), s_dim());
+    // Background swatches sampled from the scheme across the occupancy range (empty → full).
+    let mut sx = cx;
+    for k in 0..12u16 {
+        let frac = if k == 0 { 0.0 } else { 10f32.powf((f32::from(k) / 11.0 - 1.0) * knobs.decades) };
+        let (bg, _) = scheme.paint(frac, 0.5, knobs);
+        buf.set_char(sx + k, y, ' ', Style::default().bg(bg));
     }
+    sx += 12;
+    // The active knob + value (selected with [ ], adjusted with , .).
+    let (name, ..) = KNOBS[active_knob];
+    buf.set_string(sx, y, &format!("  knob [{}] {} = {:.2}  [,.]", active_knob, name, knobs.get(active_knob)), s_dim());
 }
 
 /// A short, comma-separated list of the hostnames inside `sub` — what lives in the
@@ -271,7 +188,7 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
         grid.range.block_len()
     );
     btxt(buf, area.x, legend_y, &head, s_dim());
-    draw_legend_key(buf, area.x + head.chars().count() as u16, legend_y, app.density);
+    draw_legend_key(buf, area.x + head.chars().count() as u16, legend_y, app.scheme, &app.knobs, app.active_knob);
 
     // Rows 1–2 — the block under the cursor (CIDR, span, occupancy, hostnames) and the
     // scope breadcrumb + real NetBox subnet. When the grid is one cell, that block is the
@@ -326,18 +243,21 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
         let x = body.x + (gx as u16) * 2;
         let y = body.y + gy as u16;
         if x + 1 < body.x + body.width && y < body.y + body.height {
-            // The ports toward the previous and next cell on the curve give the glyph.
+            // The ports toward the previous and next cell give the glyph; the active scheme
+            // gives the (background, curve) colours from occupancy and curve position.
             let prev = (d > 0).then(|| grid.cell_xy(d - 1)).and_then(|p| dir_between(cur, p));
             let next = (d + 1 < total).then(|| grid.cell_xy(d + 1)).and_then(|n| dir_between(cur, n));
-            paint_cell(buf, x, y, grid.fraction(d), app.density, selected, curve_glyph(prev, next));
+            let pos = if total > 1 { d as f32 / (total - 1) as f32 } else { 0.0 };
+            let (bg, fg) = app.scheme.paint(grid.fraction(d), pos, &app.knobs);
+            paint_cell(buf, x, y, bg, fg, selected, curve_glyph(prev, next));
         }
     }
 
     // Footer key hints (zoom only offered while there's a finer subnet to reach).
     let hints: &[(&str, &str)] = if zoomable {
-        &[("hjkl", "move"), ("↵", "zoom in"), ("Bksp", "out"), ("s", "style"), ("Tab", "table"), ("q", "quit")]
+        &[("hjkl", "move"), ("↵", "in"), ("Bksp", "out"), ("p", "palette"), ("[ ]", "knob"), (", .", "tune"), ("Tab", "table"), ("q", "quit")]
     } else {
-        &[("s", "style"), ("Tab", "table"), ("q", "quit")]
+        &[("p", "palette"), ("[ ]", "knob"), (", .", "tune"), ("Tab", "table"), ("q", "quit")]
     };
     keyhints(buf, area.x, foot_y, area.width, hints);
 }
@@ -345,29 +265,6 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn heat_ramp_runs_deep_red_to_white_logarithmically() {
-        // A barely-used block is deep red (r dominant, no blue); a full block is white.
-        let Color::Rgb(r_lo, _, b_lo) = heat_color(0.0005) else { panic!("expected rgb") };
-        assert!(r_lo > b_lo, "low occupancy should be red-dominant, got r={r_lo} b={b_lo}");
-        assert_eq!(heat_color(1.0), Color::Rgb(255, 255, 255), "full block is white");
-        // Endpoints match the ramp exactly (deep red ↔ white), and there is no blue skew.
-        assert_eq!(heat_color(0.0), Color::Rgb(HEAT[0].0, HEAT[0].1, HEAT[0].2));
-        // Logarithmic: a 10× fuller block sits strictly higher up the ramp (greener/whiter).
-        let Color::Rgb(_, g1, _) = heat_color(0.01) else { panic!() };
-        let Color::Rgb(_, g2, _) = heat_color(0.1) else { panic!() };
-        assert!(g2 > g1, "10x fuller should be higher on the ramp: g(0.1)={g2} > g(0.01)={g1}");
-    }
-
-    #[test]
-    fn heat_color_is_stable_and_bounded_across_the_range() {
-        // Every fraction resolves to some RGB (no panic, no out-of-band index).
-        for k in 0..=100 {
-            let f = k as f32 / 100.0;
-            assert!(matches!(heat_color(f), Color::Rgb(_, _, _)));
-        }
-    }
 
     #[test]
     fn curve_glyph_joins_the_ports() {

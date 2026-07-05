@@ -86,27 +86,7 @@ impl View {
     }
 }
 
-/// How the IP map colours a cell by how full its block is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DensityStyle {
-    /// A filled square on a smooth blackbody/Planck heat ramp — deep red = barely used
-    /// → hot blue = full — so occupancy reads like a thermal image.
-    Heatmap,
-    /// A monochrome accent shade block `░▒▓█` deepening with density — the fallback for
-    /// low-colour terminals where the heat ramp's hues would be lost.
-    Shade,
-}
-
-impl DensityStyle {
-    /// Flip between the two styles (the `s` key on the map).
-    #[must_use]
-    fn toggle(self) -> DensityStyle {
-        match self {
-            DensityStyle::Heatmap => DensityStyle::Shade,
-            DensityStyle::Shade => DensityStyle::Heatmap,
-        }
-    }
-}
+pub use super::palette::{Knobs, Scheme};
 
 /// The program's connection state, shown by the orbiting heartbeat on the frame:
 /// it keeps travelling as long as the UI is responsive (a liveness signal), and its
@@ -165,7 +145,11 @@ pub struct App {
     /// Parent scopes to return to on zoom-out (each a range + its facts).
     zoom_stack: Vec<ZoomFrame>,
     /// How the map colours cells by occupancy.
-    pub density: DensityStyle,
+    /// The map's colour scheme, its tunable knobs, and which knob the `[`/`]` selector
+    /// currently points at (adjusted with `,`/`.`).
+    pub scheme: Scheme,
+    pub knobs: Knobs,
+    pub active_knob: usize,
     /// NetBox-defined subnets (variable-length) covering the range — used to label the
     /// real subnet the map cursor sits in. Empty until live data (or demo) supplies them.
     pub subnets: Vec<Subnet>,
@@ -232,7 +216,9 @@ impl App {
             map_cur: (0, 0),
             map_order: 0,
             zoom_stack: Vec::new(),
-            density: DensityStyle::Heatmap,
+            scheme: Scheme::default(),
+            knobs: Knobs::default(),
+            active_knob: 0,
             subnets: Vec::new(),
             // Live CLI start means the endpoints already answered; otherwise we are on
             // demo data, not yet connected.
@@ -636,7 +622,13 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.map_cur.1 = (self.map_cur.1 + 1).min(last),
             KeyCode::Enter | KeyCode::Char('+') => self.zoom_into_cursor(),
             KeyCode::Backspace | KeyCode::Char('-') => self.zoom_out(),
-            KeyCode::Char('s') => self.density = self.density.toggle(),
+            KeyCode::Char('s') | KeyCode::Char('p') => self.scheme = self.scheme.cycle(),
+            KeyCode::Char('[') => {
+                self.active_knob = (self.active_knob + super::palette::KNOBS.len() - 1) % super::palette::KNOBS.len();
+            }
+            KeyCode::Char(']') => self.active_knob = (self.active_knob + 1) % super::palette::KNOBS.len(),
+            KeyCode::Char(',') => self.knobs.adjust(self.active_knob, -1.0),
+            KeyCode::Char('.') => self.knobs.adjust(self.active_knob, 1.0),
             _ => {}
         }
     }
@@ -1252,15 +1244,19 @@ mod tests {
     }
 
     #[test]
-    fn map_density_style_defaults_to_bitstream_and_s_toggles_it() {
+    fn map_scheme_cycles_and_knobs_adjust() {
         let range = Cidr::parse("10.87.3.0/24").unwrap();
         let mut app = App::new(range, Vec::new(), false, false, false, Config::default());
         app.view = View::Map;
-        assert_eq!(app.density, DensityStyle::Heatmap); // the requested look, by default
-        app.on_key(KeyCode::Char('s'));
-        assert_eq!(app.density, DensityStyle::Shade);
-        app.on_key(KeyCode::Char('s'));
-        assert_eq!(app.density, DensityStyle::Heatmap);
+        assert_eq!(app.scheme, Scheme::default()); // the default look
+        app.on_key(KeyCode::Char('p')); // cycle the scheme
+        assert_ne!(app.scheme, Scheme::default());
+        // The knob selector + adjust: pick 'ceiling' (index 1) and nudge it down.
+        app.on_key(KeyCode::Char(']')); // active_knob 0 → 1 (ceiling)
+        assert_eq!(app.active_knob, 1);
+        let before = app.knobs.get(1);
+        app.on_key(KeyCode::Char(',')); // decrease
+        assert!(app.knobs.get(1) < before);
     }
 
     #[test]

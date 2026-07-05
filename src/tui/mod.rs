@@ -9,6 +9,7 @@ pub mod draw;
 pub mod focus;
 pub mod graph;
 pub mod map;
+pub mod palette;
 pub mod theme;
 pub mod tree;
 
