@@ -14,8 +14,10 @@ use serde::Deserialize;
 #[derive(Deserialize, Debug, Clone)]
 #[serde(default)]
 pub struct Config {
-    /// Default CIDR range to browse.
-    pub range: String,
+    /// CIDR range to browse. Optional: when unset (and running `--live`) canopy
+    /// **discovers** the address space from the sources instead — see `discover`. A
+    /// `--range` flag or this key pins a single block for a focused view.
+    pub range: Option<String>,
     /// SSH host to run NetBox + DNS queries from (must reach both).
     pub vantage: String,
     /// SSH host on the target L2 for the ARP probe.
@@ -75,7 +77,7 @@ pub struct DnsServer {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            range: "10.87.3.0/24".into(),
+            range: None, // unset → discover the space live; offline falls back to a demo range
             vantage: "dns1.astron.nl".into(),
             probe_host: "takkie.astron.nl".into(),
             netbox_url: "https://netbox.astron.nl".into(),
@@ -136,13 +138,14 @@ mod tests {
         let c: Config = toml::from_str("").unwrap();
         assert_eq!(c.vantage, "dns1.astron.nl");
         assert_eq!(c.token_pass, "astron/netbox.astron.nl/dns_api_token");
+        assert!(c.range.is_none()); // no range → discover live (offline uses a demo range)
     }
 
     #[test]
     fn partial_file_overrides_only_named_keys() {
         let c: Config = toml::from_str("vantage = \"dns2.astron.nl\"\nrange = \"10.87.0.0/20\"\n").unwrap();
         assert_eq!(c.vantage, "dns2.astron.nl"); // overridden
-        assert_eq!(c.range, "10.87.0.0/20"); // overridden
+        assert_eq!(c.range.as_deref(), Some("10.87.0.0/20")); // overridden
         assert_eq!(c.probe_host, "takkie.astron.nl"); // still the default
     }
 

@@ -8,6 +8,7 @@
 //! same [`reconcile::AddressFacts`] shape.
 
 mod config;
+mod discover;
 mod dns;
 mod fixture;
 mod graph;
@@ -37,7 +38,8 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
 
-    /// CIDR range to browse. Overrides the config's `range`.
+    /// CIDR range to browse. Overrides the config's `range`. When neither is set and
+    /// `--live` is given, canopy discovers the address space from the sources instead.
     #[arg(long)]
     range: Option<String>,
 
@@ -94,9 +96,6 @@ fn main() -> anyhow::Result<()> {
 
     // Load the config (optional), then let any CLI flag override it.
     let mut cfg = Config::load(args.config.as_deref())?;
-    if let Some(v) = &args.range {
-        cfg.range = v.clone();
-    }
     if let Some(v) = &args.vantage {
         cfg.vantage = v.clone();
     }
@@ -110,7 +109,21 @@ fn main() -> anyhow::Result<()> {
         cfg.token_pass = v.clone();
     }
 
-    let range = Cidr::parse(&cfg.range).map_err(|e| anyhow::anyhow!(e))?;
+    // The range to survey: `--range` wins, else the config's `range`. `None` means
+    // "not pinned" — live runs then discover the address space from the sources.
+    let pinned_range = args.range.clone().or_else(|| cfg.range.clone());
+
+    if args.live && pinned_range.is_none() {
+        anyhow::ensure!(
+            args.allocate.is_none(),
+            "--allocate needs an explicit --range (discovery surveys many blocks, not one address)"
+        );
+        return run_discovery(&args, &cfg);
+    }
+
+    // Offline (or a pinned range): browse a single block. With nothing pinned and no live
+    // sources to discover from, fall back to the demo range so canopy still runs offline.
+    let range = Cidr::parse(pinned_range.as_deref().unwrap_or(DEMO_RANGE)).map_err(|e| anyhow::anyhow!(e))?;
 
     let (facts, subnets) = if args.live {
         let data = live::gather_live(&range, &cfg)?;
@@ -128,7 +141,49 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    tui::run(range, facts, subnets, args.write, args.dry_run, args.live, cfg)
+    tui::run(range, facts, subnets, args.write, args.dry_run, args.live, cfg, None)
+}
+
+/// The block browsed offline when no range is pinned — the fixture's `/24`, so canopy
+/// still runs and shows the demo data without a config or live sources.
+const DEMO_RANGE: &str = "10.87.3.0/24";
+
+/// Discover the address space live and survey it: NetBox aggregates + the estate's
+/// reverse zones (see [`discover`]). With `--list`, print a summary then reconcile every
+/// discovered block; otherwise open the TUI on the first block, naming the rest in the
+/// status line (multi-block navigation is a later view).
+///
+/// # Errors
+/// Propagates the token fetch, discovery, or per-block gather failures; bails if nothing
+/// was discovered (the operator should then pass an explicit `--range`).
+fn run_discovery(args: &Args, cfg: &Config) -> anyhow::Result<()> {
+    let token = live::get_token(&cfg.token_pass)?;
+    let blocks = discover::discover(cfg, &token)?;
+    anyhow::ensure!(
+        !blocks.is_empty(),
+        "discovery found no address space (no NetBox aggregates and no reverse zones); pass --range to survey a specific block"
+    );
+
+    if args.list {
+        print!("{}", discover::summary(&blocks));
+        for b in &blocks {
+            let data = live::gather_live_with_token(&b.cidr, cfg, token.clone(), |_, _| {})?;
+            println!();
+            list_table(b.cidr, &data.facts);
+        }
+        return Ok(());
+    }
+
+    // The TUI is single-block for now: browse the first discovered block and name the set.
+    let primary = discover::primary(&blocks).context("no primary block to browse")?;
+    let note = format!(
+        "discovered {} block(s); browsing {}/{} — see --list for all",
+        blocks.len(),
+        primary.cidr.base,
+        primary.cidr.prefix_len
+    );
+    let data = live::gather_live_with_token(&primary.cidr, cfg, token, |_, _| {})?;
+    tui::run(primary.cidr, data.facts, data.subnets, args.write, args.dry_run, true, cfg.clone(), Some(note))
 }
 
 /// Build and preview (or, with `--write`, apply) a plan to allocate one address.

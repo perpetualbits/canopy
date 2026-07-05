@@ -843,6 +843,7 @@ fn build_graph(facts: &HashMap<IpAddr, AddressFacts>) -> (DnsGraph, GraphCanvas)
 ///
 /// # Errors
 /// Propagates terminal setup / draw errors.
+#[allow(clippy::too_many_arguments)] // a top-level wiring entry: each arg is a distinct startup input
 pub fn run(
     range: Cidr,
     facts: Vec<AddressFacts>,
@@ -851,9 +852,14 @@ pub fn run(
     dry_run: bool,
     live: bool,
     cfg: Config,
+    initial_status: Option<String>,
 ) -> anyhow::Result<()> {
     let mut app = App::new(range, facts, write_mode, dry_run, live, cfg);
     app.set_subnets(subnets);
+    // A note carried in from startup (e.g. "discovered N blocks; browsing this one").
+    if let Some(msg) = initial_status {
+        app.status = Some((msg, false));
+    }
     let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     term.enter()?;
     let result = main_loop(&mut term, &mut app);

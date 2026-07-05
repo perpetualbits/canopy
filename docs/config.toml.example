@@ -5,8 +5,11 @@
 # No secrets live here: the NetBox token is fetched from `pass` (the entry named by
 # `token_pass`) or the $CANOPY_NETBOX_TOKEN environment variable.
 
-# Default CIDR range to browse.
-range      = "10.87.3.0/24"
+# CIDR range to browse. Optional: leave it unset and run with --live to have canopy
+# DISCOVER the address space from the sources (NetBox aggregates + the reverse zones the
+# dns_servers below master) instead of naming a block. A --range flag or this key pins a
+# single block for a focused view. Offline with nothing pinned, canopy shows the demo /24.
+# range    = "10.87.3.0/24"
 
 # SSH host to run NetBox + DNS queries from (must reach NetBox and internal DNS).
 vantage    = "dns1.astron.nl"

@@ -1,0 +1,199 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026  Epsilon Null Operation
+//! Auto-discovery of the **address space to survey** when no `--range` is given.
+//!
+//! Instead of making the user name a block, canopy asks its sources what territory
+//! exists: NetBox for its **aggregates** (the big v4/v6 allocations it manages) and the
+//! DNS estate for the **reverse zones** its servers master. The union of those — deduped
+//! and tagged with where each came from — is the set of blocks worth reconciling.
+//!
+//! Everything here yields **blocks, never address lists**: a huge IPv6 aggregate is one
+//! entry, so discovery stays cheap and honours the lazy model
+//! ([`Cidr::is_enumerable`](crate::reconcile::Cidr::is_enumerable)). Only [`discover`]
+//! touches the network; the inference in [`infer_blocks`] is pure and unit-tested.
+
+use std::collections::BTreeMap;
+use std::net::IpAddr;
+
+use crate::config::Config;
+use crate::reconcile::Cidr;
+use crate::sources::estate::DnsEstate;
+use crate::sources::netbox::NetboxSource;
+use crate::sources::Vantage;
+
+/// Which source(s) reported a block — so the summary can show why we survey it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockSource {
+    /// A NetBox aggregate.
+    Netbox,
+    /// A reverse zone a DNS server masters.
+    DnsReverse,
+    /// Both a NetBox aggregate and a mastered reverse zone.
+    Both,
+}
+
+impl BlockSource {
+    /// A short tag for the `--list` summary.
+    fn label(self) -> &'static str {
+        match self {
+            BlockSource::Netbox => "netbox",
+            BlockSource::DnsReverse => "dns",
+            BlockSource::Both => "netbox+dns",
+        }
+    }
+
+    /// Fold in another sighting: a block seen from *both* sources becomes [`Both`].
+    fn merge(self, other: BlockSource) -> BlockSource {
+        if self == other {
+            self
+        } else {
+            BlockSource::Both
+        }
+    }
+}
+
+/// One block of address space to survey, and where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredBlock {
+    /// The block, normalized to its network address (e.g. `10.87.0.0/20`).
+    pub cidr: Cidr,
+    /// Which source(s) reported it.
+    pub source: BlockSource,
+}
+
+/// The sort/dedupe key for a block: family (IPv4 first), network address, prefix length.
+///
+/// Keying on the **network** address folds any base (e.g. `10.87.3.5/24`) to its block
+/// (`10.87.3.0/24`), so the same block written two ways counts once; keying on the family
+/// bit first keeps all IPv4 blocks ahead of IPv6 in the survey order.
+fn net_key(c: &Cidr) -> (bool, u128, u8) {
+    let n = match c.network() {
+        IpAddr::V4(a) => u128::from(u32::from(a)),
+        IpAddr::V6(a) => u128::from(a),
+    };
+    (c.is_v6(), n, c.prefix_len)
+}
+
+/// Infer the set of CIDR blocks worth surveying from NetBox aggregates and the DNS
+/// estate's reverse zones. **Pure** — no I/O.
+///
+/// How: union both lists into a map keyed by [`net_key`], so a block reported by both
+/// sources becomes one entry tagged [`BlockSource::Both`] and exact repeats collapse; the
+/// `BTreeMap` then yields them in survey order (IPv4 before IPv6, then by network, then
+/// prefix). Each kept block is normalized to its network address. No enumeration happens,
+/// so a huge v6 aggregate is a single block, never a list of addresses.
+///
+/// Units: `netbox` and `reverse` are CIDR blocks; the result is CIDR blocks.
+#[must_use]
+pub fn infer_blocks(netbox: &[Cidr], reverse: &[Cidr]) -> Vec<DiscoveredBlock> {
+    let mut map: BTreeMap<(bool, u128, u8), (Cidr, BlockSource)> = BTreeMap::new();
+    let add = |cidr: &Cidr, src: BlockSource, map: &mut BTreeMap<(bool, u128, u8), (Cidr, BlockSource)>| {
+        // Store the network-normalized block so the base is always canonical.
+        let normalized = Cidr { base: cidr.network(), prefix_len: cidr.prefix_len };
+        map.entry(net_key(cidr)).and_modify(|(_, s)| *s = s.merge(src)).or_insert((normalized, src));
+    };
+    for c in netbox {
+        add(c, BlockSource::Netbox, &mut map);
+    }
+    for c in reverse {
+        add(c, BlockSource::DnsReverse, &mut map);
+    }
+    map.into_values().map(|(cidr, source)| DiscoveredBlock { cidr, source }).collect()
+}
+
+/// The block to browse in the TUI while discovering: the first in survey order. The full
+/// set is shown by `--list` and named in the TUI status line; multi-block navigation is a
+/// later (Phase-3) view. `None` only when nothing was discovered.
+#[must_use]
+pub fn primary(blocks: &[DiscoveredBlock]) -> Option<&DiscoveredBlock> {
+    blocks.first()
+}
+
+/// A short human summary of the discovered blocks, for `--list` to print before the rows:
+/// a count by family, then one line per block with its family and source.
+#[must_use]
+pub fn summary(blocks: &[DiscoveredBlock]) -> String {
+    let v4 = blocks.iter().filter(|b| !b.cidr.is_v6()).count();
+    let v6 = blocks.len() - v4;
+    let mut s = format!("discovered {} block(s) — {v4} IPv4, {v6} IPv6:\n", blocks.len());
+    for b in blocks {
+        s.push_str(&format!(
+            "  {}/{}  {}  [{}]\n",
+            b.cidr.base,
+            b.cidr.prefix_len,
+            if b.cidr.is_v6() { "IPv6" } else { "IPv4" },
+            b.source.label()
+        ));
+    }
+    s
+}
+
+/// Discover the address space **live**: NetBox aggregates unioned with the estate's
+/// reverse zones, via [`infer_blocks`].
+///
+/// The NetBox call runs on the vantage host (NetBox is internal-only); the reverse zones
+/// come straight from the configured estate, no query needed.
+///
+/// # Errors
+/// Propagates the NetBox fetch failure, or a bad reverse zone in the config.
+pub fn discover(cfg: &Config, token: &str) -> anyhow::Result<Vec<DiscoveredBlock>> {
+    let netbox = NetboxSource {
+        vantage: Vantage::new(&cfg.vantage),
+        base_url: cfg.netbox_url.clone(),
+        token: token.to_string(),
+    };
+    let aggregates = netbox.gather_aggregates()?;
+    let estate = DnsEstate::from_config(&cfg.dns_servers)?;
+    Ok(infer_blocks(&aggregates, &estate.reverse_zone_blocks()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cidr(s: &str) -> Cidr {
+        Cidr::parse(s).unwrap()
+    }
+
+    #[test]
+    fn unions_netbox_and_reverse_with_source_tags_and_survey_order() {
+        // NetBox aggregates: a v4 block and a v6 block. Reverse zones: the same v4 block
+        // (→ Both) plus a v4 block NetBox doesn't have (→ dns only).
+        let netbox = [cidr("10.87.0.0/20"), cidr("2001:db8::/48")];
+        let reverse = [cidr("10.87.0.0/20"), cidr("10.99.0.0/16")];
+        let blocks = infer_blocks(&netbox, &reverse);
+
+        // Three distinct blocks, IPv4 first (by network), then IPv6.
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].cidr, cidr("10.87.0.0/20"));
+        assert_eq!(blocks[0].source, BlockSource::Both); // seen in both sources
+        assert_eq!(blocks[1].cidr, cidr("10.99.0.0/16"));
+        assert_eq!(blocks[1].source, BlockSource::DnsReverse);
+        assert_eq!(blocks[2].cidr, cidr("2001:db8::/48")); // IPv6 sorts last
+        assert_eq!(blocks[2].source, BlockSource::Netbox);
+    }
+
+    #[test]
+    fn a_non_network_base_is_folded_to_its_block() {
+        // The same /24 written from a host address collapses to one network-normalized block.
+        let blocks = infer_blocks(&[cidr("10.87.3.5/24")], &[cidr("10.87.3.200/24")]);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].cidr, cidr("10.87.3.0/24"));
+        assert_eq!(blocks[0].source, BlockSource::Both);
+    }
+
+    #[test]
+    fn empty_sources_discover_nothing() {
+        assert!(infer_blocks(&[], &[]).is_empty());
+        assert!(primary(&[]).is_none());
+    }
+
+    #[test]
+    fn summary_counts_families_and_names_sources() {
+        let blocks = infer_blocks(&[cidr("10.0.0.0/8"), cidr("2001:db8::/32")], &[cidr("10.0.0.0/8")]);
+        let text = summary(&blocks);
+        assert!(text.contains("2 block(s) — 1 IPv4, 1 IPv6"), "{text}");
+        assert!(text.contains("10.0.0.0/8  IPv4  [netbox+dns]"), "{text}");
+        assert!(text.contains("2001:db8::/32  IPv6  [netbox]"), "{text}");
+    }
+}

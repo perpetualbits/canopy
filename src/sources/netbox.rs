@@ -64,6 +64,24 @@ impl NetboxSource {
         Ok(out)
     }
 
+    /// Fetch NetBox's **aggregates** — the top-level address space it manages (the big
+    /// v4 and v6 allocations, e.g. `10.0.0.0/8` and `2001:db8::/32`). Discovery surveys
+    /// these when no `--range` is given.
+    ///
+    /// Aggregates carry the same `prefix` field as prefixes, so this reuses
+    /// [`parse_prefixes`] and keeps only the CIDR (labels are not needed for discovery).
+    ///
+    /// # Errors
+    /// Propagates SSH/HTTP failures or a non-JSON body.
+    pub fn gather_aggregates(&self) -> anyhow::Result<Vec<Cidr>> {
+        let first = format!("{}/api/ipam/aggregates/?limit=1000", self.base_url.trim_end_matches('/'));
+        let mut out = Vec::new();
+        for json in self.paginate(first)? {
+            out.extend(parse_prefixes(&json)?.into_iter().map(|s| s.cidr));
+        }
+        Ok(out)
+    }
+
     /// Follow NetBox's `next` links from `first`, returning every page's raw JSON body.
     ///
     /// NetBox paginates list endpoints (`{count, next, results}`); a single `limit=1000`
