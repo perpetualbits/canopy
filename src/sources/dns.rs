@@ -7,21 +7,38 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use super::estate::DnsEstate;
 use super::{FactSource, Vantage};
 use crate::reconcile::{AddressFacts, Cidr};
 
 /// Reverse-resolves every host in a range via the vantage's resolver.
 #[derive(Debug, Clone)]
 pub struct DnsSource {
-    /// A host whose resolver can see the internal reverse zones.
+    /// A host whose resolver can see the internal reverse zones. Also the fallback SSH
+    /// vantage for any reverse zone the estate does not route to a specific server.
     pub vantage: Vantage,
     /// Max concurrent lookups (the `xargs -P` fan-out) — bounds the burst on the
     /// resolver and the authoritative reverse server behind it.
     pub concurrency: usize,
-    /// Authoritative server to try a **zone transfer** (AXFR) from. When non-empty and
-    /// transfer is permitted, one AXFR per `/24` replaces hundreds of `host` lookups;
-    /// otherwise we fall back to the per-address sweep. Empty disables AXFR.
+    /// Default authoritative server to try a **zone transfer** (AXFR) from, used when no
+    /// `estate` server claims a zone. When non-empty and transfer is permitted, one AXFR
+    /// per `/24` replaces hundreds of `host` lookups; otherwise we fall back to the
+    /// per-address sweep. Empty disables the default AXFR.
     pub axfr_server: String,
+    /// The DNS estate, when configured: routes each reverse zone's AXFR to the server
+    /// that masters it. Empty (the default) keeps the single-`axfr_server` path exactly.
+    pub estate: DnsEstate,
+}
+
+/// One AXFR batch: the reverse zones to transfer and where from — the vantage to SSH
+/// into and the DNS server to `dig … @host`.
+struct ReverseGroup {
+    /// The SSH vantage to run the transfers on.
+    vantage: Vantage,
+    /// The authoritative DNS server to transfer from (the `dig @host` target).
+    host: String,
+    /// The reverse zone names to transfer from `host`.
+    zones: Vec<String>,
 }
 
 /// Safety cap on how many `/24` reverse zones an AXFR sweep will transfer. A range that
@@ -52,7 +69,14 @@ impl DnsSource {
         // AXFR is the light path (and the *only* reverse path for a huge IPv6 range, which
         // can't be swept address by address): `in-addr.arpa` for v4, `ip6.arpa` for v6.
         // Only if the server actually lets us transfer, though — otherwise fall through.
-        if !self.axfr_server.is_empty() {
+        //
+        // With a configured estate, each reverse zone is routed to the server that masters
+        // it; without one, we use the single default `axfr_server` exactly as before.
+        if !self.estate.is_empty() {
+            if let Some(facts) = self.try_axfr_routed(range, &mut on_progress)? {
+                return Ok(facts);
+            }
+        } else if !self.axfr_server.is_empty() {
             if let Some(facts) = self.try_axfr(range, &mut on_progress)? {
                 return Ok(facts);
             }
@@ -100,59 +124,143 @@ impl DnsSource {
         Ok(parse_ptrs(&results))
     }
 
-    /// Try to pull the reverse PTRs by zone transfer. Returns `Some(facts)` when AXFR is
-    /// permitted and done, or `None` when the server refuses (or the range needs more
-    /// than [`MAX_ZONES`] zones) so the caller falls back to the sweep.
-    ///
-    /// Gate: transfer the first zone; if the server refuses we get an empty answer (no
-    /// SOA), which we read as "not allowed". Otherwise transfer the rest with bounded
-    /// parallelism (transfers are heavier than lookups, so a smaller fan-out), ticking
-    /// once per zone. Each answer line is prefixed `R ` so it is told apart from the `T`
-    /// zone tick on the shared stream.
+    /// Try to pull the reverse PTRs by zone transfer from the single default
+    /// `axfr_server` (the no-estate path). Returns `Some(facts)` when AXFR is permitted
+    /// and done, or `None` when the server refuses (or the range needs more than
+    /// [`MAX_ZONES`] zones) so the caller falls back to the sweep.
     fn try_axfr(&self, range: &Cidr, mut on_progress: impl FnMut(f32, &str)) -> anyhow::Result<Option<Vec<AddressFacts>>> {
         let zones = reverse_zones(range);
         if zones.is_empty() {
             return Ok(None); // too large for AXFR — use the sweep
         }
-        let n = zones.len();
-        // Probe the first zone. Any error (server unreachable, dig missing) → fall back.
-        let probe = match self.axfr_zone(&zones[0]) {
+        let total = zones.len();
+        let mut facts = Vec::new();
+        let mut done = 0usize;
+        let ran = self.axfr_zones_from(&self.vantage, &self.axfr_server, &zones, range, &mut facts, &mut done, total, &mut on_progress)?;
+        // A refusal (empty probe) leaves `ran` false → `None` so the caller sweeps, exactly
+        // as before.
+        Ok(ran.then_some(facts))
+    }
+
+    /// Try to pull the reverse PTRs by zone transfer, **routing each zone to the server
+    /// that masters it** (the estate path). Returns `Some(facts)` — the union across
+    /// servers — or `None` when the range is too large for AXFR, or no server (and no
+    /// default `axfr_server` fallback) owns any of its zones, so the caller sweeps.
+    ///
+    /// Each reverse zone is mapped back to the network it covers ([`zone_network`]) and
+    /// routed by longest-prefix match; zones no server claims go to the default
+    /// `axfr_server` when one is set. A server that refuses simply contributes nothing —
+    /// other servers may still transfer.
+    fn try_axfr_routed(&self, range: &Cidr, mut on_progress: impl FnMut(f32, &str)) -> anyhow::Result<Option<Vec<AddressFacts>>> {
+        let zones = reverse_zones(range);
+        if zones.is_empty() {
+            return Ok(None); // too large for AXFR — use the sweep
+        }
+        let groups = self.route_reverse_zones(&zones);
+        if groups.is_empty() {
+            return Ok(None); // nothing routable and no fallback → sweep instead
+        }
+        let total: usize = groups.iter().map(|g| g.zones.len()).sum();
+        let mut facts = Vec::new();
+        let mut done = 0usize;
+        for g in &groups {
+            let ran = self.axfr_zones_from(&g.vantage, &g.host, &g.zones, range, &mut facts, &mut done, total, &mut on_progress)?;
+            if !ran {
+                // This server refused (or was unreachable); its zones yield nothing. Keep
+                // the bar honest and carry on with the other servers.
+                done += g.zones.len();
+                on_progress(done as f32 / total as f32, &format!("AXFR {done}/{total} zones"));
+            }
+        }
+        Ok(Some(facts))
+    }
+
+    /// Group the reverse `zones` by the server that should transfer them.
+    ///
+    /// How: route each zone by the network it covers ([`zone_network`]) through the
+    /// estate's longest-prefix match; a zone no server owns falls back to the default
+    /// `axfr_server` (skipped entirely when that is unset). Zones bound for the same
+    /// (vantage, server) pair are batched together so each server is contacted once.
+    fn route_reverse_zones(&self, zones: &[String]) -> Vec<ReverseGroup> {
+        let mut groups: Vec<ReverseGroup> = Vec::new();
+        for z in zones {
+            let owner = zone_network(z).and_then(|addr| self.estate.reverse_owner(addr));
+            let (vantage_host, host) = match owner {
+                Some(s) => (s.vantage_or(&self.vantage.host).to_string(), s.host.clone()),
+                None if !self.axfr_server.is_empty() => (self.vantage.host.clone(), self.axfr_server.clone()),
+                None => continue, // unroutable and no fallback → left to the sweep
+            };
+            match groups.iter_mut().find(|g| g.vantage.host == vantage_host && g.host == host) {
+                Some(g) => g.zones.push(z.clone()),
+                None => groups.push(ReverseGroup { vantage: Vantage::new(vantage_host), host, zones: vec![z.clone()] }),
+            }
+        }
+        groups
+    }
+
+    /// AXFR `zones` from `axfr_host` over `vantage`, appending the PTR facts found within
+    /// `range` to `out`. Shared by the single-server and routed paths.
+    ///
+    /// Gate: transfer the first zone; an empty answer (no SOA, no PTR) means the server
+    /// refuses, and we return `Ok(false)` having added nothing. Otherwise transfer the
+    /// rest with bounded parallelism (transfers are heavier than lookups, so a smaller
+    /// fan-out), advancing the shared zone counter `done` against `total` for the progress
+    /// bar. Each answer line is prefixed `R ` so it is told apart from the `T` zone tick on
+    /// the shared stream.
+    #[allow(clippy::too_many_arguments)]
+    fn axfr_zones_from(
+        &self,
+        vantage: &Vantage,
+        axfr_host: &str,
+        zones: &[String],
+        range: &Cidr,
+        out: &mut Vec<AddressFacts>,
+        done: &mut usize,
+        total: usize,
+        mut on_progress: impl FnMut(f32, &str),
+    ) -> anyhow::Result<bool> {
+        if zones.is_empty() {
+            return Ok(true);
+        }
+        // Probe the first zone. Any error (server unreachable, dig missing) → treat as a
+        // refusal so the caller can fall back.
+        let probe = match self.axfr_zone(vantage, axfr_host, &zones[0]) {
             Ok(out) => out,
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(false),
         };
         if !probe.contains("SOA") && !probe.contains(" PTR ") {
-            return Ok(None); // empty answer = transfer refused
+            return Ok(false); // empty answer = transfer refused
         }
-        let mut facts = parse_axfr(&probe, range);
-        on_progress(1.0 / n as f32, &format!("AXFR 1/{n} zones"));
+        out.extend(parse_axfr(&probe, range));
+        *done += 1;
+        on_progress(*done as f32 / total as f32, &format!("AXFR {done}/{total} zones"));
 
-        if n > 1 {
+        if zones.len() > 1 {
             let par = self.concurrency.clamp(1, 8);
             let args = zones[1..].join(" ");
             let remote = format!(
-                "printf '%s\\n' {args} | xargs -P{par} -n1 sh -c 'dig +noall +answer AXFR \"$0\" @{srv} 2>/dev/null | sed \"s/^/R /\"; printf \"T\\n\"'",
-                srv = self.axfr_server
+                "printf '%s\\n' {args} | xargs -P{par} -n1 sh -c 'dig +noall +answer AXFR \"$0\" @{axfr_host} 2>/dev/null | sed \"s/^/R /\"; printf \"T\\n\"'"
             );
-            let mut done = 1usize;
             let mut results = String::new();
-            self.vantage.run_streaming(&remote, |line| {
+            vantage.run_streaming(&remote, |line| {
                 if line == "T" {
-                    done += 1;
-                    on_progress(done as f32 / n as f32, &format!("AXFR {done}/{n} zones"));
+                    *done += 1;
+                    on_progress(*done as f32 / total as f32, &format!("AXFR {done}/{total} zones"));
                 } else if let Some(rest) = line.strip_prefix("R ") {
                     results.push_str(rest);
                     results.push('\n');
                 }
             })?;
-            facts.extend(parse_axfr(&results, range));
+            out.extend(parse_axfr(&results, range));
         }
-        Ok(Some(facts))
+        Ok(true)
     }
 
-    /// Transfer a single reverse zone, returning dig's answer section (records only).
-    fn axfr_zone(&self, zone: &str) -> anyhow::Result<String> {
-        let remote = format!("dig +noall +answer AXFR {zone} @{}", self.axfr_server);
-        self.vantage.run(&remote)
+    /// Transfer a single reverse zone from `axfr_host` over `vantage`, returning dig's
+    /// answer section (records only).
+    fn axfr_zone(&self, vantage: &Vantage, axfr_host: &str, zone: &str) -> anyhow::Result<String> {
+        let remote = format!("dig +noall +answer AXFR {zone} @{axfr_host}");
+        vantage.run(&remote)
     }
 }
 
@@ -204,6 +312,43 @@ fn reverse_zones_v6(net: Ipv6Addr, prefix: u32) -> Vec<String> {
             format!("{}.ip6.arpa", labels.join("."))
         })
         .collect()
+}
+
+/// The network address a reverse **zone** covers, so it can be routed to the server that
+/// masters that block: `3.87.10.in-addr.arpa` → `10.87.3.0`, and an `…​.ip6.arpa` zone →
+/// the IPv6 prefix its nibbles spell out. `None` for names that are not reverse zones.
+///
+/// How: the labels of an `in-addr.arpa` zone are the network's high octets in reverse, and
+/// the labels of an `ip6.arpa` zone are its high nibbles least-significant-first (the exact
+/// inverse of how [`reverse_zones_v4`]/[`reverse_zones_v6`] build them); the remaining
+/// low bits are zero — the block's network address.
+fn zone_network(zone: &str) -> Option<IpAddr> {
+    let z = zone.trim_end_matches('.');
+    if let Some(labels) = z.strip_suffix(".in-addr.arpa") {
+        // Labels are the high octets, most-significant last (e.g. `3.87.10` → 10.87.3.x).
+        let octs: Vec<u8> = labels.split('.').map(|p| p.parse().ok()).collect::<Option<_>>()?;
+        if octs.is_empty() || octs.len() > 4 {
+            return None;
+        }
+        let mut b = [0u8; 4];
+        for (i, o) in octs.iter().rev().enumerate() {
+            b[i] = *o; // reverse back to most-significant first; low octets stay 0
+        }
+        return Some(IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3])));
+    }
+    if let Some(labels) = z.strip_suffix(".ip6.arpa") {
+        let nibs: Vec<u8> =
+            labels.split('.').map(|p| u8::from_str_radix(p, 16).ok().filter(|n| *n < 16)).collect::<Option<_>>()?;
+        if nibs.is_empty() || nibs.len() > 32 {
+            return None;
+        }
+        // Nibble k sits at bit 4k of the zone integer; the zone occupies the address's top
+        // `4·len` bits, so shift it up to form the network.
+        let zone_val = nibs.iter().enumerate().fold(0u128, |acc, (k, &n)| acc | (u128::from(n) << (4 * k)));
+        let net = zone_val << (128 - (nibs.len() as u32) * 4);
+        return Some(IpAddr::V6(Ipv6Addr::from(net)));
+    }
+    None
 }
 
 /// Map a reverse-DNS owner name back to its address: `1.3.87.10.in-addr.arpa.` →
@@ -367,6 +512,90 @@ garbage line without ip
     fn ptr_owner_maps_ip6_arpa_back_to_v6() {
         assert_eq!(ptr_owner_to_ip(&ip6_owner('1')).unwrap(), "2001:db8::1".parse::<IpAddr>().unwrap());
         assert!(ptr_owner_to_ip("a.a.a.a.8.b.d.0.1.0.0.2.ip6.arpa.").is_none()); // short zone name, not a host
+    }
+
+    #[test]
+    fn zone_network_recovers_the_block_a_reverse_zone_covers() {
+        // The /24 zone the range produces maps back to its network address.
+        assert_eq!(zone_network("3.87.10.in-addr.arpa"), Some("10.87.3.0".parse().unwrap()));
+        assert_eq!(zone_network("0.87.10.in-addr.arpa."), Some("10.87.0.0".parse().unwrap()));
+        // The v6 nibble zone maps back to its prefix (low bits zero).
+        assert_eq!(
+            zone_network("a.a.a.a.8.b.d.0.1.0.0.2.ip6.arpa"),
+            Some("2001:db8:aaaa::".parse().unwrap())
+        );
+        // A name that is not a reverse zone has no network.
+        assert!(zone_network("host.example.com").is_none());
+    }
+
+    #[test]
+    fn routing_groups_zones_by_owning_server() {
+        use crate::config::DnsServer;
+        use crate::sources::estate::DnsEstate;
+        // ntserver1 masters all of 10/8; a tighter server masters 10.87/16.
+        let estate = DnsEstate::from_config(&[
+            DnsServer {
+                name: "ntserver1".into(),
+                host: "ntserver1.nfra.nl".into(),
+                vantage: String::new(),
+                forward_zones: vec![],
+                reverse_zones: vec!["10.0.0.0/8".into()],
+            },
+            DnsServer {
+                name: "sub16".into(),
+                host: "sub16.astron.nl".into(),
+                vantage: "jump.astron.nl".into(),
+                forward_zones: vec![],
+                reverse_zones: vec!["10.87.0.0/16".into()],
+            },
+        ])
+        .unwrap();
+        let dns = DnsSource {
+            vantage: Vantage::new("dns1.astron.nl"),
+            concurrency: 8,
+            axfr_server: String::new(),
+            estate,
+        };
+        // A /20 in 10.87 → all its /24 zones route to the tighter sub16 server (@its host,
+        // via its own vantage).
+        let z20 = reverse_zones(&Cidr::parse("10.87.0.0/20").unwrap());
+        let groups = dns.route_reverse_zones(&z20);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].host, "sub16.astron.nl");
+        assert_eq!(groups[0].vantage.host, "jump.astron.nl");
+        assert_eq!(groups[0].zones.len(), 16);
+
+        // A /24 in 10.200 (only inside 10/8) → ntserver1, reached over the default vantage.
+        let z24 = reverse_zones(&Cidr::parse("10.200.4.0/24").unwrap());
+        let g2 = dns.route_reverse_zones(&z24);
+        assert_eq!(g2.len(), 1);
+        assert_eq!(g2[0].host, "ntserver1.nfra.nl");
+        assert_eq!(g2[0].vantage.host, "dns1.astron.nl"); // ntserver1 has no own vantage
+    }
+
+    #[test]
+    fn routing_falls_back_to_default_axfr_server_and_drops_unowned_zones() {
+        use crate::sources::estate::DnsEstate;
+        // No estate servers, but a default axfr_server → every zone routes there.
+        let with_default = DnsSource {
+            vantage: Vantage::new("dns1.astron.nl"),
+            concurrency: 8,
+            axfr_server: "default-axfr.astron.nl".into(),
+            estate: DnsEstate::default(),
+        };
+        let z = reverse_zones(&Cidr::parse("10.87.3.0/24").unwrap());
+        let g = with_default.route_reverse_zones(&z);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].host, "default-axfr.astron.nl");
+
+        // No estate and no default → nothing is routable (the caller sweeps instead).
+        let none = DnsSource {
+            vantage: Vantage::new("dns1.astron.nl"),
+            concurrency: 8,
+            axfr_server: String::new(),
+            estate: DnsEstate::default(),
+        };
+        assert!(none.route_reverse_zones(&z).is_empty());
     }
 
     #[test]

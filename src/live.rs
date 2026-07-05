@@ -8,6 +8,7 @@ use anyhow::Context;
 
 use crate::config::Config;
 use crate::reconcile::{AddressFacts, Cidr, Subnet};
+use crate::sources::estate::DnsEstate;
 use crate::sources::{self, dns::DnsSource, netbox::NetboxSource, probe::ProbeSource, FactSource, Vantage};
 
 /// One live gather's result: the per-address facts, plus the NetBox-defined subnets
@@ -31,6 +32,11 @@ pub struct LiveData {
 /// Propagates a token failure, or the first source that fails (SSH, HTTP, DNS).
 pub fn gather_live(range: &Cidr, cfg: &Config) -> anyhow::Result<LiveData> {
     let token = get_token(&cfg.token_pass)?;
+    // Show the operator which servers the estate will route to, before the sweep runs.
+    let estate = DnsEstate::from_config(&cfg.dns_servers)?;
+    if !estate.is_empty() {
+        eprintln!("DNS estate — routing reverse zones to:\n{}", estate.describe());
+    }
     gather_live_with_token(range, cfg, token, |_, _| {})
 }
 
@@ -57,6 +63,7 @@ pub fn gather_live_with_token(
         vantage: vantage.clone(),
         concurrency: cfg.dns_concurrency,
         axfr_server: cfg.reverse_axfr_server.clone(),
+        estate: DnsEstate::from_config(&cfg.dns_servers)?,
     };
     let probe = ProbeSource { vantage: Vantage::new(&cfg.probe_host), concurrency: cfg.probe_concurrency };
 

@@ -30,5 +30,29 @@ probe_concurrency = 64
 
 # Authoritative server to try reverse-DNS zone transfers (AXFR) from. When set and
 # transfer is permitted, one AXFR per /24 replaces hundreds of per-address lookups —
-# far lighter on the DNS server. Empty (default) keeps the per-address sweep.
+# far lighter on the DNS server. Empty (default) keeps the per-address sweep. Also the
+# fallback AXFR server for any reverse zone no [[dns_servers]] entry below claims.
 # reverse_axfr_server = "ntserver1.astron.nl"
+
+# The DNS estate: the servers of the network and the zones each masters. Optional — with
+# no [[dns_servers]] entry canopy uses the single `vantage` (+ `reverse_axfr_server`)
+# above, exactly as before. Listing servers lets canopy route each reverse-zone transfer
+# to the server that actually masters it (longest-prefix match on the reverse block), and
+# route forward names to their zone's server (longest-suffix match on the name).
+#
+# Per server:
+#   name          short label for logs / the plan preview
+#   host          the server's own hostname/IP — the `dig @host` AXFR target
+#   vantage       SSH host to reach it from (omit to use the global `vantage`)
+#   forward_zones domain suffixes it masters (e.g. "nfra.nl")
+#   reverse_zones reverse blocks it masters, as CIDRs (e.g. "10.0.0.0/8")
+#
+# [[dns_servers]]
+# name          = "dns1"
+# host          = "dns1.astron.nl"
+# forward_zones = ["nfra.nl", "astron.nl"]
+#
+# [[dns_servers]]
+# name          = "ntserver1"
+# host          = "ntserver1.nfra.nl"
+# reverse_zones = ["10.0.0.0/8"]

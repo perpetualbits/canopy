@@ -10,6 +10,7 @@
 //! itself is unavoidably live.
 
 pub mod dns;
+pub mod estate;
 pub mod netbox;
 pub mod probe;
 pub mod vantage;

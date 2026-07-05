@@ -34,8 +34,42 @@ pub struct Config {
     /// Authoritative server to attempt reverse-DNS **zone transfers** (AXFR) from, e.g.
     /// the reverse-zone master. When set (and transfer is permitted) one AXFR per `/24`
     /// replaces hundreds of per-address `host` lookups — far lighter on the DNS server.
-    /// Empty (the default) keeps the per-address sweep.
+    /// Empty (the default) keeps the per-address sweep. Acts as the fallback AXFR server
+    /// for any reverse zone no listed `dns_servers` entry claims.
     pub reverse_axfr_server: String,
+    /// The DNS servers of the estate and the zones each masters. Optional and **empty by
+    /// default** — with no entry canopy uses the single `vantage` (plus the global
+    /// `reverse_axfr_server`) exactly as before. Listing servers lets canopy route each
+    /// reverse-zone transfer to the server that actually masters it (and, later, each
+    /// forward write). In TOML these are `[[dns_servers]]` tables.
+    pub dns_servers: Vec<DnsServer>,
+}
+
+/// One DNS server of the estate and the zones it is authoritative for.
+///
+/// What: names a server, how to reach it, and which forward domains and reverse CIDR
+/// blocks it masters — the routing table canopy uses to send each query (and, later,
+/// each edit) to the right box.
+///
+/// Why: the estate is multi-server (the forward `nfra.nl` zone lives on dns1, the
+/// `10.in-addr.arpa` reverse on ntserver1), so "which server owns this zone?" must be
+/// **data**, not a hard-coded assumption.
+///
+/// Units: `forward_zones` are domain suffixes (e.g. `nfra.nl`); `reverse_zones` are CIDR
+/// strings (e.g. `10.0.0.0/8`). Every field defaults to empty, so a partial table loads.
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(default)]
+pub struct DnsServer {
+    /// Short label for logs and the plan preview (e.g. `dns1`, `ntserver1`).
+    pub name: String,
+    /// The server's own hostname/IP — the AXFR target passed to `dig … @host`.
+    pub host: String,
+    /// SSH vantage to reach this server from; empty falls back to the global `vantage`.
+    pub vantage: String,
+    /// Forward zones this server masters, as domain suffixes (e.g. `nfra.nl`).
+    pub forward_zones: Vec<String>,
+    /// Reverse blocks this server masters, as CIDR strings (e.g. `10.0.0.0/8`).
+    pub reverse_zones: Vec<String>,
 }
 
 impl Default for Config {
@@ -52,6 +86,7 @@ impl Default for Config {
             dns_concurrency: 64,
             probe_concurrency: 64,
             reverse_axfr_server: String::new(), // off by default; needs allow-transfer
+            dns_servers: Vec::new(), // no estate listed → single-vantage behaviour
         }
     }
 }
@@ -114,5 +149,34 @@ mod tests {
     #[test]
     fn path_lands_under_canopy() {
         assert!(config_path().ends_with("canopy/config.toml"));
+    }
+
+    #[test]
+    fn no_dns_servers_by_default() {
+        let c: Config = toml::from_str("").unwrap();
+        assert!(c.dns_servers.is_empty()); // empty estate = legacy single-vantage behaviour
+    }
+
+    #[test]
+    fn dns_servers_table_parses() {
+        let c: Config = toml::from_str(
+            "\
+[[dns_servers]]
+name = \"dns1\"
+host = \"dns1.astron.nl\"
+forward_zones = [\"nfra.nl\", \"astron.nl\"]
+
+[[dns_servers]]
+name = \"ntserver1\"
+host = \"ntserver1.nfra.nl\"
+reverse_zones = [\"10.0.0.0/8\"]
+",
+        )
+        .unwrap();
+        assert_eq!(c.dns_servers.len(), 2);
+        assert_eq!(c.dns_servers[0].name, "dns1");
+        assert_eq!(c.dns_servers[0].forward_zones, vec!["nfra.nl", "astron.nl"]);
+        assert!(c.dns_servers[0].vantage.is_empty()); // omitted → empty, falls back to global vantage
+        assert_eq!(c.dns_servers[1].reverse_zones, vec!["10.0.0.0/8"]);
     }
 }
