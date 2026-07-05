@@ -152,23 +152,14 @@ impl DnsEstate {
             .map(|(s, _)| s)
     }
 
-    /// A one-line-per-server summary of the estate, for the operator to see which boxes
-    /// canopy will use before a live run.
+    /// A **one-line** summary of the estate — the server names and how many zones they
+    /// master — so a live run notes which boxes it will use without a wall of zones.
     #[must_use]
     pub fn describe(&self) -> String {
-        let mut s = String::new();
-        for srv in &self.servers {
-            let via = if srv.vantage.is_empty() { "default vantage" } else { srv.vantage.as_str() };
-            let fwd = srv.forward_zones.join(", ");
-            let rev = srv
-                .reverse_blocks
-                .iter()
-                .map(|b| format!("{}/{}", b.base, b.prefix_len))
-                .collect::<Vec<_>>()
-                .join(", ");
-            s.push_str(&format!("  {} (@{}, via {}) forward: [{fwd}] reverse: [{rev}]\n", srv.name, srv.host, via));
-        }
-        s
+        let fwd: usize = self.servers.iter().map(|s| s.forward_zones.len()).sum();
+        let rev: usize = self.servers.iter().map(|s| s.reverse_blocks.len()).sum();
+        let names = self.servers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ");
+        format!("{} DNS server(s): {names} ({fwd} forward, {rev} reverse zones)", self.servers.len())
     }
 }
 

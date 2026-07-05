@@ -32,10 +32,10 @@ pub struct LiveData {
 /// Propagates a token failure, or the first source that fails (SSH, HTTP, DNS).
 pub fn gather_live(range: &Cidr, cfg: &Config) -> anyhow::Result<LiveData> {
     let token = get_token(&cfg.token_pass)?;
-    // Show the operator which servers the estate will route to, before the sweep runs.
+    // A terse one-liner naming the estate, before the sweep runs (not a wall of zones).
     let estate = DnsEstate::from_config(&cfg.dns_servers)?;
     if !estate.is_empty() {
-        eprintln!("DNS estate — routing reverse zones to:\n{}", estate.describe());
+        eprintln!("Using {}", estate.describe());
     }
     gather_live_with_token(range, cfg, token, |_, _| {})
 }
