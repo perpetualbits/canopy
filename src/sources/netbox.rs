@@ -100,6 +100,21 @@ impl NetboxSource {
         Ok(out)
     }
 
+    /// Fetch every registered `dns_name` from NetBox (all ip-addresses, whole IPAM). Used
+    /// by DNS-estate discovery to learn which forward domains are in use, so their
+    /// authoritative servers can be looked up.
+    ///
+    /// # Errors
+    /// Propagates SSH/HTTP failures or a non-JSON body.
+    pub fn gather_dns_names(&self) -> anyhow::Result<Vec<String>> {
+        let first = format!("{}/api/ipam/ip-addresses/?limit=1000", self.base_url.trim_end_matches('/'));
+        let mut out = Vec::new();
+        for json in self.paginate(first)? {
+            out.extend(parse_dns_names(&json)?);
+        }
+        Ok(out)
+    }
+
     /// Follow NetBox's `next` links from `first`, returning every page's raw JSON body.
     ///
     /// NetBox paginates list endpoints (`{count, next, results}`); a single `limit=1000`
@@ -206,6 +221,22 @@ pub fn parse_survey_prefixes(json: &str) -> anyhow::Result<Vec<Cidr>> {
         out.push(cidr);
     }
     Ok(out)
+}
+
+/// The non-empty `dns_name`s from a NetBox `ip-addresses` response.
+///
+/// # Errors
+/// Fails if the body is not the expected JSON shape.
+pub fn parse_dns_names(json: &str) -> anyhow::Result<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_str(json).context("NetBox response was not JSON")?;
+    let results = v
+        .get("results")
+        .and_then(|r| r.as_array())
+        .context("NetBox response had no `results` array")?;
+    Ok(results
+        .iter()
+        .filter_map(|o| o.get("dns_name").and_then(|d| d.as_str()).filter(|s| !s.is_empty()).map(str::to_string))
+        .collect())
 }
 
 /// Parse a NetBox `ip-addresses` list response into per-address facts.

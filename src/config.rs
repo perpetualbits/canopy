@@ -30,8 +30,13 @@ pub struct Config {
     /// `"portal.lofar.eu,inner"`. Empty (the default) connects directly. Per-server
     /// overrides live on each `[[dns_servers]]` entry; `~/.ssh/config` is honoured on top.
     pub jump: String,
-    /// SSH host on the target L2 for the ARP probe.
+    /// SSH host on the target L2 for the ARP probe — often a jump/bastion host, which
+    /// tends to sit close to the internal networks.
     pub probe_host: String,
+    /// SSH `ProxyJump` chain to reach `probe_host`. Empty (the default) connects directly —
+    /// the right choice when `probe_host` is itself a bastion (reachable from outside).
+    /// Set it only when the probe host sits behind another jump.
+    pub probe_jump: String,
     /// NetBox base URL.
     pub netbox_url: String,
     /// The `pass` entry holding the NetBox API token.
@@ -93,6 +98,7 @@ impl Default for Config {
             vantage: "dns1.astron.nl".into(),
             jump: String::new(), // direct by default; a site can set a bastion chain
             probe_host: "takkie.astron.nl".into(),
+            probe_jump: String::new(), // probe host is reached directly (often a bastion itself)
             netbox_url: "https://netbox.astron.nl".into(),
             token_pass: "astron/netbox.astron.nl/dns_api_token".into(),
             // A moderate default: gentle on a shared reverse-DNS server, still finishing

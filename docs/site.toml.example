@@ -10,8 +10,11 @@
 vantage    = "dns1.astron.nl"
 jump       = "bastion.astron.nl"        # or a chain, e.g. "portal.lofar.eu,inner.host"
 
-# On-L2 host for the ARP/ping probe (a jump host often works too — check it can reach the L2).
-probe_host = "takkie.astron.nl"
+# Host for the ARP/ping probe — a jump/bastion is a good choice: it sits close to the
+# internal L2s and is reachable directly, so probe_jump stays empty. Set probe_jump only if
+# the probe host itself sits behind another bastion.
+probe_host = "bastion.astron.nl"
+# probe_jump = ""
 
 netbox_url = "https://netbox.astron.nl"
 

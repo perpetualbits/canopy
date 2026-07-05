@@ -66,7 +66,9 @@ pub fn gather_live_with_token(
         axfr_server: cfg.reverse_axfr_server.clone(),
         estate: DnsEstate::from_config(&cfg.dns_servers)?,
     };
-    let probe = ProbeSource { vantage: Vantage::with_jump(&cfg.probe_host, &cfg.jump), concurrency: cfg.probe_concurrency };
+    // The probe host is reached over its own jump (empty = direct); it is often a bastion,
+    // so jumping through the site `jump` to reach it would be wrong.
+    let probe = ProbeSource { vantage: Vantage::with_jump(&cfg.probe_host, &cfg.probe_jump), concurrency: cfg.probe_concurrency };
 
     on_progress(0.0, "querying NetBox…");
     let nb = netbox.gather(range).context("NetBox source")?;

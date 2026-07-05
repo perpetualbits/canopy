@@ -10,6 +10,7 @@
 mod config;
 mod discover;
 mod dns;
+mod dns_discovery;
 mod fixture;
 mod graph;
 mod live;
@@ -52,6 +53,11 @@ struct Args {
     /// Gather facts from the live NetBox/DNS/probe sources instead of the demo data.
     #[arg(long)]
     live: bool,
+
+    /// Discover the DNS estate (which server masters which zones) via SOA lookups on the
+    /// vantage, and print it as a [[dns_servers]] block for conf.d/<site>.toml. Read-only.
+    #[arg(long)]
+    discover_dns: bool,
 
     /// SSH host to run NetBox + DNS queries from. Overrides the config's `vantage`.
     #[arg(long)]
@@ -115,6 +121,11 @@ fn main() -> anyhow::Result<()> {
         cfg.token_pass = v.clone();
     }
 
+    // Discover the DNS estate and print it for the site config (read-only).
+    if args.discover_dns {
+        return run_discover_dns(&cfg);
+    }
+
     // The range to survey: `--range` wins, else the config's `range`. `None` means
     // "not pinned" — live runs then discover the address space from the sources.
     let pinned_range = args.range.clone().or_else(|| cfg.range.clone());
@@ -148,6 +159,25 @@ fn main() -> anyhow::Result<()> {
     }
 
     tui::run(range, facts, subnets, args.write, args.dry_run, args.live, cfg, None)
+}
+
+/// Discover the DNS estate (which server masters which zones) and print it as a
+/// `[[dns_servers]]` block ready to paste into `conf.d/<site>.toml`. Read-only: it fetches
+/// the NetBox forward names and the surveyed blocks, then does SOA lookups on the vantage.
+///
+/// # Errors
+/// Propagates the token fetch, the NetBox/discovery fetch, or a bad reverse zone.
+fn run_discover_dns(cfg: &Config) -> anyhow::Result<()> {
+    let token = live::get_token(&cfg.token_pass)?;
+    let blocks: Vec<Cidr> = discover::discover(cfg, &token)?.into_iter().map(|b| b.cidr).collect();
+    eprintln!("Probing SOA for {} block(s) and their forward domains …", blocks.len());
+    let servers = dns_discovery::discover_dns_servers(cfg, &token, &blocks)?;
+    if servers.is_empty() {
+        eprintln!("(no authoritative servers found — check the vantage can `dig`)");
+        return Ok(());
+    }
+    print!("{}", dns_discovery::render_dns_servers(&servers));
+    Ok(())
 }
 
 /// The block browsed offline when no range is pinned — the fixture's `/24`, so canopy
