@@ -141,9 +141,10 @@ impl DnsSource {
         let mut facts = Vec::new();
         let mut done = 0usize;
         let ran = self.axfr_zones_from(&self.vantage, &self.axfr_server, &zones, range, &mut facts, &mut done, total, &mut on_progress)?;
-        // A refusal (empty probe) leaves `ran` false → `None` so the caller sweeps, exactly
-        // as before.
-        Ok(ran.then_some(facts))
+        // Fall back to the sweep whenever AXFR gives us nothing — a refusal (`ran` false) or
+        // a transfer that returned no PTRs (wrong/empty server). Only a transfer that
+        // actually yielded records short-circuits the sweep.
+        Ok((ran && !facts.is_empty()).then_some(facts))
     }
 
     /// Try to pull the reverse PTRs by zone transfer, **routing each zone to the server
@@ -176,7 +177,10 @@ impl DnsSource {
                 on_progress(done as f32 / total as f32, &format!("AXFR {done}/{total} zones"));
             }
         }
-        Ok(Some(facts))
+        // If no server yielded any PTRs (all refused, or the split-horizon routed us to a
+        // server that doesn't serve this block's reverse), fall back to the per-address
+        // sweep — a recursive `host` lookup finds the PTRs even when AXFR is blocked.
+        Ok((!facts.is_empty()).then_some(facts))
     }
 
     /// Group the reverse `zones` by the server that should transfer them.
