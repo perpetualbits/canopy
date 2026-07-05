@@ -310,22 +310,45 @@ fn list_table(range: Cidr, facts: &[reconcile::AddressFacts]) {
     let map: std::collections::HashMap<std::net::IpAddr, reconcile::AddressFacts> =
         facts.iter().cloned().map(|f| (f.addr, f)).collect();
     let c = reconcile::counts_from_facts(total, &map);
+
+    // A two-line block header: the block itself, then one aligned tally.
+    println!("{}/{}   network {}   {total} host{}", range.base, range.prefix_len, range.network(), plural(total));
     println!(
-        "{}/{} (network {})  total={total} free={} allocated={} dns-only={} netbox-only={} live-unreg={} conflict={}",
-        range.base, range.prefix_len, range.network(),
+        "  free {}  allocated {}  dns-only {}  netbox-only {}  live-unreg {}  conflict {}",
         c.free, c.allocated, c.dns_only, c.netbox_only, c.live_unregistered, c.conflict
     );
-    let mut known: Vec<reconcile::AddressRow> = facts.iter().map(reconcile::row_from_facts).collect();
-    known.sort_by_key(|r| r.addr);
-    for r in known.iter().filter(|r| !r.status.is_free()) {
-        println!(
-            "  {:<15} {:<16} {}",
-            r.addr.to_string(),
-            format!("{:?}", r.status),
-            r.name.as_deref().unwrap_or("")
-        );
+
+    // The interesting rows (everything not simply free) as an aligned ADDRESS/STATUS/NAME
+    // table; the address column is sized to its widest value so IPv4 and IPv6 both line up.
+    let mut rows: Vec<reconcile::AddressRow> = facts.iter().map(reconcile::row_from_facts).collect();
+    rows.sort_by_key(|r| r.addr);
+    rows.retain(|r| !r.status.is_free());
+    if !rows.is_empty() {
+        let addr_w = rows.iter().map(|r| r.addr.to_string().len()).max().unwrap_or(0).max("ADDRESS".len());
+        println!();
+        print_row(addr_w, "ADDRESS", "STATUS", "NAME");
+        for r in &rows {
+            print_row(addr_w, &r.addr.to_string(), r.status.label(), r.name.as_deref().unwrap_or(""));
+        }
     }
     if let Some(free) = (0..total).map(|i| range.host_at(i)).find(|a| !map.contains_key(a)) {
-        println!("first free: {free}");
+        println!("  first free: {free}");
+    }
+}
+
+/// Print one aligned `ADDRESS  STATUS  NAME` row (2-space indent), trimmed so an empty
+/// trailing column leaves no trailing whitespace — kinder to copy-paste and to diffs.
+fn print_row(addr_w: usize, addr: &str, status: &str, name: &str) {
+    // 11 = width of the longest status label ("netbox-only").
+    let line = format!("  {addr:<addr_w$}  {status:<11}  {name}");
+    println!("{}", line.trim_end());
+}
+
+/// `""` for a count of 1, else `"s"` — so headers read "1 host" / "254 hosts".
+fn plural(n: u128) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
     }
 }

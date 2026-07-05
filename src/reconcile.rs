@@ -63,6 +63,20 @@ impl AddressStatus {
     pub fn is_free(self) -> bool {
         matches!(self, AddressStatus::Free)
     }
+
+    /// A short, lower-case, hyphenated label — the same wording the count buckets use, so
+    /// the CLI's status column and its `dns-only 16` tally read as one vocabulary.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            AddressStatus::Free => "free",
+            AddressStatus::Allocated => "allocated",
+            AddressStatus::NetBoxOnly => "netbox-only",
+            AddressStatus::DnsOnly => "dns-only",
+            AddressStatus::LiveUnregistered => "live-unreg",
+            AddressStatus::Conflict => "conflict",
+        }
+    }
 }
 
 /// One row of the reconciled view: an address, its verdict, and the best name we

@@ -167,20 +167,24 @@ pub fn primary(blocks: &[DiscoveredBlock]) -> Option<&DiscoveredBlock> {
 }
 
 /// A short human summary of the discovered blocks, for `--list` to print before the rows:
-/// a count by family, then one line per block with its family and source.
+/// a count by family, then one aligned `BLOCK / FAMILY / SOURCE` line per block.
+///
+/// The block column is sized to its widest value so the families and sources line up, and
+/// each line is trimmed to leave no trailing whitespace (kinder to copy-paste).
 #[must_use]
 pub fn summary(blocks: &[DiscoveredBlock]) -> String {
     let v4 = blocks.iter().filter(|b| !b.cidr.is_v6()).count();
     let v6 = blocks.len() - v4;
-    let mut s = format!("discovered {} block(s) — {v4} IPv4, {v6} IPv6:\n", blocks.len());
+    let cidr = |b: &DiscoveredBlock| format!("{}/{}", b.cidr.base, b.cidr.prefix_len);
+    let bw = blocks.iter().map(|b| cidr(b).len()).max().unwrap_or(0).max("BLOCK".len());
+
+    let mut s = format!("Discovered {} block{} ({v4} IPv4, {v6} IPv6):\n\n", blocks.len(), if blocks.len() == 1 { "" } else { "s" });
+    s.push_str(format!("  {:<bw$}  {:<6}  {}\n", "BLOCK", "FAMILY", "SOURCE").trim_end());
+    s.push('\n');
     for b in blocks {
-        s.push_str(&format!(
-            "  {}/{}  {}  [{}]\n",
-            b.cidr.base,
-            b.cidr.prefix_len,
-            if b.cidr.is_v6() { "IPv6" } else { "IPv4" },
-            b.source.label()
-        ));
+        let fam = if b.cidr.is_v6() { "IPv6" } else { "IPv4" };
+        s.push_str(format!("  {:<bw$}  {fam:<6}  {}", cidr(b), b.source.label()).trim_end());
+        s.push('\n');
     }
     s
 }
@@ -218,7 +222,7 @@ pub fn discover(cfg: &Config, token: &str) -> anyhow::Result<Vec<DiscoveredBlock
     let reverse = estate.reverse_zone_blocks();
 
     eprintln!(
-        "discovery: NetBox {} aggregate(s), {} survey prefix(es) → {} block(s) to survey; {} reverse zone(s)",
+        "Discovery: NetBox {} aggregate(s), {} survey prefix(es) -> {} block(s) to survey; {} reverse zone(s)",
         aggregates.len(),
         prefixes.len(),
         netbox_blocks.len(),
@@ -316,8 +320,13 @@ mod tests {
     fn summary_counts_families_and_names_sources() {
         let blocks = infer_blocks(&[cidr("10.0.0.0/8"), cidr("2001:db8::/32")], &[cidr("10.0.0.0/8")]);
         let text = summary(&blocks);
-        assert!(text.contains("2 block(s) — 1 IPv4, 1 IPv6"), "{text}");
-        assert!(text.contains("10.0.0.0/8  IPv4  [netbox+dns]"), "{text}");
-        assert!(text.contains("2001:db8::/32  IPv6  [netbox]"), "{text}");
+        assert!(text.contains("Discovered 2 blocks (1 IPv4, 1 IPv6):"), "{text}");
+        // Robust to the column padding: check each block's own line for its family + source.
+        let v4 = text.lines().find(|l| l.contains("10.0.0.0/8")).unwrap();
+        assert!(v4.contains("IPv4") && v4.contains("netbox+dns"), "{v4}");
+        let v6 = text.lines().find(|l| l.contains("2001:db8::/32")).unwrap();
+        assert!(v6.contains("IPv6") && v6.contains("netbox"), "{v6}");
+        // No line carries trailing whitespace (paste-friendly).
+        assert!(text.lines().all(|l| l == l.trim_end()), "trailing whitespace in:\n{text}");
     }
 }
