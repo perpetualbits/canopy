@@ -305,7 +305,7 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
     let hints: &[(&str, &str)] = if app.chooser.is_some() {
         &[("hjkl", "quadrant"), ("↵", "zoom in"), ("z", "cells"), ("Bksp", "out"), ("q", "quit")]
     } else if zoomable {
-        &[("hjkl", "move"), ("↵", "in"), ("z", "quadrant"), ("Bksp", "out"), ("g", "groups"), ("b", "subnets"), ("Tab", "table"), ("q", "quit")]
+        &[("hl", "walk"), ("kj", "leap"), ("nf", "occ/free"), ("↵", "in"), ("z", "quadrant"), ("g", "groups"), ("b", "subnets"), ("q", "quit")]
     } else {
         &[("p", "palette"), ("g", "groups"), ("b", "subnets"), (", .", "tune"), ("Tab", "table"), ("q", "quit")]
     };

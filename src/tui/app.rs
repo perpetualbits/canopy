@@ -660,7 +660,6 @@ impl App {
     /// Keys for the map view: move the cursor over the Gilbert grid, `Enter` zooms
     /// into the highlighted cell (its exact address slice), `Backspace`/`-` zooms back out.
     fn on_key_map(&mut self, code: KeyCode) {
-        let (last_x, last_y) = (self.map_dims.0.saturating_sub(1), self.map_dims.1.saturating_sub(1));
         // `z` toggles the quadrant chooser; while it is on, the arrows step between sub-blocks
         // and Enter zooms into the selected one, so its keys are handled separately.
         if code == KeyCode::Char('z') {
@@ -684,10 +683,16 @@ impl App {
             // Esc only ever zooms out — never quits, so an extra zoom-out is harmless. Only q/Q
             // leave canopy.
             KeyCode::Esc => self.zoom_out(),
-            KeyCode::Left | KeyCode::Char('h') => self.map_cur.0 = self.map_cur.0.saturating_sub(1),
-            KeyCode::Right | KeyCode::Char('l') => self.map_cur.0 = (self.map_cur.0 + 1).min(last_x),
-            KeyCode::Up | KeyCode::Char('k') => self.map_cur.1 = self.map_cur.1.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => self.map_cur.1 = (self.map_cur.1 + 1).min(last_y),
+            // Walk *along the Gilbert curve*: h/l step one cell (address-adjacent), k/j jump a
+            // "row" (the grid width) for a bigger stride; n/f leap to the next occupied/free zone.
+            KeyCode::Left | KeyCode::Char('h') => self.map_walk(-1),
+            KeyCode::Right | KeyCode::Char('l') => self.map_walk(1),
+            KeyCode::Up | KeyCode::Char('k') => self.map_walk(-i64::from(self.map_dims.0.max(1))),
+            KeyCode::Down | KeyCode::Char('j') => self.map_walk(i64::from(self.map_dims.0.max(1))),
+            KeyCode::Char('n') => self.jump_zone(true, true),
+            KeyCode::Char('N') => self.jump_zone(false, true),
+            KeyCode::Char('f') => self.jump_zone(true, false),
+            KeyCode::Char('F') => self.jump_zone(false, false),
             KeyCode::Enter | KeyCode::Char('+') => self.zoom_into_cursor(),
             KeyCode::Backspace | KeyCode::Char('-') => self.zoom_out(),
             KeyCode::Char('s') | KeyCode::Char('p') => self.scheme = self.scheme.cycle(),
@@ -777,6 +782,48 @@ impl App {
         }
         let d = mullion::spacefill::Gilbert::new(w, h).xy_to_d(self.map_cur.0, self.map_cur.1)?;
         Some(self.range.nth_slice(cells, u128::from(d)))
+    }
+
+    /// The cursor's index along the Gilbert curve in the current grid (`0` if the grid is empty).
+    fn cursor_d(&self) -> usize {
+        let (w, h) = self.map_dims;
+        if w == 0 || h == 0 {
+            return 0;
+        }
+        mullion::spacefill::Gilbert::new(w, h).xy_to_d(self.map_cur.0, self.map_cur.1).unwrap_or(0) as usize
+    }
+
+    /// Move the cursor `delta` cells **along the curve** (clamped to the grid) — the serpentine
+    /// walk that follows address order, not raw 2-D motion.
+    fn map_walk(&mut self, delta: i64) {
+        let (w, h) = self.map_dims;
+        let total = u128::from(w) * u128::from(h);
+        if total == 0 {
+            return;
+        }
+        let d = (self.cursor_d() as i64 + delta).clamp(0, total as i64 - 1) as usize;
+        self.map_cur = mullion::spacefill::Gilbert::new(w, h).d_to_xy(d);
+    }
+
+    /// Jump the cursor to the start of the next (`forward`) or previous run of **occupied**
+    /// (`occupied`) or free cells along the curve — a "zone" being a maximal run of like cells.
+    /// A no-op when there is no such zone ahead.
+    fn jump_zone(&mut self, forward: bool, occupied: bool) {
+        let (w, h) = self.map_dims;
+        let total = (u128::from(w) * u128::from(h)) as usize;
+        if total <= 1 {
+            return;
+        }
+        let grid = crate::map::MapGrid::build(self.range, &self.facts, w, h);
+        let hit = |d: usize| (grid.used[d] > 0) == occupied;
+        // A run-start is a hit cell whose predecessor on the curve is a miss (or the very first).
+        let run_start = |d: usize| hit(d) && (d == 0 || !hit(d - 1));
+        let cur = self.cursor_d();
+        let found =
+            if forward { (cur + 1..total).find(|&d| run_start(d)) } else { (0..cur).rev().find(|&d| run_start(d)) };
+        if let Some(d) = found {
+            self.map_cur = grid.cell_xy(d);
+        }
     }
 
     /// Zoom into the cell under the cursor, if there is a finer slice.
@@ -1486,25 +1533,58 @@ mod tests {
     }
 
     #[test]
-    fn map_cursor_clamps_to_the_grid() {
+    fn map_curve_walk_clamps_to_the_curve_ends() {
         let range = Cidr::parse("10.87.3.0/24").unwrap();
         let mut app = App::new(range, Vec::new(), false, false, false, Config::default());
         app.view = View::Map;
         let mut buf = Buffer::empty(Rect::new(0, 0, 120, 50));
         crate::tui::map::screen(&mut buf, &mut app);
-        let (last_x, last_y) = (app.map_dims.0 - 1, app.map_dims.1 - 1);
-        // Hammer right/down past the edge — the cursor must stay in-bounds.
-        for _ in 0..64 {
+        let (w, h) = app.map_dims;
+        let total = (u128::from(w) * u128::from(h)) as usize;
+        let g = mullion::spacefill::Gilbert::new(w, h);
+        // Hammering forward along the curve lands on its last index (the endpoint), not a corner.
+        for _ in 0..(total + 8) {
             app.on_key(KeyCode::Right);
             app.on_key(KeyCode::Down);
         }
-        assert_eq!(app.map_cur, (last_x, last_y));
-        // And back the other way, never below zero.
-        for _ in 0..64 {
+        assert_eq!(g.xy_to_d(app.map_cur.0, app.map_cur.1), Some(total as u32 - 1));
+        // And back the other way clamps at index 0 — the curve starts at the origin.
+        for _ in 0..(total + 8) {
             app.on_key(KeyCode::Left);
             app.on_key(KeyCode::Up);
         }
         assert_eq!(app.map_cur, (0, 0));
+
+        // A single step right advances exactly one cell along the curve.
+        app.on_key(KeyCode::Right);
+        assert_eq!(g.xy_to_d(app.map_cur.0, app.map_cur.1), Some(1));
+    }
+
+    #[test]
+    fn jump_zone_leaps_to_the_next_occupied_run() {
+        // Two occupied cells with a gap between them on the curve; `n` jumps to the run holding
+        // the second, `N` back to the first.
+        let range = Cidr::parse("10.87.3.0/24").unwrap();
+        let hosts = ["10.87.3.5", "10.87.3.200"]; // far apart → different cells/zones
+        let facts: Vec<AddressFacts> = hosts
+            .iter()
+            .map(|a| AddressFacts { addr: a.parse().unwrap(), netbox: None, ptr: Some("x.".into()), live: true })
+            .collect();
+        let mut app = App::new(range, facts, false, false, false, Config::default());
+        app.view = View::Map;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 50));
+        crate::tui::map::screen(&mut buf, &mut app);
+        let (w, h) = app.map_dims;
+        let grid = crate::map::MapGrid::build(app.range, &app.facts, w, h);
+        let occ_d = |app: &App| grid.xy_to_d(app.map_cur.0, app.map_cur.1).map(|d| grid.used[d as usize] > 0);
+
+        app.map_cur = (0, 0);
+        app.on_key(KeyCode::Char('n')); // → first occupied run
+        assert_eq!(occ_d(&app), Some(true), "n landed on an occupied cell");
+        let first = app.map_cur;
+        app.on_key(KeyCode::Char('n')); // → the next occupied run
+        assert_eq!(occ_d(&app), Some(true));
+        assert_ne!(app.map_cur, first, "n advanced to a different occupied zone");
     }
 
     #[test]
