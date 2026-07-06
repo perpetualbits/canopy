@@ -1,24 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026  Epsilon Null Operation
-//! The IP-map view: the range laid on a Hilbert curve as a grid of little squares,
-//! each a `/(prefix + 2·order)` block coloured by how full it is. Built from
-//! [`crate::map::MapGrid`] each frame (`O(facts)`), so a `/8` maps as cheaply as a
-//! `/24`. The legend labels the block structure — the covered CIDR and the per-cell
-//! subnet size — not linear x/y ticks, which a Hilbert layout has no use for.
+//! The IP-map view: the range laid on a **generalized-Hilbert (Gilbert) curve** as a grid of
+//! little cells that **fills the whole terminal rectangle** — any `width × height`, not just a
+//! square power of two — each cell a contiguous address slice coloured by how full it is. Built
+//! from [`crate::map::MapGrid`] each frame (`O(width·height + facts)`), so a `/8` maps as cheaply
+//! as a `/24`. The legend labels the grid structure — dimensions, per-cell address count, and the
+//! covered range — not linear x/y ticks, which a space-filling layout has no use for.
 //!
-//! Each cell **draws its segment of the actual Hilbert curve** with rounded box-drawing
+//! Each cell **draws its segment of the actual Gilbert curve** with rounded box-drawing
 //! glyphs (`─│╭╮╰╯`), so the serpentine path — which cell follows which — is visible rather
-//! than left to the imagination. Occupancy is the cell **background**, per
-//! [`DensityStyle`](super::app::DensityStyle):
+//! than left to the imagination (the grid dimensions are nudged to share parity so the curve
+//! is strictly continuous, an unbroken line). Occupancy is the cell **background**:
 //! - **Heatmap** (default) — a **logarithmic** ramp, near-black = empty → deep red = barely
 //!   used → white = full, with no blue; because almost every block is sparse, the log scale
 //!   spreads the low end across the reds/oranges and reserves white for a genuinely full block.
 //! - **Shade** — a monochrome grey ramp, for low-colour terminals.
 //!
-//! The curve line sits on top in a contrasting colour. `s` toggles the two styles. A
-//! highlighted cursor moves over the grid (`hjkl`); `Enter` zooms into the cell under it —
-//! always a clean subnet — and `Backspace` zooms back out, so a few steps take a `/8` down
-//! to a `/24` the table and tree resolve to single addresses.
+//! The curve line sits on top in a contrasting colour. `s`/`p` cycle the schemes. A highlighted
+//! cursor moves over the grid (`hjkl`); `Enter` zooms into the exact address slice under it —
+//! a clean subnet when the geometry is a power of two, else a ragged range — and `Backspace`
+//! zooms back out, so a few steps take a `/8` down to where the table and tree resolve to
+//! single addresses.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -31,7 +33,7 @@ use super::draw::{btxt, keyhints};
 use super::palette::{Knobs, Scheme, KNOBS};
 use super::theme::{s_accent, s_dim, s_sel, s_title};
 use crate::map::MapGrid;
-use crate::reconcile::{self, AddressFacts, Cidr, Subnet};
+use crate::reconcile::{self, AddrRange, AddressFacts, Subnet};
 
 /// A grid direction from one cell to an adjacent one.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -95,15 +97,48 @@ fn paint_cell(buf: &mut Buffer, x: u16, y: u16, bg: Color, fg: Color, selected: 
     buf.set_char(x + 1, y, if connects_right { '─' } else { ' ' }, cell);
 }
 
-/// The largest Hilbert order whose `2^order × 2^order` grid of 2-wide cells fits in
-/// `body` — `floor(log2(min(width/2, height)))`.
-fn fit_order(body: Rect) -> u32 {
-    let side_max = (body.width / 2).min(body.height);
-    if side_max < 1 {
-        0
+/// Choose the Gilbert grid `(width, height)` for `body`, in cells (each cell is two columns
+/// wide, one row tall). The grid **fills** the drawable rectangle, but never asks for more
+/// cells than the range has addresses (`block_len`): a large range uses the whole screen at
+/// a coarse resolution; a small range shrinks to a power-of-two rectangle so each cell is a
+/// clean single sub-block. The two dimensions are nudged to share parity so the Gilbert
+/// curve is strictly 4-continuous — an unbroken line (see `mullion::spacefill::strictly_continuous`).
+fn fit_dims(body: Rect, block_len: u128) -> (u32, u32) {
+    let w_max = u32::from(body.width / 2).max(1);
+    let h_max = u32::from(body.height).max(1);
+    let area = u128::from(w_max) * u128::from(h_max);
+
+    let (mut w, mut h) = if block_len >= area {
+        // More addresses than cells: fill the whole rectangle (cells become ragged slices).
+        (w_max, h_max)
     } else {
-        u32::BITS - 1 - u32::from(side_max).leading_zeros()
+        // Fewer addresses than the screen holds: block_len is a power of two, so pick the
+        // largest power-of-two rectangle (2^a × 2^b) that fits — this keeps each cell a
+        // clean, aligned sub-block. Prefer a wider grid to use horizontal space.
+        let k = (block_len as u64).trailing_zeros();
+        let mut best = (1u32, 1u32);
+        'outer: for m in (0..=k).rev() {
+            for a in (0..=m).rev() {
+                let (ww, hh) = (1u64 << a, 1u64 << (m - a));
+                if ww <= u64::from(w_max) && hh <= u64::from(h_max) {
+                    best = (ww as u32, hh as u32);
+                    break 'outer;
+                }
+            }
+        }
+        best
+    };
+
+    // A strictly-continuous curve (a clean, unbroken line) needs the dimensions to share
+    // parity; if they differ, trim one cell off the larger axis.
+    if (w + h) % 2 != 0 {
+        if h > 1 {
+            h -= 1;
+        } else if w > 1 {
+            w -= 1;
+        }
     }
+    (w.max(1), h.max(1))
 }
 
 /// Draw the palette key at `(x, y)`: the scheme name, an `empty → full` swatch strip
@@ -127,7 +162,7 @@ fn draw_legend_key(buf: &mut Buffer, x: u16, y: u16, scheme: Scheme, knobs: &Kno
 /// A short, comma-separated list of the hostnames inside `sub` — what lives in the
 /// block under the cursor. Shows up to `max` names, then `+N` for the rest; `—` when
 /// the block is empty. Names come from the reconciled facts (PTR or NetBox name).
-fn names_in(facts: &HashMap<IpAddr, AddressFacts>, sub: Cidr, max: usize) -> String {
+fn names_in(facts: &HashMap<IpAddr, AddressFacts>, sub: AddrRange, max: usize) -> String {
     let mut names: Vec<String> = facts
         .values()
         .filter(|f| sub.contains(f.addr))
@@ -158,7 +193,7 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
     }
 
     // ── frame (title + data badge in the border) ──
-    let title = format!("canopy — map: {}/{}", app.range.base, app.range.prefix_len);
+    let title = format!("canopy — map: {}", app.range.label());
     let prog = app.progress.as_ref().map(|(f, l)| (*f, l.as_str()));
     let area = super::draw::frame(buf, full, &title, s_title(), Some(super::draw::data_badge(app)), prog, &app.heartbeat());
 
@@ -170,45 +205,41 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
     let foot_y = area.y + area.height - 1;
     let body = Rect::new(area.x, area.y + 3, area.width, area.height.saturating_sub(4));
 
-    let grid = MapGrid::build(app.range, &app.facts, fit_order(body));
-    let side = grid.side();
+    let (gw, gh) = fit_dims(body, app.range.block_len());
+    let grid = MapGrid::build(app.range, &app.facts, gw, gh);
     let used_total: u32 = grid.used.iter().sum();
-    let cell_prefix = app.range.prefix_len + 2 * grid.order as u8;
 
-    // Sync the app's cursor state to this frame's grid: the order sets what `Enter`
-    // zooms into, and a shrunk terminal may need the cursor clamped back in-bounds.
-    app.map_order = grid.order;
-    let last = (side as u32).saturating_sub(1);
-    app.map_cur = (app.map_cur.0.min(last), app.map_cur.1.min(last));
+    // Sync the app's cursor state to this frame's grid: the dims set what `Enter` zooms
+    // into, and a shrunk terminal may need the cursor clamped back in-bounds.
+    app.map_dims = (grid.width, grid.height);
+    app.map_cur = (app.map_cur.0.min(grid.width.saturating_sub(1)), app.map_cur.1.min(grid.height.saturating_sub(1)));
 
-    // Row 0 — block structure + density key (Hilbert has no meaningful linear x/y axis).
+    // Row 0 — grid structure + density key (a Gilbert curve has no meaningful linear axis).
+    let cell_addrs = grid.range.block_len() / grid.cells().max(1) as u128;
     let head = format!(
-        "Hilbert · {side}×{side} · cell = /{cell_prefix} ({} addrs) · {used_total} used / {} total   ",
-        grid.block,
+        "Gilbert · {gw}×{gh} · cell ≈ {cell_addrs} addrs · {used_total} used / {} total   ",
         grid.range.block_len()
     );
     btxt(buf, area.x, legend_y, &head, s_dim());
     draw_legend_key(buf, area.x + head.chars().count() as u16, legend_y, app.scheme, &app.knobs, app.active_knob);
 
-    // Rows 1–2 — the block under the cursor (CIDR, span, occupancy, hostnames) and the
-    // scope breadcrumb + real NetBox subnet. When the grid is one cell, that block is the
-    // whole current scope.
-    let zoomable = app.cursor_subnet().is_some();
-    let (cell, used, block) = match app.cursor_subnet() {
-        Some(sub) => {
-            let d = crate::map::hilbert_xy2d(grid.order, app.map_cur.0, app.map_cur.1) as usize;
-            (sub, grid.used.get(d).copied().unwrap_or(0), grid.block)
-        }
-        None => (app.range, used_total, grid.range.block_len()),
+    // Rows 1–2 — the slice under the cursor (its range, occupancy, hostnames) and the scope
+    // breadcrumb + real NetBox subnet. When the grid is one cell, that slice is the whole
+    // current scope.
+    let cursor_d = grid.xy_to_d(app.map_cur.0, app.map_cur.1);
+    let zoomable = cursor_d.is_some() && grid.cells() > 1;
+    let (cell, used) = match cursor_d {
+        Some(d) => (grid.cell_range(d as usize), grid.used.get(d as usize).copied().unwrap_or(0)),
+        None => (app.range, used_total),
     };
-    // For a sparse (huge) block the "/block" denominator is astronomically large and
-    // unhelpful, so show just the used count; for an enumerable block show used/total.
+    // For a sparse (huge) slice the "/block" denominator is astronomically large and
+    // unhelpful, so show just the used count; for an enumerable slice show used/total.
+    let block = cell.block_len();
     let occ = if cell.is_enumerable() { format!("{used}/{block} used") } else { format!("{used} used") };
     let info = format!(
-        "▸ {}/{}   {} – {}   {occ}   {}",
-        cell.base,
-        cell.prefix_len,
-        cell.base,
+        "▸ {}   {} – {}   {occ}   {}",
+        cell.label(),
+        cell.base(),
         cell.last(),
         names_in(&app.facts, cell, 3),
     );
@@ -217,10 +248,10 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
     let crumb = app
         .scope_chain()
         .iter()
-        .map(|c| format!("{}/{}", c.base, c.prefix_len))
+        .map(|c| c.label())
         .collect::<Vec<_>>()
         .join(" › ");
-    let subnet_txt = match Subnet::most_specific(&app.subnets, cell.base) {
+    let subnet_txt = match Subnet::most_specific(&app.subnets, cell.base()) {
         Some(s) if !s.name.is_empty() => format!("   ·   subnet: {}/{} ({})", s.cidr.base, s.cidr.prefix_len, s.name),
         Some(s) => format!("   ·   subnet: {}/{}", s.cidr.base, s.cidr.prefix_len),
         None => String::new(),
@@ -229,11 +260,11 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
         buf,
         area.x,
         scope_y,
-        &clip(&format!("scope: {crumb}{subnet_txt}   ·   the line is the Hilbert curve · bg = occupancy"), area.width),
+        &clip(&format!("scope: {crumb}{subnet_txt}   ·   the line is the Gilbert curve · bg = occupancy"), area.width),
         s_dim(),
     );
 
-    // The Hilbert grid: each cell draws its segment of the actual curve (rounded box glyphs)
+    // The Gilbert grid: each cell draws its segment of the actual curve (rounded box glyphs)
     // over a background coloured by occupancy, so the serpentine path is visible directly.
     let total = grid.cells();
     for d in 0..total {

@@ -21,7 +21,7 @@ use crate::config::Config;
 use crate::graph::DnsGraph;
 use crate::live::{self, LiveData};
 use crate::plan::{Allocation, Plan};
-use crate::reconcile::{self, AddressFacts, AddressRow, AddressStatus, Cidr, Counts, Subnet};
+use crate::reconcile::{self, AddrRange, AddressFacts, AddressRow, AddressStatus, Cidr, Counts, Subnet};
 use crate::sources::Vantage;
 
 /// The result the live-gather thread sends back.
@@ -41,7 +41,7 @@ pub enum AllocPhase {
 
 /// A saved map scope for zoom-out: a range and the facts within it.
 struct ZoomFrame {
-    range: Cidr,
+    range: AddrRange,
     facts: Rc<HashMap<IpAddr, AddressFacts>>,
 }
 
@@ -105,8 +105,9 @@ pub enum Link {
 
 /// The whole application state.
 pub struct App {
-    /// The range being browsed.
-    pub range: Cidr,
+    /// The range being browsed. A CIDR at the top level; a map zoom can narrow it to a
+    /// ragged [`AddrRange`] slice with no single prefix.
+    pub range: AddrRange,
     /// Number of usable host addresses in `range` — the table's row count. A `/8` is
     /// 16M, so rows are computed on demand ([`row_at`](App::row_at)), never stored.
     pub total: usize,
@@ -137,11 +138,11 @@ pub struct App {
     pub tree_cur: usize,
     /// Group keys currently expanded in the tree view.
     pub tree_expanded: HashSet<String>,
-    /// Cursor cell `(x, y)` on the Hilbert map grid.
+    /// Cursor cell `(x, y)` on the Gilbert map grid.
     pub map_cur: (u32, u32),
-    /// The map grid order measured at the last map render — used to clamp the cursor
-    /// and to compute which subnet a cell covers (the render owns the fit).
-    pub map_order: u32,
+    /// The map grid `(width, height)` measured at the last map render — used to clamp the
+    /// cursor and to compute which slice a cell covers (the render owns the fit).
+    pub map_dims: (u32, u32),
     /// Parent scopes to return to on zoom-out (each a range + its facts).
     zoom_stack: Vec<ZoomFrame>,
     /// How the map colours cells by occupancy.
@@ -193,6 +194,9 @@ impl App {
     /// (bounded) and the row count are kept.
     #[must_use]
     pub fn new(range: Cidr, facts: Vec<AddressFacts>, write_mode: bool, dry_run: bool, live: bool, cfg: Config) -> Self {
+        // The survey scope arrives as a CIDR; internally the browse scope is a general
+        // address range so a map zoom can narrow it to a ragged slice.
+        let range = AddrRange::from(range);
         let total = range.host_count().min(usize::MAX as u128) as usize;
         let facts: Rc<HashMap<IpAddr, AddressFacts>> =
             Rc::new(facts.into_iter().map(|f| (f.addr, f)).collect());
@@ -214,7 +218,7 @@ impl App {
             tree_cur: 0,
             tree_expanded: HashSet::new(),
             map_cur: (0, 0),
-            map_order: 0,
+            map_dims: (0, 0),
             zoom_stack: Vec::new(),
             scheme: Scheme::default(),
             knobs: Knobs::default(),
@@ -265,10 +269,16 @@ impl App {
         if self.loading {
             return;
         }
+        // Live gathering probes the scope by AXFR / reverse zone — a CIDR-shaped operation.
+        // A map zoom into a ragged slice has no prefix to probe, so refuse until zoomed to a
+        // clean CIDR (zoom out, or onto an aligned cell).
+        let Some(range) = self.range.as_cidr() else {
+            self.status = Some(("live refresh needs a CIDR-aligned scope — zoom out first".to_string(), true));
+            return;
+        };
         let (tx, rx) = mpsc::channel();
         let (ptx, prx) = mpsc::channel(); // progress updates
         let cfg = self.cfg.clone();
-        let range = self.range;
         std::thread::spawn(move || {
             let progress = |frac: f32, label: &str| {
                 let _ = ptx.send((frac, label.to_string()));
@@ -490,7 +500,13 @@ impl App {
             self.status = Some(("type a name first".to_string(), true));
             return;
         }
-        let alloc = Allocation { addr, prefix_len: self.range.prefix_len, fqdn };
+        // A NetBox allocation carries the host's containing prefix. A ragged map-zoom slice
+        // has none, so writes are only offered on a CIDR-aligned scope.
+        let Some(prefix_len) = self.range.as_cidr().map(|c| c.prefix_len) else {
+            self.status = Some(("allocation needs a CIDR-aligned scope — zoom out first".to_string(), true));
+            return;
+        };
+        let alloc = Allocation { addr, prefix_len, fqdn };
         // The plan only needs the target address's current row for its free-check.
         let target = self
             .facts
@@ -602,10 +618,10 @@ impl App {
         }
     }
 
-    /// Keys for the map view: move the cursor over the Hilbert grid, `Enter` zooms
-    /// into the highlighted cell (a clean subnet), `Backspace`/`-` zooms back out.
+    /// Keys for the map view: move the cursor over the Gilbert grid, `Enter` zooms
+    /// into the highlighted cell (its exact address slice), `Backspace`/`-` zooms back out.
     fn on_key_map(&mut self, code: KeyCode) {
-        let last = (1u32 << self.map_order).saturating_sub(1);
+        let (last_x, last_y) = (self.map_dims.0.saturating_sub(1), self.map_dims.1.saturating_sub(1));
         match code {
             KeyCode::Char('q') => self.quit = true,
             // Esc zooms out if zoomed in, otherwise quits.
@@ -617,9 +633,9 @@ impl App {
                 }
             }
             KeyCode::Left | KeyCode::Char('h') => self.map_cur.0 = self.map_cur.0.saturating_sub(1),
-            KeyCode::Right | KeyCode::Char('l') => self.map_cur.0 = (self.map_cur.0 + 1).min(last),
+            KeyCode::Right | KeyCode::Char('l') => self.map_cur.0 = (self.map_cur.0 + 1).min(last_x),
             KeyCode::Up | KeyCode::Char('k') => self.map_cur.1 = self.map_cur.1.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => self.map_cur.1 = (self.map_cur.1 + 1).min(last),
+            KeyCode::Down | KeyCode::Char('j') => self.map_cur.1 = (self.map_cur.1 + 1).min(last_y),
             KeyCode::Enter | KeyCode::Char('+') => self.zoom_into_cursor(),
             KeyCode::Backspace | KeyCode::Char('-') => self.zoom_out(),
             KeyCode::Char('s') | KeyCode::Char('p') => self.scheme = self.scheme.cycle(),
@@ -637,27 +653,29 @@ impl App {
     /// zoom breadcrumb. The first entry is where you started; the last is the current
     /// scope. Each parent came from a `ZoomFrame` pushed on the way in.
     #[must_use]
-    pub fn scope_chain(&self) -> Vec<Cidr> {
-        let mut chain: Vec<Cidr> = self.zoom_stack.iter().map(|f| f.range).collect();
+    pub fn scope_chain(&self) -> Vec<AddrRange> {
+        let mut chain: Vec<AddrRange> = self.zoom_stack.iter().map(|f| f.range).collect();
         chain.push(self.range);
         chain
     }
 
-    /// The subnet the map cursor sits over — the block that cell covers, a
-    /// `/(prefix + 2·order)` CIDR. `None` when the grid is a single cell (order 0),
-    /// i.e. nothing finer to zoom into.
+    /// The address slice the map cursor sits over — the contiguous run that cell covers on
+    /// the Gilbert curve. `None` when the grid is a single cell, i.e. nothing finer to zoom
+    /// into. The slice is a clean CIDR when the geometry is a power of two, else ragged.
     #[must_use]
-    pub fn cursor_subnet(&self) -> Option<Cidr> {
-        if self.map_order == 0 {
+    pub fn cursor_range(&self) -> Option<AddrRange> {
+        let (w, h) = self.map_dims;
+        let cells = u128::from(w) * u128::from(h);
+        if cells <= 1 {
             return None;
         }
-        let d = crate::map::hilbert_xy2d(self.map_order, self.map_cur.0, self.map_cur.1);
-        Some(crate::map::block_cidr(self.range, self.map_order, d))
+        let d = mullion::spacefill::Gilbert::new(w, h).xy_to_d(self.map_cur.0, self.map_cur.1)?;
+        Some(self.range.nth_slice(cells, u128::from(d)))
     }
 
-    /// Zoom into the cell under the cursor, if there is a finer subnet.
+    /// Zoom into the cell under the cursor, if there is a finer slice.
     fn zoom_into_cursor(&mut self) {
-        if let Some(sub) = self.cursor_subnet() {
+        if let Some(sub) = self.cursor_range() {
             self.zoom_stack.push(ZoomFrame { range: self.range, facts: Rc::clone(&self.facts) });
             let sub_facts: HashMap<IpAddr, AddressFacts> = self
                 .facts
@@ -666,7 +684,7 @@ impl App {
                 .map(|(a, f)| (*a, f.clone()))
                 .collect();
             self.set_scope(sub, Rc::new(sub_facts));
-            self.status = Some((format!("zoomed into {}/{}", sub.base, sub.prefix_len), false));
+            self.status = Some((format!("zoomed into {}", sub.label()), false));
         }
     }
 
@@ -674,13 +692,13 @@ impl App {
     fn zoom_out(&mut self) {
         if let Some(f) = self.zoom_stack.pop() {
             self.set_scope(f.range, f.facts);
-            self.status = Some((format!("zoomed out to {}/{}", self.range.base, self.range.prefix_len), false));
+            self.status = Some((format!("zoomed out to {}", self.range.label()), false));
         }
     }
 
     /// Point the whole app at `range` with `facts` (already narrowed to it), rebuilding
     /// every derived view. Used by both zoom directions so all four views stay in sync.
-    fn set_scope(&mut self, range: Cidr, facts: Rc<HashMap<IpAddr, AddressFacts>>) {
+    fn set_scope(&mut self, range: AddrRange, facts: Rc<HashMap<IpAddr, AddressFacts>>) {
         self.range = range;
         self.total = range.host_count().min(usize::MAX as u128) as usize;
         self.counts = reconcile::counts_from_facts(range.host_count(), &facts);
@@ -1215,32 +1233,34 @@ mod tests {
         }];
         let mut app = App::new(range, facts, false, false, false, Config::default());
         app.view = View::Map;
-        // Render once so map_order is set from the fitted grid.
+        // Render once so map_dims is set from the fitted grid.
         let mut buf = Buffer::empty(Rect::new(0, 0, 120, 50));
         crate::tui::map::screen(&mut buf, &mut app);
-        assert!(app.map_order > 0);
+        let (w, h) = app.map_dims;
+        assert!(w > 0 && h > 0);
         let parent_total = app.total;
+        let top = AddrRange::from(range);
 
-        // Move the cursor onto the cell that actually holds the host, then zoom in.
+        // Move the cursor onto the cell whose slice actually holds the host, then zoom in.
         let host: IpAddr = "10.1.0.5".parse().unwrap();
-        let off = range.offset_of(host).unwrap();
-        let block = range.block_len() >> (2 * app.map_order);
-        app.map_cur = crate::map::hilbert_d2xy(app.map_order, (off / block) as u64);
-        let target = app.cursor_subnet().unwrap();
+        let grid = crate::map::MapGrid::build(app.range, &HashMap::new(), w, h);
+        let d = (0..grid.cells()).find(|&d| grid.cell_range(d).contains(host)).unwrap();
+        app.map_cur = grid.cell_xy(d);
+        let target = app.cursor_range().unwrap();
         assert!(target.contains(host));
         app.on_key(KeyCode::Enter);
         assert_eq!(app.range, target);
-        assert_eq!(app.scope_chain(), vec![range, target]); // parent › current
+        assert_eq!(app.scope_chain(), vec![top, target]); // parent › current
         assert!(app.total < parent_total);
-        // The one host survived the narrowing (it lies inside the zoomed subnet).
+        // The one host survived the narrowing (it lies inside the zoomed slice).
         assert_eq!(app.counts.dns_only, 1);
         assert_eq!(app.map_cur, (0, 0)); // cursor reset on scope change
 
         // Zoom back out restores the /8 and its full facts.
         app.on_key(KeyCode::Backspace);
-        assert_eq!(app.range, range);
+        assert_eq!(app.range, top);
         assert_eq!(app.total, parent_total);
-        assert_eq!(app.scope_chain(), vec![range]); // back to just the top scope
+        assert_eq!(app.scope_chain(), vec![top]); // back to just the top scope
     }
 
     #[test]
@@ -1285,13 +1305,13 @@ mod tests {
         app.view = View::Map;
         let mut buf = Buffer::empty(Rect::new(0, 0, 120, 50));
         crate::tui::map::screen(&mut buf, &mut app);
-        let last = (1u32 << app.map_order) - 1;
+        let (last_x, last_y) = (app.map_dims.0 - 1, app.map_dims.1 - 1);
         // Hammer right/down past the edge — the cursor must stay in-bounds.
         for _ in 0..64 {
             app.on_key(KeyCode::Right);
             app.on_key(KeyCode::Down);
         }
-        assert_eq!(app.map_cur, (last, last));
+        assert_eq!(app.map_cur, (last_x, last_y));
         // And back the other way, never below zero.
         for _ in 0..64 {
             app.on_key(KeyCode::Left);

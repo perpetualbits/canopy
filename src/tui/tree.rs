@@ -68,7 +68,7 @@ pub fn rows(app: &App) -> Vec<TreeRowView> {
     let mut out = Vec::new();
     out.push(TreeRowView {
         depth: 0,
-        label: format!("{}/{}", app.range.base, app.range.prefix_len),
+        label: app.range.label(),
         detail: format!("{} free / {} total", app.counts.free, app.total),
         is_group: true,
         expanded: true,
@@ -133,7 +133,7 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
     }
 
     // ── frame + header ──
-    let title = format!("canopy — tree: {}/{}", app.range.base, app.range.prefix_len);
+    let title = format!("canopy — tree: {}", app.range.label());
     let prog = app.progress.as_ref().map(|(f, l)| (*f, l.as_str()));
     let area = super::draw::frame(buf, full, &title, s_title(), Some(super::draw::data_badge(app)), prog, &app.heartbeat());
     btxt(buf, area.x, area.y, "network → cluster → host", s_dim());

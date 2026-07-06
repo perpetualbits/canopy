@@ -146,11 +146,11 @@ pub fn row_from_facts(facts: &AddressFacts) -> AddressRow {
 /// The reconciled row for the address at `index` in `range`, looked up in `facts`.
 ///
 /// This is the lazy, `O(1)` core of pagination: the address is computed by
-/// arithmetic ([`Cidr::host_at`]) and classified from the (bounded) fact map, so a
+/// arithmetic ([`AddrRange::host_at`]) and classified from the (bounded) fact map, so a
 /// caller can render just the visible window of a `/8` without building 16M rows.
 /// An address absent from `facts` is `Free`.
 #[must_use]
-pub fn reconcile_at(range: Cidr, facts: &HashMap<IpAddr, AddressFacts>, index: u128) -> AddressRow {
+pub fn reconcile_at(range: AddrRange, facts: &HashMap<IpAddr, AddressFacts>, index: u128) -> AddressRow {
     let addr = range.host_at(index);
     match facts.get(&addr) {
         Some(f) => row_from_facts(f),
@@ -363,12 +363,6 @@ impl Cidr {
         self.to_addr(self.value() & self.mask())
     }
 
-    /// The last address of the block (network with all host bits set).
-    #[must_use]
-    pub fn last(self) -> IpAddr {
-        self.to_addr((self.value() & self.mask()) | self.hostmask())
-    }
-
     /// Whether `ip` lies inside this block. A mismatched address family is never inside.
     #[must_use]
     pub fn contains(self, ip: IpAddr) -> bool {
@@ -394,29 +388,6 @@ impl Cidr {
         } else {
             1u128 << hb
         }
-    }
-
-    /// The offset of `addr` within the block (`addr − network`), or `None` if `addr` is
-    /// outside the block (including a mismatched family).
-    #[must_use]
-    pub fn offset_of(self, addr: IpAddr) -> Option<u128> {
-        if !self.contains(addr) {
-            return None;
-        }
-        let v = match addr {
-            IpAddr::V4(a) => u128::from(u32::from(a)),
-            IpAddr::V6(a) => u128::from(a),
-        };
-        Some(v - (self.value() & self.mask()))
-    }
-
-    /// The address at `offset` within the block (`network + offset`), clamped to the last
-    /// address of the block.
-    #[must_use]
-    pub fn address_at_offset(self, offset: u128) -> IpAddr {
-        let net = self.value() & self.mask();
-        let last = net | self.hostmask();
-        self.to_addr(net.saturating_add(offset).min(last))
     }
 
     /// The inclusive `(first, last)` usable-host address bounds, as `u128`.
@@ -463,21 +434,6 @@ impl Cidr {
         self.to_addr(s.saturating_add(index).min(e))
     }
 
-    /// The 0-based host index of `addr`, or `None` if it is not a usable host of the
-    /// block — the inverse of [`host_at`](Cidr::host_at).
-    #[must_use]
-    pub fn host_index(self, addr: IpAddr) -> Option<u128> {
-        if addr.is_ipv6() != self.is_v6() {
-            return None;
-        }
-        let (s, e) = self.host_bounds();
-        let a = match addr {
-            IpAddr::V4(x) => u128::from(u32::from(x)),
-            IpAddr::V6(x) => u128::from(x),
-        };
-        (a >= s && a <= e).then_some(a - s)
-    }
-
     /// Iterate the usable host addresses of the block.
     ///
     /// **Only call this on an [enumerable](Cidr::is_enumerable) block** — a large IPv6
@@ -487,6 +443,199 @@ impl Cidr {
     pub fn hosts(self) -> impl Iterator<Item = IpAddr> {
         let (start, end) = self.host_bounds();
         (start..=end).map(move |v| self.to_addr(v))
+    }
+}
+
+/// The `u128` value of an address (IPv4 in the low 32 bits).
+fn addr_value(addr: IpAddr) -> u128 {
+    match addr {
+        IpAddr::V4(a) => u128::from(u32::from(a)),
+        IpAddr::V6(a) => u128::from(a),
+    }
+}
+
+/// A contiguous run of addresses `[first, first + len)` within one address family — the
+/// generalization of [`Cidr`] that the map's zoom needs. A [`Cidr`] is exactly the case
+/// where `len` is a power of two and `first` is aligned to it; a Gilbert map cell is
+/// usually a **ragged** slice that is neither, so it carries no single prefix length.
+///
+/// Where an operation genuinely needs a CIDR — a NetBox allocation prefix, a live AXFR
+/// probe — gate on [`as_cidr`](AddrRange::as_cidr) (which is `Some` only for an aligned
+/// run). Everything else — containment, host enumeration, occupancy bucketing — works over
+/// the raw run, so the same call sites serve a whole `/24` and a ragged mid-curve slice.
+///
+/// Host semantics match [`Cidr`] wherever the run *is* a CIDR (an IPv4 `/24` still hides
+/// its network/broadcast in the table), and enumerate every address of the run when it is
+/// not (a ragged slice has no network or broadcast to hide).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AddrRange {
+    /// First address value (IPv4 in the low 32 bits).
+    first: u128,
+    /// Number of addresses in the run (`≥ 1`); `u128::MAX` stands in for a v6 `/0`.
+    len: u128,
+    /// IPv6 family — needed to rebuild addresses and to size the family width.
+    v6: bool,
+}
+
+impl From<Cidr> for AddrRange {
+    fn from(c: Cidr) -> Self {
+        AddrRange { first: c.value() & c.mask(), len: c.block_len(), v6: c.is_v6() }
+    }
+}
+
+impl AddrRange {
+    /// The address width in bits — 32 for IPv4, 128 for IPv6.
+    fn width(self) -> u32 {
+        if self.v6 {
+            128
+        } else {
+            32
+        }
+    }
+
+    /// Rebuild an address of this run's family from a `u128` value.
+    fn to_addr(self, v: u128) -> IpAddr {
+        if self.v6 {
+            IpAddr::V6(Ipv6Addr::from(v))
+        } else {
+            IpAddr::V4(Ipv4Addr::from(v as u32))
+        }
+    }
+
+    /// The first address of the run (its "network" analogue for labelling).
+    #[must_use]
+    pub fn base(self) -> IpAddr {
+        self.to_addr(self.first)
+    }
+
+    /// The last address of the run.
+    #[must_use]
+    pub fn last(self) -> IpAddr {
+        self.to_addr(self.first.saturating_add(self.len - 1))
+    }
+
+    /// The number of addresses in the run — the map's addressing space (mirrors
+    /// [`Cidr::block_len`]).
+    #[must_use]
+    pub fn block_len(self) -> u128 {
+        self.len
+    }
+
+    /// Whether `ip` lies in the run. A mismatched address family is never inside.
+    #[must_use]
+    pub fn contains(self, ip: IpAddr) -> bool {
+        if ip.is_ipv6() != self.v6 {
+            return false;
+        }
+        let v = addr_value(ip);
+        v >= self.first && v.saturating_sub(self.first) < self.len
+    }
+
+    /// The offset of `addr` within the run (`addr − first`), or `None` if outside it.
+    #[must_use]
+    pub fn offset_of(self, addr: IpAddr) -> Option<u128> {
+        self.contains(addr).then(|| addr_value(addr) - self.first)
+    }
+
+    /// The CIDR this run *is*, or `None` when it is a ragged slice with no single prefix.
+    /// `Some` iff `len` is a power of two, `first` is aligned to it, and it fits the family.
+    #[must_use]
+    pub fn as_cidr(self) -> Option<Cidr> {
+        // A v6 `/0` has `len == u128::MAX` (its 2^128 does not fit); treat it specially.
+        if self.v6 && self.len == u128::MAX && self.first == 0 {
+            return Some(Cidr { base: self.to_addr(0), prefix_len: 0 });
+        }
+        if !self.len.is_power_of_two() || self.first & (self.len - 1) != 0 {
+            return None;
+        }
+        let host_bits = self.len.trailing_zeros();
+        (host_bits <= self.width()).then(|| Cidr {
+            base: self.to_addr(self.first),
+            prefix_len: (self.width() - host_bits) as u8,
+        })
+    }
+
+    /// A short label: the `base/prefix` CIDR when the run is aligned, else `first – last`.
+    #[must_use]
+    pub fn label(self) -> String {
+        match self.as_cidr() {
+            Some(c) => format!("{}/{}", c.base, c.prefix_len),
+            None => format!("{} – {}", self.base(), self.last()),
+        }
+    }
+
+    /// The inclusive `(first, last)` **host** bounds as `u128`. When the run is a CIDR its
+    /// host rules apply (IPv4 hides network/broadcast); a ragged slice has neither, so
+    /// every address of the run is a host.
+    fn host_bounds(self) -> (u128, u128) {
+        match self.as_cidr() {
+            Some(c) => c.host_bounds(),
+            None => (self.first, self.first.saturating_add(self.len - 1)),
+        }
+    }
+
+    /// How many usable host addresses the run has (mirrors [`Cidr::host_count`]).
+    #[must_use]
+    pub fn host_count(self) -> u128 {
+        let (s, e) = self.host_bounds();
+        (e - s).saturating_add(1)
+    }
+
+    /// Whether the run is small enough to list every address (≤ [`ENUMERATION_CAP`]).
+    #[must_use]
+    pub fn is_enumerable(self) -> bool {
+        self.host_count() <= ENUMERATION_CAP
+    }
+
+    /// The `index`-th usable host address (0-based), clamped to the last host.
+    #[must_use]
+    pub fn host_at(self, index: u128) -> IpAddr {
+        let (s, e) = self.host_bounds();
+        self.to_addr(s.saturating_add(index).min(e))
+    }
+
+    /// The 0-based host index of `addr`, or `None` if it is not a host of the run.
+    #[must_use]
+    pub fn host_index(self, addr: IpAddr) -> Option<u128> {
+        if addr.is_ipv6() != self.v6 {
+            return None;
+        }
+        let (s, e) = self.host_bounds();
+        let a = addr_value(addr);
+        (a >= s && a <= e).then_some(a - s)
+    }
+
+    /// Split the run into `n` near-equal contiguous slices and return slice `d`
+    /// (`0 ≤ d < n`, `n ≥ 1`, `n ≤ len`) — the address range of one map cell. The first
+    /// `len % n` slices are one address larger, so the slices exactly tile the run with
+    /// no gap or overlap. Overflow-safe for a full IPv6 range: the multiply `d · block`
+    /// never exceeds `len`. Paired with [`slice_index`](AddrRange::slice_index), its
+    /// inverse.
+    #[must_use]
+    pub fn nth_slice(self, n: u128, d: u128) -> AddrRange {
+        let n = n.max(1);
+        let block = self.len / n;
+        let rem = self.len % n;
+        let lo = d.min(n) * block + d.min(rem); // ≤ len, no overflow
+        let size = block + u128::from(d < rem);
+        AddrRange { first: self.first + lo, len: size.max(1), v6: self.v6 }
+    }
+
+    /// Which of the `n` slices (see [`nth_slice`](AddrRange::nth_slice)) an in-run
+    /// `offset` falls into — the exact inverse used to bucket a known address into its
+    /// map cell. `offset` is `0..len`; the result is `0..n`.
+    #[must_use]
+    pub fn slice_index(self, n: u128, offset: u128) -> u128 {
+        let n = n.max(1);
+        let block = (self.len / n).max(1);
+        let rem = self.len % n;
+        let split = rem * (block + 1); // addresses covered by the larger leading slices
+        let d = if offset < split {
+            offset / (block + 1)
+        } else {
+            rem + (offset - split) / block
+        };
+        d.min(n - 1)
     }
 }
 
@@ -515,8 +664,6 @@ mod tests {
         assert_eq!(c.host_count(), 4); // IPv6 keeps the network/all-ones addresses
         assert_eq!(c.host_at(0), "2001:db8::".parse::<IpAddr>().unwrap());
         assert_eq!(c.host_at(3), "2001:db8::3".parse::<IpAddr>().unwrap());
-        assert_eq!(c.last(), "2001:db8::3".parse::<IpAddr>().unwrap());
-        assert_eq!(c.host_index("2001:db8::2".parse().unwrap()), Some(2));
     }
 
     #[test]
@@ -646,8 +793,6 @@ mod tests {
         assert_eq!(c24.host_count() as usize, c24.hosts().count());
         assert_eq!(c24.host_at(0), "10.87.3.1".parse::<IpAddr>().unwrap());
         assert_eq!(c24.host_at(67), "10.87.3.68".parse::<IpAddr>().unwrap());
-        assert_eq!(c24.host_index("10.87.3.68".parse().unwrap()), Some(67));
-        assert_eq!(c24.host_index("10.87.4.1".parse().unwrap()), None); // outside
 
         // A /8 is sized and addressed by arithmetic — no iteration.
         let c8 = Cidr::parse("10.0.0.0/8").unwrap();
@@ -668,7 +813,7 @@ mod tests {
         let full = reconcile(range, &f);
         // reconcile_at(i) reproduces the full pass, address by address.
         for i in 0..range.host_count() {
-            assert_eq!(reconcile_at(range, &map, i), full[i as usize]);
+            assert_eq!(reconcile_at(range.into(), &map, i), full[i as usize]);
         }
         // And counts_from_facts matches the full pass — without enumerating it.
         let mut expected = Counts::default();
@@ -676,5 +821,54 @@ mod tests {
             tally(&mut expected, r.status);
         }
         assert_eq!(counts_from_facts(range.host_count(), &map), expected);
+    }
+
+    // ── AddrRange: the general scope the map zoom narrows to ──
+
+    #[test]
+    fn addr_range_from_cidr_mirrors_host_arithmetic() {
+        // AddrRange delegates to Cidr host rules when it *is* a CIDR: an IPv4 /24 still hides
+        // its network/broadcast, and a v6 /126 keeps every address.
+        let r = AddrRange::from(Cidr::parse("10.87.3.0/24").unwrap());
+        assert_eq!(r.host_count(), 254);
+        assert_eq!(r.host_at(0), "10.87.3.1".parse::<IpAddr>().unwrap());
+        assert_eq!(r.host_index("10.87.3.68".parse().unwrap()), Some(67));
+        assert_eq!(r.host_index("10.87.4.1".parse().unwrap()), None);
+        assert_eq!(r.last(), "10.87.3.255".parse::<IpAddr>().unwrap()); // full block, broadcast
+        let v6 = AddrRange::from(Cidr::parse("2001:db8::/126").unwrap());
+        assert_eq!(v6.host_count(), 4);
+        assert_eq!(v6.last(), "2001:db8::3".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn as_cidr_and_label_distinguish_aligned_from_ragged() {
+        let aligned = AddrRange::from(Cidr::parse("10.0.0.0/8").unwrap());
+        assert_eq!(aligned.as_cidr().map(|c| c.prefix_len), Some(8));
+        assert_eq!(aligned.label(), "10.0.0.0/8");
+        // A slice that is not a power-of-two-aligned block has no prefix and reads as a span.
+        let ragged = aligned.nth_slice(3, 1); // one-third of a /8 → not a CIDR
+        assert!(ragged.as_cidr().is_none());
+        assert!(ragged.label().contains('–'));
+    }
+
+    #[test]
+    fn slices_tile_the_run_and_index_inverts() {
+        // The n slices exactly partition the run (no gap/overlap) and slice_index is the
+        // inverse of nth_slice — a fact at either end of a slice lands back in it.
+        let r = AddrRange::from(Cidr::parse("10.87.3.0/24").unwrap()); // 256 addresses
+        for &n in &[1u128, 7, 16, 35, 256] {
+            let mut expected_lo = 0u128;
+            for d in 0..n {
+                let s = r.nth_slice(n, d);
+                let lo = r.offset_of(s.base()).unwrap();
+                let hi = r.offset_of(s.last()).unwrap();
+                assert_eq!(lo, expected_lo, "slice {d}/{n} left a gap");
+                assert!(hi >= lo);
+                assert_eq!(r.slice_index(n, lo), d, "offset {lo} misrouted for n={n}");
+                assert_eq!(r.slice_index(n, hi), d, "offset {hi} misrouted for n={n}");
+                expected_lo = hi + 1;
+            }
+            assert_eq!(expected_lo, 256, "slices must tile the whole /24 for n={n}");
+        }
     }
 }

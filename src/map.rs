@@ -1,105 +1,41 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026  Epsilon Null Operation
-//! The IP map: lay an address range onto a **Hilbert curve** so that every
-//! axis-aligned power-of-two square is a contiguous CIDR — a zoomed square is always
-//! a clean subnet — while consecutive addresses stay spatially adjacent (the curve
-//! never jumps, unlike Z-order), so a contiguous allocation reads as one blob.
+//! The IP map: lay an address range onto a **generalized-Hilbert (Gilbert) curve** so the
+//! grid fills the whole terminal rectangle — any `width × height`, not just a square power
+//! of two — while consecutive addresses stay spatially adjacent (the curve never jumps,
+//! unlike Z-order), so a contiguous allocation reads as one blob.
 //!
-//! A range is mapped over its **full** `2^host_bits` address block (not the usable
-//! hosts, whose count isn't a power of two) so the quadrant tiling is exact. Works for
-//! IPv4 and IPv6 alike — all the offset arithmetic is `u128`. The grid is
-//! `2^order × 2^order`; each cell covers a `/(prefix + 2·order)` block. An enumerable
-//! range is shaded by absolute occupancy; a sparse IPv6 range by *relative* density (the
-//! busiest cell is hottest) since absolute occupancy of a `2^128` block is meaningless.
-//! Building is `O(facts)`. Rendering lives in `tui::map`.
+//! A range is mapped over its **full** `2^host_bits` address block (not the usable hosts,
+//! whose count isn't a power of two) so the address line tiles the grid evenly. Works for
+//! IPv4 and IPv6 alike — all the offset arithmetic is `u128`. Each cell covers a contiguous
+//! [`AddrRange`] slice of `block_len / (width·height)` addresses; when the grid dimensions
+//! and block size are both powers of two the slice happens to be a clean CIDR, otherwise it
+//! is a ragged run with no single prefix (the price of filling an arbitrary rectangle). An
+//! enumerable range is shaded by absolute occupancy; a sparse IPv6 range by *relative*
+//! density (the busiest cell is hottest) since absolute occupancy of a `2^128` block is
+//! meaningless. Building is `O(width·height + facts)`. Rendering lives in `tui::map`.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 
-use crate::reconcile::{AddressFacts, Cidr};
+use mullion::spacefill::Gilbert;
 
-/// Map a Hilbert distance `d` (`0..4^order`) to its grid cell `(x, y)` on the
-/// order-`order` Hilbert curve — a `2^order × 2^order` grid.
-///
-/// Standard iterative construction: read `d` two bits at a time from the top, and at
-/// each level rotate/reflect the current sub-square so the curve joins up. Bijective
-/// with [`hilbert_xy2d`]; a `+1` step in `d` is always an adjacent cell.
-#[must_use]
-pub fn hilbert_d2xy(order: u32, d: u64) -> (u32, u32) {
-    let n = 1u64 << order;
-    let (mut x, mut y, mut t) = (0u64, 0u64, d);
-    let mut s = 1u64;
-    while s < n {
-        let rx = 1 & (t / 2);
-        let ry = 1 & (t ^ rx);
-        // Rotate/reflect this sub-square of side `s` before placing the quadrant.
-        if ry == 0 {
-            if rx == 1 {
-                x = s - 1 - x;
-                y = s - 1 - y;
-            }
-            std::mem::swap(&mut x, &mut y);
-        }
-        x += s * rx;
-        y += s * ry;
-        t /= 4;
-        s *= 2;
-    }
-    (x as u32, y as u32)
-}
+use crate::reconcile::{AddrRange, AddressFacts};
 
-/// Map a grid cell `(x, y)` back to its Hilbert distance `d` — the inverse of
-/// [`hilbert_d2xy`], used to turn a cursor position into the address block under it.
-#[must_use]
-pub fn hilbert_xy2d(order: u32, x: u32, y: u32) -> u64 {
-    let n = 1u64 << order;
-    let (mut x, mut y) = (u64::from(x), u64::from(y));
-    let mut d = 0u64;
-    let mut s = n / 2;
-    while s > 0 {
-        let rx = u64::from((x & s) > 0);
-        let ry = u64::from((y & s) > 0);
-        d += s * s * ((3 * rx) ^ ry);
-        // Rotate/reflect the full grid of side `n` (mirror of the d2xy step).
-        if ry == 0 {
-            if rx == 1 {
-                x = n - 1 - x;
-                y = n - 1 - y;
-            }
-            std::mem::swap(&mut x, &mut y);
-        }
-        s /= 2;
-    }
-    d
-}
-
-/// The clean CIDR block that cell `d` of an order-`order` grid over `range` covers —
-/// a `/(prefix + 2·order)`. This is the "a zoomed square is always a subnet" guarantee
-/// made concrete, and the single source of truth for both the grid and the map cursor.
-///
-/// A cell holds `block = 2^(host_bits − 2·order)` addresses, so cell `d` starts at offset
-/// `d · block` from the range's network address; its prefix grows by `2·order` bits. The
-/// offset is a shift (not a multiply) so it never overflows even for a `/0` IPv6 block.
-#[must_use]
-pub fn block_cidr(range: Cidr, order: u32, d: u64) -> Cidr {
-    let shift = range.host_bits() - 2 * order; // host bits below the cell
-    let offset = if shift >= 128 { 0 } else { u128::from(d) << shift };
-    Cidr { base: range.address_at_offset(offset), prefix_len: range.prefix_len + 2 * order as u8 }
-}
-
-/// A Hilbert-laid map of a CIDR range: a `2^order × 2^order` grid whose cells, in
-/// Hilbert order, tile the range's address block; `used[d]` counts used addresses in
-/// cell `d`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A Gilbert-laid map of an address range: a `width × height` grid whose cells, in curve
+/// order, tile the range's full address block; `used[d]` counts used addresses in the cell
+/// at curve distance `d`.
+#[derive(Debug, Clone)]
 pub struct MapGrid {
-    /// The CIDR this map covers.
-    pub range: Cidr,
-    /// Grid order — side is `2^order`, cell count `4^order`.
-    pub order: u32,
-    /// Addresses per cell — `2^(host_bits − 2·order)`, a power of two (`u128` because an
-    /// IPv6 cell can span up to `2^128` addresses).
-    pub block: u128,
-    /// Used-address count per cell, indexed by **Hilbert distance** `d`.
+    /// The address range this map covers.
+    pub range: AddrRange,
+    /// Grid width in cells.
+    pub width: u32,
+    /// Grid height in cells.
+    pub height: u32,
+    /// The Gilbert curve mapping over `width × height` — `d ↔ (x, y)` both ways in O(1).
+    gilbert: Gilbert,
+    /// Used-address count per cell, indexed by **curve distance** `d`.
     pub used: Vec<u32>,
     /// `true` when the range is too large to reason about absolute occupancy (a sparse
     /// IPv6 block): [`fraction`](MapGrid::fraction) then reports *relative* density.
@@ -109,50 +45,50 @@ pub struct MapGrid {
 }
 
 impl MapGrid {
-    /// Build the map for `range` from the (bounded) `facts`, at the largest order up
-    /// to `max_order` that still gives at least one address per cell.
+    /// Build the `width × height` map for `range` from the (bounded) `facts`.
     ///
-    /// The order is capped at `host_bits / 2` so `2·order ≤ host_bits` (a cell is a
-    /// real, ≥1-address CIDR). Each known address is bucketed into cell `offset ≫ shift`
-    /// (its Hilbert distance), all in `u128` so an IPv6 range works the same. `O(facts)`.
+    /// The caller sizes the grid (see `tui::map::fit_dims`) so `width·height ≤ block_len`
+    /// — every cell holds at least one address. Each known address is bucketed into its
+    /// curve cell by [`AddrRange::slice_index`], all in `u128` so an IPv6 range works the
+    /// same. `O(width·height + facts)`.
     #[must_use]
-    pub fn build(range: Cidr, facts: &HashMap<IpAddr, AddressFacts>, max_order: u32) -> MapGrid {
-        let host_bits = range.host_bits();
-        let order = max_order.min(host_bits / 2);
-        let cells = 1u64 << (2 * order);
-        let shift = host_bits - 2 * order; // host bits below one cell
-        let block = if shift >= 128 { u128::MAX } else { 1u128 << shift };
+    pub fn build(range: AddrRange, facts: &HashMap<IpAddr, AddressFacts>, width: u32, height: u32) -> MapGrid {
+        let gilbert = Gilbert::new(width, height);
+        let cells = gilbert.len() as u128;
 
-        let mut used = vec![0u32; cells as usize];
-        for addr in facts.keys() {
-            if let Some(off) = range.offset_of(*addr) {
-                let d = if shift >= 128 { 0 } else { (off >> shift).min(u128::from(cells) - 1) as usize };
-                used[d] += 1;
+        let mut used = vec![0u32; gilbert.len()];
+        if cells > 0 {
+            for addr in facts.keys() {
+                if let Some(off) = range.offset_of(*addr) {
+                    let d = range.slice_index(cells, off) as usize;
+                    used[d.min(gilbert.len().saturating_sub(1))] += 1;
+                }
             }
         }
         let max_used = used.iter().copied().max().unwrap_or(0);
-        MapGrid { range, order, block, used, sparse: !range.is_enumerable(), max_used }
+        MapGrid { range, width, height, gilbert, used, sparse: !range.is_enumerable(), max_used }
     }
 
-    /// Grid side length (`2^order`).
-    #[must_use]
-    pub fn side(&self) -> usize {
-        1usize << self.order
-    }
-
-    /// Number of cells (`4^order`).
+    /// Number of cells (`width · height`).
     #[must_use]
     pub fn cells(&self) -> usize {
-        1usize << (2 * self.order)
+        self.gilbert.len()
+    }
+
+    /// The address slice cell `d` covers — one of `cells()` near-equal contiguous runs of
+    /// the range. A clean CIDR when the geometry is a power of two, else a ragged run.
+    #[must_use]
+    pub fn cell_range(&self, d: usize) -> AddrRange {
+        self.range.nth_slice(self.cells() as u128, d as u128)
     }
 
     /// The heat value of cell `d` in `[0, 1]`.
     ///
     /// For an enumerable range this is **absolute** occupancy (used addresses over the
-    /// cell's `block`) — "how full is this block". For a sparse IPv6 range, where a cell
-    /// spans up to `2^128` addresses and absolute occupancy is always ≈0, it is instead
-    /// **relative** density on a log scale (busiest cell = 1), so the map shows *where*
-    /// allocations cluster rather than a uniform near-empty field.
+    /// cell's address count) — "how full is this block". For a sparse IPv6 range, where a
+    /// cell spans up to `2^128` addresses and absolute occupancy is always ≈0, it is
+    /// instead **relative** density on a log scale (busiest cell = 1), so the map shows
+    /// *where* allocations cluster rather than a uniform near-empty field.
     #[must_use]
     pub fn fraction(&self, d: usize) -> f32 {
         let used = self.used[d];
@@ -165,37 +101,47 @@ impl MapGrid {
             }
             (f64::from(used).ln_1p() / f64::from(self.max_used).ln_1p()) as f32
         } else {
-            (f64::from(used) / self.block as f64).clamp(0.0, 1.0) as f32
+            (f64::from(used) / self.cell_range(d).block_len() as f64).clamp(0.0, 1.0) as f32
         }
     }
 
-    /// The grid position `(x, y)` of cell `d` (its Hilbert placement).
+    /// The grid position `(x, y)` of cell `d` (its Gilbert placement).
     #[must_use]
     pub fn cell_xy(&self, d: usize) -> (u32, u32) {
-        hilbert_d2xy(self.order, d as u64)
+        self.gilbert.d_to_xy(d)
     }
 
+    /// The curve distance `d` at grid cell `(x, y)`, or `None` if off-grid — turns a
+    /// cursor position into the address slice under it.
+    #[must_use]
+    pub fn xy_to_d(&self, x: u32, y: u32) -> Option<u32> {
+        self.gilbert.xy_to_d(x, y)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reconcile::Cidr;
 
     fn fact(addr: &str) -> AddressFacts {
         AddressFacts { addr: addr.parse().unwrap(), netbox: None, ptr: Some("x.".into()), live: false }
     }
 
+    fn range(s: &str) -> AddrRange {
+        AddrRange::from(Cidr::parse(s).unwrap())
+    }
+
     #[test]
     fn ipv6_map_buckets_and_uses_relative_density() {
         // A /32 is far too big for absolute occupancy; the heat must be *relative* so a
-        // busy cell stands out. Two clusters land in two different Hilbert cells.
-        let range = Cidr::parse("2001:db8::/32").unwrap();
+        // busy cell stands out. Two clusters land in two different curve cells.
         let facts: HashMap<_, _> =
             [fact("2001:db8::1"), fact("2001:db8::2"), fact("2001:db8::3"), fact("2001:db8:ffff::1")]
                 .into_iter()
                 .map(|f| (f.addr, f))
                 .collect();
-        let g = MapGrid::build(range, &facts, 4);
+        let g = MapGrid::build(range("2001:db8::/32"), &facts, 16, 16);
         assert_eq!(g.used.iter().sum::<u32>(), 4); // all four bucketed
         assert_eq!(g.used.iter().filter(|&&u| u > 0).count(), 2); // in two cells
         let heats: Vec<f32> = (0..g.cells()).map(|d| g.fraction(d)).collect();
@@ -206,63 +152,63 @@ mod tests {
     }
 
     #[test]
-    fn hilbert_order1_is_the_u_shape() {
-        // The base order-1 curve: (0,0)→(0,1)→(1,1)→(1,0).
-        assert_eq!(hilbert_d2xy(1, 0), (0, 0));
-        assert_eq!(hilbert_d2xy(1, 1), (0, 1));
-        assert_eq!(hilbert_d2xy(1, 2), (1, 1));
-        assert_eq!(hilbert_d2xy(1, 3), (1, 0));
-    }
-
-    #[test]
-    fn hilbert_is_a_bijection_and_contiguous() {
-        for order in 1..=5u32 {
-            let n = 1u32 << order;
-            let cells = 1u64 << (2 * order);
-            let mut seen = vec![false; cells as usize];
+    fn grid_tiles_every_cell_once_and_stays_contiguous() {
+        // A Gilbert grid over an arbitrary (non-square) rectangle: every cell placed once,
+        // and consecutive curve cells are unit-adjacent (locality — the point of the curve).
+        for (w, h) in [(16u32, 16u32), (12, 8), (40, 24)] {
+            let g = MapGrid::build(range("10.0.0.0/8"), &HashMap::new(), w, h);
+            let mut seen = vec![false; (w * h) as usize];
             let mut prev: Option<(u32, u32)> = None;
-            for d in 0..cells {
-                let (x, y) = hilbert_d2xy(order, d);
-                assert!(x < n && y < n);
-                // Round-trips.
-                assert_eq!(hilbert_xy2d(order, x, y), d);
-                // Every cell hit exactly once.
-                let i = (y * n + x) as usize;
-                assert!(!seen[i]);
+            for d in 0..g.cells() {
+                let (x, y) = g.cell_xy(d);
+                assert!(x < w && y < h);
+                assert_eq!(g.xy_to_d(x, y), Some(d as u32)); // round-trips
+                let i = (y * w + x) as usize;
+                assert!(!seen[i], "cell ({x},{y}) visited twice");
                 seen[i] = true;
-                // Consecutive distances are adjacent (Manhattan distance 1).
                 if let Some((px, py)) = prev {
-                    let dist = px.abs_diff(x) + py.abs_diff(y);
-                    assert_eq!(dist, 1, "d={d} jumped");
+                    assert_eq!(px.abs_diff(x) + py.abs_diff(y), 1, "d={d} jumped (not contiguous)");
                 }
                 prev = Some((x, y));
             }
-            assert!(seen.into_iter().all(|b| b));
+            assert!(seen.into_iter().all(|b| b), "{w}x{h} left a gap");
         }
     }
 
     #[test]
-    fn a_square_region_is_a_clean_cidr() {
-        // The whole /8 at order 4 → cells are /16 blocks; the first cell is 10.0.0.0/16.
-        let range = Cidr::parse("10.0.0.0/8").unwrap();
-        let g = MapGrid::build(range, &HashMap::new(), 4);
-        assert_eq!(g.order, 4); // host_bits 24, capped by max_order 4
-        assert_eq!(g.block, 65_536); // 2^16
-        let c0 = block_cidr(g.range, g.order, 0);
+    fn power_of_two_geometry_gives_clean_cidr_cells() {
+        // A /8 on a 16×16 grid → 256 cells, each a clean /16; cell 0 is 10.0.0.0/16 and the
+        // cells tile the block in curve order.
+        let g = MapGrid::build(range("10.0.0.0/8"), &HashMap::new(), 16, 16);
+        assert_eq!(g.cells(), 256);
+        let c0 = g.cell_range(0).as_cidr().expect("aligned geometry → clean CIDR");
         assert_eq!(c0.prefix_len, 16);
         assert_eq!(c0.base, "10.0.0.0".parse::<IpAddr>().unwrap());
-        // Cell 1 (next Hilbert step) is the adjacent /16.
-        assert_eq!(block_cidr(g.range, g.order, 1).base, "10.1.0.0".parse::<IpAddr>().unwrap());
+        // The 256 cells partition the /8 into the 256 distinct /16s.
+        let firsts: std::collections::HashSet<_> =
+            (0..g.cells()).map(|d| g.cell_range(d).base()).collect();
+        assert_eq!(firsts.len(), 256);
     }
 
     #[test]
-    fn buckets_facts_into_hilbert_cells() {
-        let range = Cidr::parse("10.0.0.0/8").unwrap();
+    fn ragged_geometry_still_covers_the_whole_block() {
+        // A non-power-of-two grid can't give clean CIDRs, but the slices must still tile the
+        // range with no gap: the last cell's last address is the range's last address.
+        let r = range("10.87.3.0/24");
+        let g = MapGrid::build(r, &HashMap::new(), 7, 5); // 35 cells over 256 addresses
+        assert_eq!(g.cell_range(0).base(), r.base());
+        assert_eq!(g.cell_range(g.cells() - 1).last(), r.last());
+        // 256 doesn't divide by 35, so some cells are ragged runs with no clean prefix.
+        assert!((0..g.cells()).any(|d| g.cell_range(d).as_cidr().is_none()));
+    }
+
+    #[test]
+    fn buckets_facts_into_curve_cells() {
         let facts: HashMap<_, _> = [fact("10.0.0.9"), fact("10.1.2.3")]
             .into_iter()
             .map(|f| (f.addr, f))
             .collect();
-        let g = MapGrid::build(range, &facts, 4); // /16 cells
+        let g = MapGrid::build(range("10.0.0.0/8"), &facts, 16, 16); // /16 cells
         // 10.0.x → cell 0 (offset < 65536); 10.1.x → cell 1.
         assert_eq!(g.used[0], 1);
         assert_eq!(g.used[1], 1);
