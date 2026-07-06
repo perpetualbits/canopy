@@ -23,14 +23,29 @@ fn fold(name: &str) -> String {
     name.trim_end_matches('.').to_ascii_lowercase()
 }
 
-/// The `(zone apex, primary master)` from a `dig` response's SOA record, or `None`.
+/// The fields of a zone's SOA record that canopy needs: the zone **apex**, its primary
+/// **master** (the SOA `MNAME`), and the **serial** — the number a cache watches to decide
+/// whether a zone changed at all before paying for a transfer (roadmap P13). The RDATA after
+/// `SOA` is `MNAME RNAME SERIAL REFRESH RETRY EXPIRE MINIMUM`, so the serial is the third token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoaRecord {
+    /// The zone apex (the record owner), lower-cased and un-dotted.
+    pub apex: String,
+    /// The primary master (SOA `MNAME`), lower-cased and un-dotted.
+    pub master: String,
+    /// The zone serial — monotonic; unchanged means the zone is unchanged.
+    pub serial: u64,
+}
+
+/// Parse the [`SoaRecord`] from a `dig SOA …` response, or `None` if it carries no SOA line.
 ///
-/// How: scan the answer/authority lines for the one carrying `SOA` — its owner is the
-/// zone apex and the token just after `SOA` is the `MNAME` (the primary master). Comment
-/// and question lines (starting `;`) are skipped, so a `dig SOA <host>` on a non-apex name
-/// still yields the containing zone from the authority section.
+/// How: scan the answer/authority lines for the one carrying `SOA` — its owner is the zone apex,
+/// the token just after `SOA` is the `MNAME`, and two further along is the serial. Comment and
+/// question lines (starting `;`) are skipped, so a `dig SOA <host>` on a non-apex name still
+/// yields the containing zone from the authority section. A malformed SOA line is skipped, not
+/// fatal.
 #[must_use]
-pub fn parse_soa(output: &str) -> Option<(String, String)> {
+pub fn parse_soa_record(output: &str) -> Option<SoaRecord> {
     for line in output.lines() {
         if line.starts_with(';') {
             continue; // dig comment / question line
@@ -39,11 +54,22 @@ pub fn parse_soa(output: &str) -> Option<(String, String)> {
         let Some(i) = f.iter().position(|&t| t == "SOA") else {
             continue;
         };
-        if let (Some(apex), Some(mname)) = (f.first(), f.get(i + 1)) {
-            return Some((fold(apex), fold(mname)));
-        }
+        let (Some(apex), Some(mname), Some(serial)) = (f.first(), f.get(i + 1), f.get(i + 3)) else {
+            continue; // SOA line missing fields — try the next line
+        };
+        let Ok(serial) = serial.parse::<u64>() else {
+            continue;
+        };
+        return Some(SoaRecord { apex: fold(apex), master: fold(mname), serial });
     }
     None
+}
+
+/// The `(zone apex, primary master)` from a `dig` response's SOA record, or `None`. A thin view
+/// over [`parse_soa_record`] for callers that don't need the serial.
+#[must_use]
+pub fn parse_soa(output: &str) -> Option<(String, String)> {
+    parse_soa_record(output).map(|r| (r.apex, r.master))
 }
 
 /// The parent domain of a name — drop the leftmost label: `dop21.nfra.nl` → `nfra.nl`.
@@ -370,6 +396,20 @@ mod tests {
 ;nfra.nl.\t\t\tIN\tSOA
 nfra.nl.\t\t3600\tIN\tSOA\tdns1.astron.nl. hostmaster.astron.nl. 2026070300 3600 900 604800 3600";
         assert_eq!(parse_soa(out), Some(("nfra.nl".to_string(), "dns1.astron.nl".to_string())));
+    }
+
+    #[test]
+    fn parses_soa_serial_for_freshness() {
+        // The serial (3rd RDATA token after SOA) is what the P13 cache watches to skip a transfer.
+        let out = "\
+; <<>> DiG <<>> SOA nfra.nl
+nfra.nl.\t\t3600\tIN\tSOA\tdns1.astron.nl. hostmaster.astron.nl. 2026070300 3600 900 604800 3600";
+        let rec = parse_soa_record(out).unwrap();
+        assert_eq!(rec.apex, "nfra.nl");
+        assert_eq!(rec.master, "dns1.astron.nl");
+        assert_eq!(rec.serial, 2026070300);
+        // A response with no SOA line (e.g. NXDOMAIN answer) yields nothing.
+        assert_eq!(parse_soa_record(";; no answer\n"), None);
     }
 
     #[test]

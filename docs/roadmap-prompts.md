@@ -234,6 +234,60 @@ one reviewable change (compiles, tests, one capability).
 
 ---
 
+## Phase 5 — Continuous survey: a cached, versioned mirror
+
+> **Read first** — the materials this phase builds on: `docs/vision.md` (pillar 4,
+> Reconcile — this phase makes it *time-aware*); this file's P1–P3 (sources & discovery);
+> `src/sources/` (netbox/dns/probe behind `AddressFacts`, and `merge`); `src/dns_discovery.rs`
+> (the `dig SOA` probing + `parse_soa`); `src/dns/serial.rs` (`SerialScheme` — serial *bumping*
+> for the write path; this phase *reads* serials); `src/reconcile.rs` (the pure core — keep it
+> pure); `src/fixture.rs` (a frozen snapshot — this phase generalises it to a live, versioned one).
+>
+> Design decisions settled with Roland (do not relitigate): canopy is a **mirror, never a DNS
+> server** — no `:53`, no authority. Freshness rides **DNS's own SOA serial**. The store is
+> **git** — plain, diffable, greppable text. The real prize is **history** (drift over time),
+> not just speed.
+
+### P13 — SOA-serial freshness + the on-disk cache
+
+> Make the second sweep cheap. Cache what each source returned, keyed so it survives
+> **split-horizon** — the estate has two `10/8` views (lcs020 vs ntserver1), so the key is
+> `(zone, view/server)`, never the zone alone. On launch, check freshness *before* transferring:
+>
+> - Extend the SOA read to capture the **serial** (RDATA after `SOA` is `MNAME RNAME SERIAL …`;
+>   the serial is already on the line `parse_soa` scans).
+> - Per zone/view, store `{ serial, synced_at, facts }`. On launch `dig SOA` each zone (cheap):
+>   **serial unchanged ⇒ load from cache, skip the AXFR**; changed or missing ⇒ transfer and
+>   update. ARP/probe **liveness is ephemeral — never cache it**; mark it "as of <t>", re-probe
+>   on demand.
+> - The reconcile core stays pure: the cache sits between `sources/` and the merge. Show a status
+>   line: `cache: N fresh · M refreshed · as of HH:MM`.
+> - Safety net: serials get left un-bumped by lazy admins, so a `--resweep` forces a full transfer
+>   and staleness is reported honestly. Zones that refuse AXFR fall back to the existing
+>   reverse-sweep.
+> - Tests: parse the serial from a real `dig SOA` response; a cache round-trip; a split-horizon
+>   case where the same `10/8` under two views does **not** collide.
+
+### P14 — IXFR: transfer only the delta
+
+> When a serial *has* moved, fetch just the change: try **IXFR** (`dig … IXFR=<cached serial>`)
+> against the zone's master; on a master that won't do IXFR, fall back to AXFR. Apply the delta
+> to the cached facts, under the same `(zone, view)` key. Tests: parse an IXFR delta into
+> add/remove sets; exercise the AXFR fallback.
+
+### P15 — git-backed history + "what changed"
+
+> Turn the cache into revision control. Each sync writes the estate as **normalised,
+> one-record-per-line** text (sorted, stable field order → clean diffs) into a git repo under the
+> config dir and commits it (`synced <site> @ <t>`). Then `git log`/`git diff` *is* the estate's
+> changelog. Add `--since <rev|time>` (and a TUI "what changed" view) that diffs two revisions and
+> surfaces the reconcile-relevant deltas: host appeared/vanished, name changed, subnet filled, a
+> squatter arrived. Read-only; the repo is canopy's own, never the DNS masters. Tests: the
+> normaliser is deterministic (same facts → identical bytes); a two-revision diff yields the
+> expected add/remove/rename set.
+
+---
+
 ## Cross-cutting (fold into each prompt, not a separate step)
 
 - Keep `cargo build` **warning-free** and `cargo test` green after every prompt.
