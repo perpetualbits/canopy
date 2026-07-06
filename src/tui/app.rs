@@ -162,6 +162,9 @@ pub struct App {
     /// map view (its curve segment luma-pulses); the arrows step between sub-blocks and `Enter`
     /// zooms into the selected one. `None` is the normal per-cell cursor mode. Toggled with `z`.
     pub chooser: Option<usize>,
+    /// When `true`, the map draws a rounded boundary around the subnet under the cursor (later
+    /// reusable for VLANs). Toggled with `b`.
+    pub show_subnets: bool,
     /// The human-asserted groups (from `conf.d/<site>.groups.toml`) and native NetBox clusters,
     /// kept so the grouping can be re-fused with inference whenever the facts change (a zoom).
     /// Empty on the demo/offline path; populated by [`set_group_sources`](App::set_group_sources).
@@ -248,6 +251,7 @@ impl App {
             grouping,
             color_by_group: false,
             chooser: None,
+            show_subnets: false,
             asserted_groups: Vec::new(),
             native_groups: Vec::new(),
             anim_override: None,
@@ -688,6 +692,7 @@ impl App {
             KeyCode::Backspace | KeyCode::Char('-') => self.zoom_out(),
             KeyCode::Char('s') | KeyCode::Char('p') => self.scheme = self.scheme.cycle(),
             KeyCode::Char('g') => self.color_by_group = !self.color_by_group,
+            KeyCode::Char('b') => self.show_subnets = !self.show_subnets,
             KeyCode::Char('[') => {
                 self.active_knob = (self.active_knob + super::palette::KNOBS.len() - 1) % super::palette::KNOBS.len();
             }
@@ -1408,6 +1413,41 @@ mod tests {
         app.on_key(KeyCode::Esc);
         assert_eq!(app.chooser, None);
         assert_eq!(app.range, expected); // Esc in chooser did NOT zoom out
+    }
+
+    #[test]
+    fn subnet_outline_draws_a_boundary_when_toggled() {
+        use crate::reconcile::Subnet;
+        let range = Cidr::parse("10.87.3.0/24").unwrap();
+        let mut app = App::new(range, Vec::new(), false, false, false, Config::default());
+        app.view = View::Map;
+        app.set_subnets(vec![
+            Subnet { cidr: Cidr::parse("10.87.3.0/24").unwrap(), name: "control".into() },
+            Subnet { cidr: Cidr::parse("10.87.3.64/26").unwrap(), name: "IPMI".into() },
+        ]);
+        let area = Rect::new(0, 0, 120, 50);
+        let mut buf = Buffer::empty(area);
+        crate::tui::map::screen(&mut buf, &mut app); // fix map_dims
+        // Put the cursor inside the /26 so its most-specific subnet is IPMI.
+        let (w, h) = app.map_dims;
+        let grid = crate::map::MapGrid::build(app.range, &HashMap::new(), w, h);
+        let host: IpAddr = "10.87.3.70".parse().unwrap();
+        let d = (0..grid.cells()).find(|&d| grid.cell_range(d).contains(host)).unwrap();
+        app.map_cur = grid.cell_xy(d);
+
+        let symbols = |app: &mut App| {
+            let mut b = Buffer::empty(area);
+            crate::tui::map::screen(&mut b, app);
+            (0..area.height).flat_map(|y| (0..area.width).map(move |x| (x, y))).map(|(x, y)| b.get(x, y).symbol.clone()).collect::<Vec<_>>()
+        };
+        let off = symbols(&mut app);
+        app.show_subnets = true;
+        let on = symbols(&mut app);
+        assert_ne!(off, on, "toggling subnet outlines must change the render");
+        // The /26 is a quarter of the /24, so its ring is on-screen (not clipped) — outline glyphs appear.
+        let box_glyphs = ['╭', '╮', '╰', '╯', '─', '│', '├', '┤', '┬', '┴', '┼'];
+        let count = |v: &[String]| v.iter().filter(|s| s.chars().next().is_some_and(|c| box_glyphs.contains(&c))).count();
+        assert!(count(&on) > count(&off), "the outline adds box-drawing glyphs");
     }
 
     #[test]

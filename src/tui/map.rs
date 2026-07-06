@@ -26,6 +26,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 
+use mullion::border::{BorderStyle, CornerStyle, LineWeight};
 use mullion::curve_map;
 use mullion::style::{Color, Style};
 use mullion::{Buffer, Rect};
@@ -79,6 +80,34 @@ fn boost(c: Color, f: f32) -> Color {
         }
         other => other,
     }
+}
+
+/// Draw a rounded boundary around the subnet the cursor sits in. Membership is by **most-specific**
+/// subnet, so a cell belongs to exactly one region and only that one subnet is outlined — no
+/// doubled edges between neighbours. `mullion::curve_map::draw_region_outline` traces the ring
+/// just outside the region; a subnet covering the whole view has its ring off-screen (no line).
+fn draw_subnet_outline(buf: &mut Buffer, body: Rect, grid: &MapGrid, app: &App) {
+    let Some(cur_d) = grid.xy_to_d(app.map_cur.0, app.map_cur.1) else { return };
+    let base = grid.cell_range(cur_d as usize).base();
+    let Some(target) = Subnet::most_specific(&app.subnets, base).map(|s| s.cidr) else { return };
+
+    // Which most-specific subnet the map cell under screen `(sx, sy)` belongs to — both columns of
+    // a 2-wide cell map to the same grid cell, so the region is a clean 2-column-per-cell shape.
+    let inside = |sx: u16, sy: u16| -> bool {
+        if sx < body.x || sy < body.y {
+            return false;
+        }
+        let (gx, gy) = ((sx - body.x) / 2, sy - body.y);
+        match grid.xy_to_d(u32::from(gx), u32::from(gy)) {
+            Some(d) => {
+                let b = grid.cell_range(d as usize).base();
+                Subnet::most_specific(&app.subnets, b).map(|s| s.cidr) == Some(target)
+            }
+            None => false,
+        }
+    };
+    let style = BorderStyle { weight: LineWeight::Light, corners: CornerStyle::Rounded, style: s_accent() };
+    curve_map::draw_region_outline(buf, body, inside, &style);
 }
 
 
@@ -266,13 +295,19 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
         }
     }
 
+    // Subnet boundary: a rounded outline around the subnet under the cursor (mullion's region
+    // outline), a frame we can later hang VLAN/subnet info on.
+    if app.show_subnets {
+        draw_subnet_outline(buf, body, &grid, app);
+    }
+
     // Footer key hints — context-aware: the quadrant chooser has its own bindings.
     let hints: &[(&str, &str)] = if app.chooser.is_some() {
         &[("hjkl", "quadrant"), ("↵", "zoom in"), ("z", "cells"), ("Bksp", "out"), ("q", "quit")]
     } else if zoomable {
-        &[("hjkl", "move"), ("↵", "in"), ("z", "quadrant"), ("Bksp", "out"), ("p", "palette"), ("g", "groups"), ("Tab", "table"), ("q", "quit")]
+        &[("hjkl", "move"), ("↵", "in"), ("z", "quadrant"), ("Bksp", "out"), ("g", "groups"), ("b", "subnets"), ("Tab", "table"), ("q", "quit")]
     } else {
-        &[("p", "palette"), ("g", "groups"), ("[ ]", "knob"), (", .", "tune"), ("Tab", "table"), ("q", "quit")]
+        &[("p", "palette"), ("g", "groups"), ("b", "subnets"), (", .", "tune"), ("Tab", "table"), ("q", "quit")]
     };
     keyhints(buf, area.x, foot_y, area.width, hints);
 }
