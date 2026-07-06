@@ -57,6 +57,57 @@ fn group_look_at(app: &App, grid: &MapGrid, d: usize) -> Option<(crate::group::L
     Some((app.grouping.look(&g.id), grid.fraction(d).clamp(0.0, 1.0)))
 }
 
+/// Per-cell bitstream assignment for the animated groups: `Some((band, active))` for a cell that
+/// is part of an animated group's **curve span**, `None` otherwise. A cell holding a member is a
+/// lit bit (`active`); an empty gap *between* members of the same cluster (within its
+/// `[min_d, max_d]` span on the curve) is a dim bit — so a cluster reads as a run of set/unset
+/// squares (the vision-doc bitstream), not just isolated dots.
+///
+/// Members always win over gap-fill, and a gap is only filled if the cell is empty and not
+/// already claimed — so one cluster's span never clobbers another group's cells. `O(members +
+/// spans)`, small.
+fn bitstream_cells(app: &App, grid: &MapGrid) -> Vec<Option<(usize, bool)>> {
+    let total = grid.cells();
+    let mut out = vec![None; total];
+    let cells = total as u128;
+    // The member cells of each animated group, as curve indices in the current view.
+    let member_ds = |g: &crate::group::Group| -> Vec<usize> {
+        let mut ds: Vec<usize> = g
+            .members
+            .iter()
+            .filter_map(|m| m.addr)
+            .filter_map(|a| grid.range.offset_of(a).map(|off| grid.range.slice_index(cells, off) as usize))
+            .collect();
+        ds.sort_unstable();
+        ds.dedup();
+        ds
+    };
+    // Pass 1: every animated member is a lit bit (members always win).
+    for g in &app.grouping.groups {
+        if app.grouping.look(&g.id).animate {
+            let band = app.grouping.look(&g.id).band;
+            for d in member_ds(g) {
+                out[d] = Some((band, true));
+            }
+        }
+    }
+    // Pass 2: fill each animated group's span gaps (empty, unclaimed cells) as dim bits.
+    for g in &app.grouping.groups {
+        if !app.grouping.look(&g.id).animate {
+            continue;
+        }
+        let ds = member_ds(g);
+        let (Some(&lo), Some(&hi)) = (ds.first(), ds.last()) else { continue };
+        let band = app.grouping.look(&g.id).band;
+        for d in lo..=hi {
+            if out[d].is_none() && grid.used[d] == 0 {
+                out[d] = Some((band, false));
+            }
+        }
+    }
+    out
+}
+
 /// Paint one animated cluster cell as a **coloured-square bitstream** using mullion's surf-field
 /// [`FlowStyle`](mullion::FlowStyle) `stream_color` (the technique the `spiral_stress` demo
 /// pioneered): the group's `band` gives a golden-angle-distinct base hue, the hue streams along
@@ -272,15 +323,17 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
         (fg, bg)
     });
 
-    // Overlay: animated clusters/services as the flowing coloured-square bitstream.
-    for d in 0..total {
-        if let Some(Some((look, occ))) = group_cells.get(d) {
-            if look.animate {
+    // Overlay: animated clusters/services as the flowing coloured-square bitstream. Each cluster
+    // fills its whole curve span — occupied members are lit bits, the gaps between them dim bits.
+    if app.color_by_group {
+        let bits = bitstream_cells(app, &grid);
+        for (d, cell) in bits.iter().enumerate() {
+            if let Some((band, active)) = *cell {
                 let (gx, gy) = grid.cell_xy(d);
                 let (x, y) = (body.x + (gx as u16) * 2, body.y + gy as u16);
                 if x + 1 < body.x + body.width && y < body.y + body.height {
                     let pos = if total > 1 { d as f32 / (total - 1) as f32 } else { 0.0 };
-                    paint_bitstream(buf, x, y, look.band, pos, clock, *occ > 0.0);
+                    paint_bitstream(buf, x, y, band, pos, clock, active);
                 }
             }
         }
@@ -361,6 +414,34 @@ mod tests {
             out.push_str("\x1b[0m\n");
         }
         out
+    }
+
+    /// Span-fill: a cluster's members are lit bits and the empty gaps within its curve span are
+    /// dim bits, so the bitstream covers more cells than just the members.
+    #[test]
+    fn bitstream_span_fills_gaps_between_members() {
+        use crate::reconcile::Cidr;
+        // Three cluster members spread across the /24 so their span has empty cells between them.
+        let ptr = |o: u8| crate::reconcile::AddressFacts {
+            addr: format!("10.87.3.{o}").parse().unwrap(),
+            netbox: None,
+            ptr: Some(format!("netapp-dw{o}-bmc.nfra.nl.")),
+            live: true,
+        };
+        let range = Cidr::parse("10.87.3.0/24").unwrap();
+        let mut app = App::new(range, vec![ptr(10), ptr(40), ptr(200)], false, false, false, crate::config::Config::default());
+        app.view = super::super::app::View::Map;
+        app.color_by_group = true;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 96, 48));
+        screen(&mut buf, &mut app);
+        let (w, h) = app.map_dims;
+        let grid = MapGrid::build(app.range, &app.facts, w, h);
+
+        let bits = bitstream_cells(&app, &grid);
+        let lit = bits.iter().filter(|c| matches!(c, Some((_, true)))).count();
+        let dim = bits.iter().filter(|c| matches!(c, Some((_, false)))).count();
+        assert_eq!(lit, 3, "the three members are lit bits");
+        assert!(dim > 0, "gaps within the cluster's span are dim bits (span-fill)");
     }
 
     /// Dump the occupancy-coloured map. Ignored by default (writes escape codes to stdout); run
