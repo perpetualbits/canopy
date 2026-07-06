@@ -338,6 +338,29 @@ mod tests {
         println!("{}", dump_ansi(&mut app, 96, 48));
     }
 
+    /// Dump the **quadrant chooser** over a larger range: a sub-block selected, its curve
+    /// luma-pulsing seam-free across 12 frames. Run with
+    /// `cargo test --bin canopy map::tests::dump_chooser -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dump_chooser() {
+        use crate::reconcile::Cidr;
+        let range = Cidr::parse("10.87.0.0/18").unwrap();
+        let mut app = App::new(range, Vec::new(), false, false, false, crate::config::Config::default());
+        app.view = super::super::app::View::Map;
+        // Render once to fix map_dims, then enter the chooser and select a middle sub-block.
+        let _ = dump_ansi(&mut app, 96, 48);
+        app.on_key(mullion::KeyCode::Char('z'));
+        app.on_key(mullion::KeyCode::Char('l'));
+        let frames = 12;
+        for i in 0..frames {
+            let t = i as f32 / frames as f32 * (std::f32::consts::TAU);
+            app.set_anim_clock(Some(t));
+            println!("@@@FRAME {i}@@@");
+            println!("{}", dump_ansi(&mut app, 96, 48));
+        }
+    }
+
     /// Dump the **group-identity**-coloured map (`g` mode): each logical group's stable hue, with
     /// clusters as the animated coloured-square bitstream. Emits several frames across the
     /// animation cycle (separated by `@@@FRAME t@@@` markers) so a viewer can replay the motion.
