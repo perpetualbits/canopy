@@ -175,67 +175,49 @@ fn lighten(c: Color, amount: f32) -> Color {
     }
 }
 
-/// Blend a colour `amount` (0..1) of the way toward **yellow** — the selected-quadrant pulse.
-/// A non-RGB colour (the terminal-default `Reset` of empty cells) is treated as black, so an
-/// empty cell in the selected quadrant glows a dim, pulsing yellow rather than staying blank.
-fn toward_yellow(c: Color, amount: f32) -> Color {
-    let a = amount.clamp(0.0, 1.0);
-    let (r0, g0, b0) = match c {
-        Color::Rgb(r, g, b) => (r, g, b),
-        _ => (0, 0, 0),
-    };
-    let lerp = |v: u8, t: u8| (f32::from(v) + (f32::from(t) - f32::from(v)) * a).round() as u8;
-    Color::Rgb(lerp(r0, 255), lerp(g0, 255), lerp(b0, 0))
-}
-
-/// Draw the information pane beside the Gilbert square (text left-aligned to the square, no
-/// divider): VIEW, PATH, SUBNET, QUADRANT, then a scrollable host list. The palette lives in the
-/// square's edge, not here.
-fn draw_info_pane(buf: &mut Buffer, pane: Rect, app: &App, grid: &MapGrid, quads: &[(std::ops::Range<usize>, Rect)], used_total: u32) -> Rect {
-    let (x, w, bottom) = (pane.x, pane.width, pane.y + pane.height);
-    let mut y = pane.y;
-    let line = |buf: &mut Buffer, y: &mut u16, text: &str, style| {
-        if *y < bottom {
-            btxt(buf, x, *y, &clip(text, w), style);
+/// The compact **two-column field strip** across the top: VIEW + SUBNET in the left column, PATH +
+/// QUADRANT in the right. Half the height of the old stacked pane, which is what frees the room for
+/// the square and the host list to share a height.
+fn draw_fields(buf: &mut Buffer, strip: Rect, app: &App, grid: &MapGrid, quads: &[(std::ops::Range<usize>, Rect)], used_total: u32) {
+    let half = strip.width / 2;
+    let colw = half.saturating_sub(1);
+    let (lx, rx, y0) = (strip.x, strip.x + half, strip.y);
+    let put = |buf: &mut Buffer, x: u16, dy: u16, text: &str, st| {
+        if y0 + dy < strip.y + strip.height {
+            btxt(buf, x, y0 + dy, &clip(text, colw), st);
         }
-        *y += 1;
     };
 
+    // Left column: VIEW, SUBNET.
     let addrs = grid.range.block_len();
     let cell_addrs = addrs / grid.cells().max(1) as u128;
-    line(buf, &mut y, "VIEW", s_title());
-    line(buf, &mut y, &app.range.label(), s_accent());
-    line(buf, &mut y, &format!("{used_total} used / {addrs} addr · {}/cell", cell_addrs), s_dim());
-    y += 1;
-
-    line(buf, &mut y, "PATH", s_title());
-    line(buf, &mut y, &app.scope_chain().iter().map(mullion_label).collect::<Vec<_>>().join(" › "), s_dim());
-    y += 1;
-
+    put(buf, lx, 0, &format!("VIEW  {}", app.range.label()), s_title());
+    put(buf, lx, 1, &format!("      {used_total} used / {addrs} · {cell_addrs}/cell"), s_dim());
     if let Some(s) = Subnet::most_specific(&app.subnets, app.range.base()) {
-        line(buf, &mut y, "SUBNET", s_title());
         let name = if s.name.is_empty() { String::new() } else { format!(" {}", s.name) };
-        line(buf, &mut y, &format!("{}/{}{name}", s.cidr.base, s.cidr.prefix_len), s_dim());
-        y += 1;
+        put(buf, lx, 3, &format!("SUBNET  {}/{}{name}", s.cidr.base, s.cidr.prefix_len), s_title());
     }
 
+    // Right column: PATH, QUADRANT.
+    put(buf, rx, 0, "PATH", s_title());
+    put(buf, rx, 1, &format!("  {}", app.scope_chain().iter().map(mullion_label).collect::<Vec<_>>().join(" › ")), s_dim());
     if let Some((dr, _)) = quads.get(app.zoom_sel) {
         let q = grid.range.span_slices(grid.cells() as u128, dr.start as u128, dr.end as u128);
         let used: u32 = (dr.start..dr.end).filter_map(|d| grid.used.get(d)).sum();
-        line(buf, &mut y, &format!("QUADRANT {}/{}", app.zoom_sel + 1, quads.len()), s_title());
-        line(buf, &mut y, &q.label(), s_accent());
-        line(buf, &mut y, &format!("{} used{}", used, if app.can_zoom_in() { "" } else { " · max zoom" }), s_dim());
-        y += 1;
+        put(buf, rx, 3, &format!("QUADRANT  {}/{}  {}  {used} used", app.zoom_sel + 1, quads.len(), q.label()), s_title());
     }
+}
 
-    // The scrollable, paginated host list — an outlined box with a mullion scrollbar. Only the
-    // visible window is drawn, so it is instant even over a huge range (it lists the bounded known
-    // hosts, never the address space).
-    let hosts = app.hosts_in_view();
-    let list_box = Rect::new(pane.x, y, w, bottom.saturating_sub(y));
-    if list_box.height < 3 {
+/// The scrollable, paginated **host list** — an outlined box with a mullion scrollbar; a host in
+/// the synced cell lights up (the hover sync). Lazy: only the visible window is drawn, so it is
+/// instant even over a huge range (it lists the bounded known hosts, never the address space).
+/// Any family shows — a v6 address prints and syncs exactly like a v4 one. Returns its rows
+/// rectangle, so a pointer over a name maps back to its curve cell (reciprocal sync).
+fn draw_host_list(buf: &mut Buffer, list_box: Rect, app: &App) -> Rect {
+    if list_box.height < 3 || list_box.width < 8 {
         return Rect::new(0, 0, 0, 0);
     }
+    let hosts = app.hosts_in_view();
     let bstyle = BorderStyle { weight: LineWeight::Light, corners: CornerStyle::Rounded, style: s_dim() };
     mullion::border::draw_box(buf, list_box, mullion::border::Borders::ALL, &bstyle);
     let rows = list_box.height.saturating_sub(2) as usize; // inside the top/bottom border
@@ -246,7 +228,6 @@ fn draw_info_pane(buf: &mut Buffer, pane: Rect, app: &App, grid: &MapGrid, quads
     let label = format!("┤ hosts {}–{}/{} ├", (scroll + 1).min(hosts.len().max(1)), scroll + shown, hosts.len());
     btxt(buf, list_box.x + 2, list_box.y, &clip(&label, list_box.width.saturating_sub(4)), s_dim());
     for (i, (addr, name)) in hosts.iter().skip(scroll).take(rows).enumerate() {
-        // A host in the synced cell lights up with the rest of its cell — the hover sync.
         let synced = app.hover_d.is_some() && app.cell_of_addr(*addr) == app.hover_d;
         let style = if synced { s_sel() } else { s_dim() };
         btxt(buf, list_box.x + 1, list_box.y + 1 + i as u16, &clip(&format!("{addr}  {name}"), text_w), style);
@@ -254,7 +235,6 @@ fn draw_info_pane(buf: &mut Buffer, pane: Rect, app: &App, grid: &MapGrid, quads
     // A scrollbar on the right inside edge shows where the window sits in the whole list.
     let track = Rect::new(list_box.x + list_box.width - 1, list_box.y + 1, 1, rows as u16);
     mullion::render_scrollbar(buf, track, mullion::ScrollMetrics::from_window(scroll, rows, hosts.len()), s_dim());
-    // The rows rectangle, so a pointer over a name can be mapped back to its host (reciprocal sync).
     Rect::new(list_box.x + 1, list_box.y + 1, text_w, shown as u16)
 }
 
@@ -310,14 +290,21 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
     let area = super::draw::frame(buf, full, &title, s_title(), Some(super::draw::data_badge(app)), prog, &app.heartbeat());
     let foot_y = area.y + area.height - 1;
 
-    // Layout: the Gilbert square (with a rounded edge) hugs the left; the info pane follows its
-    // right edge with a couple of columns' gap. The square is bound by the available *height* (so
-    // it stays square-ish and does not eat the width), leaving the rest for the pane.
-    let inner = Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), area.height.saturating_sub(3));
-    let sq_region = Rect::new(inner.x, inner.y, inner.width.min(inner.height * 2 + 2), inner.height);
+    // Layout: a compact two-column field strip at the top; below it the Gilbert square (left,
+    // rounded edge) and the host list (right) share the same top and height, so their bases line
+    // up. Compacting the fields is what frees the vertical room for the two to match.
+    let fields_h: u16 = 5.min(area.height.saturating_sub(6));
+    let fields = Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), fields_h);
+    let content_top = area.y + fields_h;
+    let content_h = foot_y.saturating_sub(content_top); // rows for square + scroller (above footer)
+
+    // Fit the square to the content height (square-ish, height-bound). Its edge and the host-list
+    // box then share `content_top` and the fitted height.
+    let sq_region = Rect::new(area.x + 2, content_top + 1, content_h.saturating_mul(2), content_h.saturating_sub(2));
     let (gw, gh) = curve_map::fit_dims(sq_region, app.range.block_len());
     let grid = MapGrid::build(app.range, &app.facts, gw, gh);
-    let body = Rect::new(inner.x, inner.y, (gw as u16) * 2, gh as u16);
+    let edge = Rect::new(area.x + 1, content_top, gw as u16 * 2 + 2, gh as u16 + 2);
+    let body = Rect::new(edge.x + 1, edge.y + 1, gw as u16 * 2, gh as u16);
     let used_total: u32 = grid.used.iter().sum();
 
     app.map_dims = (grid.width, grid.height);
@@ -333,21 +320,29 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
     let group_cells: Vec<Option<(crate::group::Look, f32)>> =
         if app.color_by_group { (0..total).map(|d| group_look_at(app, &grid, d)).collect() } else { Vec::new() };
 
-    // The selected quadrant's curve pulses **toward yellow at 2 Hz** (`t = clock·4π`, since the
-    // pulse period is 2π in `t`), tapering to nothing at the joins so there is no seam.
-    let pulse = quads
+    // The curve's light — all soft *lifts*, never a hard flash, combined into one gentle luma
+    // boost per cell:
+    //  · the selected quadrant: a slow glow (~0.4 Hz), seam-free at the joins — a calm shimmer,
+    //    not the old 2 Hz flash;
+    //  · pointing: a focused gaussian band on the synced cell (hover sync);
+    //  · idle: a slow ambient shimmer, gathering where the estate has structure.
+    // Each lifts a cell's own colour rather than whitening it, so the light stays multicoloured.
+    let qglow = quads
         .get(app.zoom_sel)
-        .map(|(dr, _)| curve_map::pulse_segment(total, dr.clone(), clock * 4.0 * std::f32::consts::PI, 3));
-
-    // The curve's light. Pointing at it focuses a soft gaussian band on the synced cell (the hover
-    // sync); idle, a slow ambient shimmer threads the whole curve, gathering where the estate has
-    // structure. Both *lift* each cell's own colour rather than whitening it → multicoloured light.
-    let glow = match app.hover_d {
+        .map(|(dr, _)| curve_map::pulse_segment(total, dr.clone(), clock * std::f32::consts::TAU * 0.4, 4));
+    let ambient = match app.hover_d {
         Some(hd) => hover_glow(Some(hd), total, clock),
         None => ambient_glow(&grid, total, clock),
     };
+    let lift: Vec<f32> = (0..total)
+        .map(|d| {
+            let base = ambient.get(d).copied().unwrap_or(0.0);
+            let q = qglow.as_ref().map_or(0.0, |p| p(d) * 0.5);
+            (base + q).min(0.85)
+        })
+        .collect();
 
-    // Base layer: occupancy heat / static group tint, then the quadrant pulse and the hover glow.
+    // Base layer: occupancy heat / static group tint, lifted by the combined light.
     curve_map::render(buf, body, grid.gilbert(), |d| {
         let pos = if total > 1 { d as f32 / (total - 1) as f32 } else { 0.0 };
         let (bg, fg) = app.scheme.paint(grid.fraction(d), pos, &app.knobs);
@@ -355,16 +350,7 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
             Some(Some((look, occ))) if !look.animate => (fg, super::palette::hsl_rgb(look.hue, look.sat, 0.16 + 0.30 * occ)),
             _ => (fg, bg), // curve_map wants (fg, bg); Scheme::paint yields (bg, fg)
         };
-        // The selected quadrant flashes the **curve** toward yellow — the background is left alone.
-        if let Some(p) = &pulse {
-            let a = p(d) * 0.9;
-            if a > 0.0 {
-                fg = toward_yellow(fg, a);
-            }
-        }
-        if let Some(&g) = glow.get(d) {
-            fg = lighten(fg, g);
-        }
+        fg = lighten(fg, lift[d]);
         (fg, bg)
     });
 
@@ -377,7 +363,7 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
                 let (x, y) = (body.x + (gx as u16) * 2, body.y + gy as u16);
                 if x + 1 < body.x + body.width && y < body.y + body.height {
                     let pos = if total > 1 { d as f32 / (total - 1) as f32 } else { 0.0 };
-                    paint_bitstream(buf, x, y, band, pos, clock, active, glow.get(d).copied().unwrap_or(0.0));
+                    paint_bitstream(buf, x, y, band, pos, clock, active, lift[d]);
                 }
             }
         }
@@ -387,8 +373,7 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
         draw_subnet_outline(buf, body, &grid, app);
     }
 
-    // The rounded edge around the whole Gilbert square (a frame for zoom animation + info later).
-    let edge = Rect::new(body.x.saturating_sub(1), body.y.saturating_sub(1), body.width + 2, body.height + 2);
+    // The rounded edge around the whole Gilbert square (a frame for the zoom sweep + palette).
     let estyle = BorderStyle { weight: LineWeight::Light, corners: CornerStyle::Rounded, style: s_dim() };
     mullion::border::draw_box(buf, edge, mullion::border::Borders::ALL, &estyle);
 
@@ -405,15 +390,14 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
     let palette = format!("┤ {} · {}={:.2} ├", app.scheme.name(), kn, app.knobs.get(app.active_knob));
     btxt(buf, edge.x + 2, edge.y + edge.height - 1, &clip(&palette, edge.width.saturating_sub(4)), s_dim());
 
-    // The information pane, hugging the square's right edge with a two-column gap (no divider).
-    let pane_x = edge.x + edge.width + 2;
-    let pane = Rect::new(pane_x, area.y, (area.x + area.width).saturating_sub(pane_x), area.height.saturating_sub(1));
-    app.pane_area = pane;
-    app.host_list_area = if pane.width >= 20 {
-        draw_info_pane(buf, pane, app, &grid, &quads, used_total)
-    } else {
-        Rect::new(0, 0, 0, 0)
-    };
+    // The host list: same top and height as the square's edge, to its right — bases level.
+    let list_x = edge.x + edge.width + 2;
+    let list_box = Rect::new(list_x, edge.y, (area.x + area.width).saturating_sub(list_x), edge.height);
+    app.pane_area = list_box;
+    app.host_list_area = if list_box.width >= 16 { draw_host_list(buf, list_box, app) } else { Rect::new(0, 0, 0, 0) };
+
+    // The two-column field strip across the top.
+    draw_fields(buf, fields, app, &grid, &quads, used_total);
 
     let hints: &[(&str, &str)] =
         &[("← ↑ ↓ →", "quadrant"), ("↵/click", "zoom in"), ("Esc/rclick", "out"), ("g", "groups"), ("b", "subnets"), ("q", "quit")];
