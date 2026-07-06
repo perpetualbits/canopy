@@ -161,10 +161,10 @@ pub struct App {
     /// `true` when the map colours cells by **group identity** (hue = which cluster) instead of
     /// occupancy; toggled with `g`. Occupancy still sets the brightness of a grouped cell.
     pub color_by_group: bool,
-    /// The **quadrant chooser**: `Some(i)` selects the `i`-th top-level sub-block of the current
-    /// map view (its curve segment luma-pulses); the arrows step between sub-blocks and `Enter`
-    /// zooms into the selected one. `None` is the normal per-cell cursor mode. Toggled with `z`.
-    pub chooser: Option<usize>,
+    /// **Zoom mode** selection: which of the current view's quadrant sub-squares
+    /// ([`map_quadrants`](App::map_quadrants)) is highlighted. The arrows move it between
+    /// quadrants, `Enter`/left-click zooms in, `Esc`/right-click zooms out.
+    pub zoom_sel: usize,
     /// When `true`, the map draws a rounded boundary around the subnet under the cursor (later
     /// reusable for VLANs). Toggled with `b`.
     pub show_subnets: bool,
@@ -253,7 +253,7 @@ impl App {
             active_knob: 0,
             grouping,
             color_by_group: false,
-            chooser: None,
+            zoom_sel: 0,
             show_subnets: false,
             map_area: Rect::new(0, 0, 0, 0),
             asserted_groups: Vec::new(),
@@ -661,47 +661,23 @@ impl App {
         }
     }
 
-    /// Keys for the map view: move the cursor over the Gilbert grid, `Enter` zooms
-    /// into the highlighted cell (its exact address slice), `Backspace`/`-` zooms back out.
+    /// Keys for the map view — **zoom mode**: the arrows move the selection between quadrant
+    /// sub-squares, `Enter` zooms into the selected one, `Esc`/`Backspace` zooms back out. (A
+    /// per-host *trace* mode will share these keys later.)
     fn on_key_map(&mut self, code: KeyCode) {
-        // `z` toggles the quadrant chooser; while it is on, the arrows step between sub-blocks
-        // and Enter zooms into the selected one, so its keys are handled separately.
-        if code == KeyCode::Char('z') {
-            self.toggle_chooser();
-            return;
-        }
-        if self.chooser.is_some() {
-            match code {
-                KeyCode::Char('q') | KeyCode::Char('Q') => self.quit = true,
-                KeyCode::Left | KeyCode::Char('h') | KeyCode::Up | KeyCode::Char('k') => self.chooser_step(-1),
-                KeyCode::Right | KeyCode::Char('l') | KeyCode::Down | KeyCode::Char('j') => self.chooser_step(1),
-                KeyCode::Enter | KeyCode::Char('+') => self.zoom_into_chooser(),
-                KeyCode::Esc => self.chooser = None, // leave the chooser without zooming
-                KeyCode::Backspace | KeyCode::Char('-') => self.zoom_out(),
-                _ => {}
-            }
-            return;
-        }
         match code {
             KeyCode::Char('q') | KeyCode::Char('Q') => self.quit = true,
-            // Esc only ever zooms out — never quits, so an extra zoom-out is harmless. Only q/Q
-            // leave canopy.
-            KeyCode::Esc => self.zoom_out(),
-            // Walk *along the Gilbert curve*: h/l step one cell (address-adjacent), k/j jump a
-            // "row" (the grid width) for a bigger stride; n/f leap to the next occupied/free zone.
-            KeyCode::Left | KeyCode::Char('h') => self.map_walk(-1),
-            KeyCode::Right | KeyCode::Char('l') => self.map_walk(1),
-            KeyCode::Up | KeyCode::Char('k') => self.map_walk(-i64::from(self.map_dims.0.max(1))),
-            KeyCode::Down | KeyCode::Char('j') => self.map_walk(i64::from(self.map_dims.0.max(1))),
-            KeyCode::Char('n') => self.jump_zone(true, true),
-            KeyCode::Char('N') => self.jump_zone(false, true),
-            KeyCode::Char('f') => self.jump_zone(true, false),
-            KeyCode::Char('F') => self.jump_zone(false, false),
-            KeyCode::Enter | KeyCode::Char('+') => self.zoom_into_cursor(),
-            KeyCode::Backspace | KeyCode::Char('-') => self.zoom_out(),
+            KeyCode::Left => self.quadrant_move(-1, 0),
+            KeyCode::Right => self.quadrant_move(1, 0),
+            KeyCode::Up => self.quadrant_move(0, -1),
+            KeyCode::Down => self.quadrant_move(0, 1),
+            KeyCode::Enter | KeyCode::Char('+') => self.zoom_into_selected(),
+            // Esc only ever zooms out — never quits (only q/Q do).
+            KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('-') => self.zoom_out(),
             KeyCode::Char('s') | KeyCode::Char('p') => self.scheme = self.scheme.cycle(),
             KeyCode::Char('g') => self.color_by_group = !self.color_by_group,
             KeyCode::Char('b') => self.show_subnets = !self.show_subnets,
+            // Palette knob tuning (shown in the info pane): `[`/`]` pick a knob, `,`/`.` nudge it.
             KeyCode::Char('[') => {
                 self.active_knob = (self.active_knob + super::palette::KNOBS.len() - 1) % super::palette::KNOBS.len();
             }
@@ -712,54 +688,90 @@ impl App {
         }
     }
 
-    /// The current map view's top-level sub-blocks (the curve's own quadrant partition), from
-    /// mullion. Empty when the grid is a single cell (nothing to choose).
+    /// The current view's **zoom sub-squares**: 4 quadrants for a square grid, or the largest
+    /// square tiles for a non-square one (2 for a 2:1 grid, 4 for 4:1, …). Each is a contiguous
+    /// `d`-interval of the Gilbert curve — which, for these power-of-two grids, is exactly a
+    /// spatial sub-rectangle — paired with its grid bounds. Empty when the grid is a single cell.
     #[must_use]
-    pub fn map_subblocks(&self) -> Vec<mullion::spacefill::SubBlock> {
+    pub fn map_quadrants(&self) -> Vec<(std::ops::Range<usize>, Rect)> {
         let (w, h) = self.map_dims;
-        if u128::from(w) * u128::from(h) <= 1 {
+        let total = (u128::from(w) * u128::from(h)) as usize;
+        if total <= 1 {
             return Vec::new();
         }
-        mullion::spacefill::Gilbert::new(w, h).subblocks()
+        let (a, b) = (w.max(1).ilog2(), h.max(1).ilog2());
+        // A square splits into 4 quadrants; a rectangle into its 2^|a−b| largest square tiles.
+        let k = (if a == b { 4 } else { 1usize << a.abs_diff(b) }).min(total);
+        let g = mullion::spacefill::Gilbert::new(w, h);
+        let part = total / k;
+        (0..k)
+            .map(|i| {
+                let (lo, hi) = (i * part, if i == k - 1 { total } else { (i + 1) * part });
+                let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+                for d in lo..hi {
+                    let (x, y) = g.d_to_xy(d);
+                    (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+                }
+                let bounds = Rect::new(x0 as u16, y0 as u16, (x1 - x0 + 1) as u16, (y1 - y0 + 1) as u16);
+                (lo..hi, bounds)
+            })
+            .collect()
     }
 
-    /// Enter the quadrant chooser (selecting the sub-block under the cursor) or leave it.
-    fn toggle_chooser(&mut self) {
-        if self.chooser.is_some() {
-            self.chooser = None;
+    /// Move the zoom selection to the quadrant nearest in direction `(dx, dy)` (each ∈ {−1,0,1}).
+    fn quadrant_move(&mut self, dx: i32, dy: i32) {
+        let quads = self.map_quadrants();
+        if quads.len() < 2 {
             return;
         }
-        let (w, h) = self.map_dims;
-        let subs = self.map_subblocks();
-        if subs.is_empty() {
-            return; // one cell — nothing to choose
+        let sel = self.zoom_sel.min(quads.len() - 1);
+        // Twice each rect's centre (integer, avoids a /2 rounding tie).
+        let c2 = |r: Rect| (i32::from(r.x) * 2 + i32::from(r.width), i32::from(r.y) * 2 + i32::from(r.height));
+        let (cx, cy) = c2(quads[sel].1);
+        let mut best: Option<(usize, (i32, i32))> = None;
+        for (i, (_, r)) in quads.iter().enumerate() {
+            if i == sel {
+                continue;
+            }
+            let (bx, by) = c2(*r);
+            let along = dx * (bx - cx) + dy * (by - cy); // progress in the requested direction
+            if along <= 0 {
+                continue;
+            }
+            let perp = if dx == 0 { (bx - cx).abs() } else { (by - cy).abs() }; // off-axis drift
+            let score = (perp, -along); // least drift, then furthest along
+            if best.is_none_or(|(_, s)| score < s) {
+                best = Some((i, score));
+            }
         }
-        // Start on the sub-block containing the current cursor cell.
-        let g = mullion::spacefill::Gilbert::new(w, h);
-        let start = g.xy_to_d(self.map_cur.0, self.map_cur.1).map_or(0, |d| g.subblock_at(d as usize));
-        self.chooser = Some(start.min(subs.len() - 1));
+        if let Some((i, _)) = best {
+            self.zoom_sel = i;
+        }
     }
 
-    /// Step the chooser selection by `delta` sub-blocks, wrapping.
-    fn chooser_step(&mut self, delta: isize) {
-        let n = self.map_subblocks().len();
-        if let (Some(i), true) = (self.chooser, n > 0) {
-            let next = (i as isize + delta).rem_euclid(n as isize) as usize;
-            self.chooser = Some(next);
-        }
-    }
-
-    /// Zoom into the selected sub-block: narrow the scope to the address run its cells cover.
-    fn zoom_into_chooser(&mut self) {
+    /// Whether zooming in is still useful — `false` once each cell already holds a single address
+    /// (max resolution), where zooming further would just show fewer addresses at the same detail.
+    #[must_use]
+    pub fn can_zoom_in(&self) -> bool {
         let (w, h) = self.map_dims;
         let cells = u128::from(w) * u128::from(h);
-        let subs = self.map_subblocks();
-        let Some(sb) = self.chooser.and_then(|i| subs.get(i)) else { return };
-        let sub = self.range.span_slices(cells, sb.d_range.start as u128, sb.d_range.end as u128);
+        cells > 1 && self.range.block_len() > cells
+    }
+
+    /// Zoom into the selected quadrant: narrow the scope to its address run and its facts.
+    fn zoom_into_selected(&mut self) {
+        if !self.can_zoom_in() {
+            self.status = Some(("already at one address per cell — can't zoom further".into(), false));
+            return;
+        }
+        let quads = self.map_quadrants();
+        let Some((d_range, _)) = quads.get(self.zoom_sel) else { return };
+        let (w, h) = self.map_dims;
+        let cells = u128::from(w) * u128::from(h);
+        let sub = self.range.span_slices(cells, d_range.start as u128, d_range.end as u128);
         self.zoom_stack.push(ZoomFrame { range: self.range, facts: Rc::clone(&self.facts) });
         let sub_facts: HashMap<IpAddr, AddressFacts> =
             self.facts.iter().filter(|(a, _)| sub.contains(**a)).map(|(a, f)| (*a, f.clone())).collect();
-        self.chooser = None;
         self.set_scope(sub, Rc::new(sub_facts));
         self.status = Some((format!("zoomed into {}", self.range.label()), false));
     }
@@ -774,20 +786,6 @@ impl App {
         chain
     }
 
-    /// The address slice the map cursor sits over — the contiguous run that cell covers on
-    /// the Gilbert curve. `None` when the grid is a single cell, i.e. nothing finer to zoom
-    /// into. The slice is a clean CIDR when the geometry is a power of two, else ragged.
-    #[must_use]
-    pub fn cursor_range(&self) -> Option<AddrRange> {
-        let (w, h) = self.map_dims;
-        let cells = u128::from(w) * u128::from(h);
-        if cells <= 1 {
-            return None;
-        }
-        let d = mullion::spacefill::Gilbert::new(w, h).xy_to_d(self.map_cur.0, self.map_cur.1)?;
-        Some(self.range.nth_slice(cells, u128::from(d)))
-    }
-
     /// The grid cell `(x, y)` under a mouse `(column, row)`, or `None` if outside the grid. Each
     /// cell is two screen columns wide, so the column is halved relative to the grid's origin.
     fn map_cell_at(&self, column: u16, row: u16) -> Option<(u32, u32)> {
@@ -800,84 +798,35 @@ impl App {
         (gx < w && gy < h).then_some((gx, gy))
     }
 
-    /// Mouse control for the map: left-click selects the cell under the pointer, the wheel zooms
-    /// (up = into that cell, down = out). Ignored in the other views for now.
+    /// Which zoom quadrant the mouse `(column, row)` is over, if any.
+    fn quadrant_at(&self, column: u16, row: u16) -> Option<usize> {
+        let (gx, gy) = self.map_cell_at(column, row)?;
+        self.map_quadrants().iter().position(|(_, b)| {
+            (u32::from(b.x)..u32::from(b.x) + u32::from(b.width)).contains(&gx)
+                && (u32::from(b.y)..u32::from(b.y) + u32::from(b.height)).contains(&gy)
+        })
+    }
+
+    /// Mouse control for the map (zoom mode): moving the pointer selects the quadrant under it,
+    /// left-click (or wheel-up) zooms into it, right-click (or wheel-down) zooms out.
     pub fn on_mouse(&mut self, ev: MouseEvent) {
         if self.view != View::Map {
             return;
         }
         match ev.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(cell) = self.map_cell_at(ev.column, ev.row) {
-                    self.map_cur = cell;
-                    self.chooser = None;
+            MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                if let Some(q) = self.quadrant_at(ev.column, ev.row) {
+                    self.zoom_sel = q;
                 }
             }
-            MouseEventKind::ScrollUp => {
-                if let Some(cell) = self.map_cell_at(ev.column, ev.row) {
-                    self.map_cur = cell;
-                    self.zoom_into_cursor();
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::ScrollUp => {
+                if let Some(q) = self.quadrant_at(ev.column, ev.row) {
+                    self.zoom_sel = q;
                 }
+                self.zoom_into_selected();
             }
-            MouseEventKind::ScrollDown => self.zoom_out(),
+            MouseEventKind::Down(MouseButton::Right) | MouseEventKind::ScrollDown => self.zoom_out(),
             _ => {}
-        }
-    }
-
-    /// The cursor's index along the Gilbert curve in the current grid (`0` if the grid is empty).
-    fn cursor_d(&self) -> usize {
-        let (w, h) = self.map_dims;
-        if w == 0 || h == 0 {
-            return 0;
-        }
-        mullion::spacefill::Gilbert::new(w, h).xy_to_d(self.map_cur.0, self.map_cur.1).unwrap_or(0) as usize
-    }
-
-    /// Move the cursor `delta` cells **along the curve** (clamped to the grid) — the serpentine
-    /// walk that follows address order, not raw 2-D motion.
-    fn map_walk(&mut self, delta: i64) {
-        let (w, h) = self.map_dims;
-        let total = u128::from(w) * u128::from(h);
-        if total == 0 {
-            return;
-        }
-        let d = (self.cursor_d() as i64 + delta).clamp(0, total as i64 - 1) as usize;
-        self.map_cur = mullion::spacefill::Gilbert::new(w, h).d_to_xy(d);
-    }
-
-    /// Jump the cursor to the start of the next (`forward`) or previous run of **occupied**
-    /// (`occupied`) or free cells along the curve — a "zone" being a maximal run of like cells.
-    /// A no-op when there is no such zone ahead.
-    fn jump_zone(&mut self, forward: bool, occupied: bool) {
-        let (w, h) = self.map_dims;
-        let total = (u128::from(w) * u128::from(h)) as usize;
-        if total <= 1 {
-            return;
-        }
-        let grid = crate::map::MapGrid::build(self.range, &self.facts, w, h);
-        let hit = |d: usize| (grid.used[d] > 0) == occupied;
-        // A run-start is a hit cell whose predecessor on the curve is a miss (or the very first).
-        let run_start = |d: usize| hit(d) && (d == 0 || !hit(d - 1));
-        let cur = self.cursor_d();
-        let found =
-            if forward { (cur + 1..total).find(|&d| run_start(d)) } else { (0..cur).rev().find(|&d| run_start(d)) };
-        if let Some(d) = found {
-            self.map_cur = grid.cell_xy(d);
-        }
-    }
-
-    /// Zoom into the cell under the cursor, if there is a finer slice.
-    fn zoom_into_cursor(&mut self) {
-        if let Some(sub) = self.cursor_range() {
-            self.zoom_stack.push(ZoomFrame { range: self.range, facts: Rc::clone(&self.facts) });
-            let sub_facts: HashMap<IpAddr, AddressFacts> = self
-                .facts
-                .iter()
-                .filter(|(a, _)| sub.contains(**a))
-                .map(|(a, f)| (*a, f.clone()))
-                .collect();
-            self.set_scope(sub, Rc::new(sub_facts));
-            self.status = Some((format!("zoomed into {}", sub.label()), false));
         }
     }
 
@@ -924,7 +873,7 @@ impl App {
         self.tree_expanded.clear();
         self.pan = (0, 0);
         self.map_cur = (0, 0);
-        self.chooser = None; // a new scope has different sub-blocks; leave the chooser
+        self.zoom_sel = 0; // a new scope has fresh quadrants; select the first
         self.detail = false;
     }
 
@@ -1431,9 +1380,7 @@ mod tests {
     }
 
     #[test]
-    fn map_zoom_narrows_scope_and_zoom_out_restores_it() {
-        // A /8 with one host outside the top-left cell; render sets the grid order,
-        // then Enter zooms into the cursor cell and everything narrows to that subnet.
+    fn zoom_into_selected_quadrant_narrows_scope_and_zoom_out_restores_it() {
         let range = Cidr::parse("10.0.0.0/8").unwrap();
         let facts = vec![AddressFacts {
             addr: "10.1.0.5".parse().unwrap(),
@@ -1443,97 +1390,78 @@ mod tests {
         }];
         let mut app = App::new(range, facts, false, false, false, Config::default());
         app.view = View::Map;
-        // Render once so map_dims is set from the fitted grid.
         let mut buf = Buffer::empty(Rect::new(0, 0, 120, 50));
         crate::tui::map::screen(&mut buf, &mut app);
-        let (w, h) = app.map_dims;
-        assert!(w > 0 && h > 0);
         let parent_total = app.total;
         let top = AddrRange::from(range);
+        let (w, h) = app.map_dims;
+        let cells = u128::from(w) * u128::from(h);
 
-        // Move the cursor onto the cell whose slice actually holds the host, then zoom in.
+        // Select the quadrant holding the host, then Enter zooms into exactly its address run.
         let host: IpAddr = "10.1.0.5".parse().unwrap();
-        let grid = crate::map::MapGrid::build(app.range, &HashMap::new(), w, h);
-        let d = (0..grid.cells()).find(|&d| grid.cell_range(d).contains(host)).unwrap();
-        app.map_cur = grid.cell_xy(d);
-        let target = app.cursor_range().unwrap();
-        assert!(target.contains(host));
+        let hd = top.slice_index(cells, top.offset_of(host).unwrap()) as usize;
+        let quads = app.map_quadrants();
+        app.zoom_sel = quads.iter().position(|(dr, _)| dr.contains(&hd)).unwrap();
+        let expected = top.span_slices(cells, quads[app.zoom_sel].0.start as u128, quads[app.zoom_sel].0.end as u128);
+        assert!(expected.contains(host));
+
         app.on_key(KeyCode::Enter);
-        assert_eq!(app.range, target);
-        assert_eq!(app.scope_chain(), vec![top, target]); // parent › current
-        assert!(app.total < parent_total);
-        // The one host survived the narrowing (it lies inside the zoomed slice).
-        assert_eq!(app.counts.dns_only, 1);
-        assert_eq!(app.map_cur, (0, 0)); // cursor reset on scope change
-
-        // Zoom back out restores the /8 and its full facts.
-        app.on_key(KeyCode::Backspace);
-        assert_eq!(app.range, top);
-        assert_eq!(app.total, parent_total);
-        assert_eq!(app.scope_chain(), vec![top]); // back to just the top scope
-    }
-
-    #[test]
-    fn quadrant_chooser_steps_and_zooms_into_a_subblock() {
-        let range = Cidr::parse("10.0.0.0/8").unwrap();
-        let mut app = App::new(range, Vec::new(), false, false, false, Config::default());
-        app.view = View::Map;
-        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 50));
-        crate::tui::map::screen(&mut buf, &mut app); // sets map_dims
-        let top = AddrRange::from(range);
-        let subs = app.map_subblocks();
-        assert!(subs.len() >= 2, "a big grid has ≥2 sub-blocks to choose between");
-
-        // `z` enters the chooser on the sub-block under the cursor (cursor at (0,0) → block 0).
-        app.on_key(KeyCode::Char('z'));
-        assert_eq!(app.chooser, Some(0));
-        app.on_key(KeyCode::Char('l')); // step to the next sub-block
-        let sel = app.chooser.unwrap();
-        assert!(sel < subs.len() && sel != 0);
-
-        // Enter zooms into exactly that sub-block's address run, and leaves the chooser.
-        let expected = top.span_slices(u128::from(app.map_dims.0) * u128::from(app.map_dims.1), subs[sel].d_range.start as u128, subs[sel].d_range.end as u128);
-        app.on_key(KeyCode::Enter);
-        assert_eq!(app.chooser, None);
         assert_eq!(app.range, expected);
-        assert!(app.total < (top.host_count().min(usize::MAX as u128) as usize));
         assert_eq!(app.scope_chain(), vec![top, expected]);
+        assert!(app.total < parent_total);
+        assert_eq!(app.counts.dns_only, 1); // the host survived the narrowing
+        assert_eq!(app.zoom_sel, 0); // selection reset on scope change
 
-        // Esc leaves the chooser without zooming; Backspace restored parent already, so re-enter.
-        app.on_key(KeyCode::Char('z'));
-        assert!(app.chooser.is_some());
-        app.on_key(KeyCode::Esc);
-        assert_eq!(app.chooser, None);
-        assert_eq!(app.range, expected); // Esc in chooser did NOT zoom out
+        app.on_key(KeyCode::Esc); // Esc zooms out (never quits)
+        assert_eq!(app.range, top);
+        assert_eq!(app.scope_chain(), vec![top]);
+        assert!(!app.quit);
     }
 
     #[test]
-    fn mouse_click_selects_the_cell_and_scroll_zooms() {
-        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    fn arrows_move_between_quadrants() {
         let range = Cidr::parse("10.0.0.0/8").unwrap();
         let mut app = App::new(range, Vec::new(), false, false, false, Config::default());
         app.view = View::Map;
         let mut buf = Buffer::empty(Rect::new(0, 0, 120, 50));
-        crate::tui::map::screen(&mut buf, &mut app); // sets map_dims + map_area
+        crate::tui::map::screen(&mut buf, &mut app);
+        let quads = app.map_quadrants();
+        assert_eq!(quads.len(), 4, "a square grid has four quadrants");
+        assert_eq!(app.zoom_sel, 0); // starts top-left
+
+        // Right then Down reach a different quadrant each time (spatial move).
+        app.on_key(KeyCode::Right);
+        let after_right = app.zoom_sel;
+        assert_ne!(after_right, 0);
+        // The selected quadrant's centre lies to the right of quadrant 0's.
+        let cx = |i: usize| i32::from(quads[i].1.x) * 2 + i32::from(quads[i].1.width);
+        assert!(cx(after_right) > cx(0));
+    }
+
+    #[test]
+    fn mouse_hover_selects_quadrant_and_click_zooms() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let ev = |kind, column, row| MouseEvent { kind, column, row, modifiers: KeyModifiers::empty() };
+        let range = Cidr::parse("10.0.0.0/8").unwrap();
+        let mut app = App::new(range, Vec::new(), false, false, false, Config::default());
+        app.view = View::Map;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 50));
+        crate::tui::map::screen(&mut buf, &mut app);
         let a = app.map_area;
-        assert!(a.width > 0);
+        let quads = app.map_quadrants();
+        // Hover over quadrant 3's centre → it becomes selected.
+        let (_, b) = quads[3];
+        let (cgx, cgy) = (u16::from(b.x) + u16::from(b.width) / 2, u16::from(b.y) + u16::from(b.height) / 2);
+        let (col, row) = (a.x + cgx * 2, a.y + cgy);
+        app.on_mouse(ev(MouseEventKind::Moved, col, row));
+        assert_eq!(app.zoom_sel, 3);
 
-        // Left-click at a known screen position maps to grid cell ((col-x)/2, row-y).
-        let (col, row) = (a.x + 8, a.y + 2);
-        let click = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: col, row, modifiers: KeyModifiers::empty() };
-        app.on_mouse(click);
-        assert_eq!(app.map_cur, (4, 2));
-
-        // Scroll up over a cell zooms into it; scroll down zooms back out.
+        // Left-click zooms in; right-click zooms out.
         let parent = app.range;
-        let scroll_up =
-            MouseEvent { kind: MouseEventKind::ScrollUp, column: a.x + 20, row: a.y + 4, modifiers: KeyModifiers::empty() };
-        app.on_mouse(scroll_up);
-        assert_ne!(app.range, parent, "scroll-up zoomed into a sub-range");
-        let scroll_down =
-            MouseEvent { kind: MouseEventKind::ScrollDown, column: a.x, row: a.y, modifiers: KeyModifiers::empty() };
-        app.on_mouse(scroll_down);
-        assert_eq!(app.range, parent, "scroll-down zoomed back out");
+        app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), col, row));
+        assert_ne!(app.range, parent);
+        app.on_mouse(ev(MouseEventKind::Down(MouseButton::Right), a.x, a.y));
+        assert_eq!(app.range, parent);
     }
 
     #[test]
@@ -1548,13 +1476,13 @@ mod tests {
         ]);
         let area = Rect::new(0, 0, 120, 50);
         let mut buf = Buffer::empty(area);
-        crate::tui::map::screen(&mut buf, &mut app); // fix map_dims
-        // Put the cursor inside the /26 so its most-specific subnet is IPMI.
+        crate::tui::map::screen(&mut buf, &mut app);
+        // Select the quadrant that holds the /26, so its boundary is what gets outlined.
+        let top = AddrRange::from(range);
         let (w, h) = app.map_dims;
-        let grid = crate::map::MapGrid::build(app.range, &HashMap::new(), w, h);
-        let host: IpAddr = "10.87.3.70".parse().unwrap();
-        let d = (0..grid.cells()).find(|&d| grid.cell_range(d).contains(host)).unwrap();
-        app.map_cur = grid.cell_xy(d);
+        let cells = u128::from(w) * u128::from(h);
+        let hd = top.slice_index(cells, top.offset_of("10.87.3.70".parse().unwrap()).unwrap()) as usize;
+        app.zoom_sel = app.map_quadrants().iter().position(|(dr, _)| dr.contains(&hd)).unwrap();
 
         let symbols = |app: &mut App| {
             let mut b = Buffer::empty(area);
@@ -1565,7 +1493,6 @@ mod tests {
         app.show_subnets = true;
         let on = symbols(&mut app);
         assert_ne!(off, on, "toggling subnet outlines must change the render");
-        // The /26 is a quarter of the /24, so its ring is on-screen (not clipped) — outline glyphs appear.
         let box_glyphs = ['╭', '╮', '╰', '╯', '─', '│', '├', '┤', '┬', '┴', '┼'];
         let count = |v: &[String]| v.iter().filter(|s| s.chars().next().is_some_and(|c| box_glyphs.contains(&c))).count();
         assert!(count(&on) > count(&off), "the outline adds box-drawing glyphs");
@@ -1588,7 +1515,7 @@ mod tests {
     }
 
     #[test]
-    fn map_names_the_real_subnet_under_the_cursor() {
+    fn map_info_pane_names_the_view_subnet() {
         use mullion::{Buffer, Rect};
         let range = Cidr::parse("10.87.3.0/24").unwrap();
         let mut app = App::new(range, Vec::new(), false, false, false, Config::default());
@@ -1597,68 +1524,14 @@ mod tests {
             Subnet { cidr: Cidr::parse("10.87.3.0/26").unwrap(), name: "IPMI".into() },
         ]);
         app.view = View::Map;
-        let mut buf = Buffer::empty(Rect::new(0, 0, 88, 16));
+        let area = Rect::new(0, 0, 120, 40); // wide enough for the info pane
+        let mut buf = Buffer::empty(area);
         crate::tui::map::screen(&mut buf, &mut app);
-        // The scope row is now the third header row above the grid (buffer row 3: top border
-        // 0, legend 1, cursor-info 2, scope 3). It names the most-specific NetBox subnet at
-        // the cursor: 10.87.3.0 → the /26, not the /24.
-        let scope: String = (0..88).map(|x| buf.get(x, 3).symbol.clone()).collect();
-        assert!(scope.contains("subnet: 10.87.3.0/26 (IPMI)"), "scope row: {scope:?}");
-    }
-
-    #[test]
-    fn map_curve_walk_clamps_to_the_curve_ends() {
-        let range = Cidr::parse("10.87.3.0/24").unwrap();
-        let mut app = App::new(range, Vec::new(), false, false, false, Config::default());
-        app.view = View::Map;
-        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 50));
-        crate::tui::map::screen(&mut buf, &mut app);
-        let (w, h) = app.map_dims;
-        let total = (u128::from(w) * u128::from(h)) as usize;
-        let g = mullion::spacefill::Gilbert::new(w, h);
-        // Hammering forward along the curve lands on its last index (the endpoint), not a corner.
-        for _ in 0..(total + 8) {
-            app.on_key(KeyCode::Right);
-            app.on_key(KeyCode::Down);
-        }
-        assert_eq!(g.xy_to_d(app.map_cur.0, app.map_cur.1), Some(total as u32 - 1));
-        // And back the other way clamps at index 0 — the curve starts at the origin.
-        for _ in 0..(total + 8) {
-            app.on_key(KeyCode::Left);
-            app.on_key(KeyCode::Up);
-        }
-        assert_eq!(app.map_cur, (0, 0));
-
-        // A single step right advances exactly one cell along the curve.
-        app.on_key(KeyCode::Right);
-        assert_eq!(g.xy_to_d(app.map_cur.0, app.map_cur.1), Some(1));
-    }
-
-    #[test]
-    fn jump_zone_leaps_to_the_next_occupied_run() {
-        // Two occupied cells with a gap between them on the curve; `n` jumps to the run holding
-        // the second, `N` back to the first.
-        let range = Cidr::parse("10.87.3.0/24").unwrap();
-        let hosts = ["10.87.3.5", "10.87.3.200"]; // far apart → different cells/zones
-        let facts: Vec<AddressFacts> = hosts
-            .iter()
-            .map(|a| AddressFacts { addr: a.parse().unwrap(), netbox: None, ptr: Some("x.".into()), live: true })
-            .collect();
-        let mut app = App::new(range, facts, false, false, false, Config::default());
-        app.view = View::Map;
-        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 50));
-        crate::tui::map::screen(&mut buf, &mut app);
-        let (w, h) = app.map_dims;
-        let grid = crate::map::MapGrid::build(app.range, &app.facts, w, h);
-        let occ_d = |app: &App| grid.xy_to_d(app.map_cur.0, app.map_cur.1).map(|d| grid.used[d as usize] > 0);
-
-        app.map_cur = (0, 0);
-        app.on_key(KeyCode::Char('n')); // → first occupied run
-        assert_eq!(occ_d(&app), Some(true), "n landed on an occupied cell");
-        let first = app.map_cur;
-        app.on_key(KeyCode::Char('n')); // → the next occupied run
-        assert_eq!(occ_d(&app), Some(true));
-        assert_ne!(app.map_cur, first, "n advanced to a different occupied zone");
+        // The info pane (beside the square) names the most-specific subnet at the view base:
+        // 10.87.3.0 → the /26, not the /24.
+        let text: String =
+            (0..area.height).flat_map(|y| (0..area.width).map(move |x| (x, y))).map(|(x, y)| buf.get(x, y).symbol.clone()).collect();
+        assert!(text.contains("10.87.3.0/26 IPMI"), "info pane should name the /26 subnet");
     }
 
     #[test]

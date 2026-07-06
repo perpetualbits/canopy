@@ -28,13 +28,13 @@ use std::net::IpAddr;
 
 use mullion::border::{BorderStyle, CornerStyle, LineWeight};
 use mullion::curve_map;
-use mullion::style::{Color, Style};
+use mullion::style::Color;
 use mullion::{Buffer, Rect};
 
 use super::app::App;
 use super::draw::{btxt, keyhints};
-use super::palette::{Knobs, Scheme, KNOBS};
-use super::theme::{s_accent, s_dim, s_sel, s_title};
+use super::palette::KNOBS;
+use super::theme::{s_accent, s_dim, s_title};
 use crate::map::MapGrid;
 use crate::reconcile::{self, AddrRange, AddressFacts, Subnet};
 
@@ -121,16 +121,77 @@ fn paint_bitstream(buf: &mut Buffer, x: u16, y: u16, band: usize, pos: f32, t: f
     buf.set_char(x + 1, y, '█', style);
 }
 
-/// Scale an RGB colour's luma by `f` (clamped), for the chooser's pulse glow. A non-RGB colour
-/// (e.g. the terminal-default `Reset` background of empty space) is left untouched.
-fn boost(c: Color, f: f32) -> Color {
-    match c {
-        Color::Rgb(r, g, b) => {
-            let s = |v: u8| (f32::from(v) * f).round().clamp(0.0, 255.0) as u8;
-            Color::Rgb(s(r), s(g), s(b))
-        }
-        other => other,
+/// Blend a colour `amount` (0..1) of the way toward **yellow** — the selected-quadrant pulse.
+/// A non-RGB colour (the terminal-default `Reset` of empty cells) is treated as black, so an
+/// empty cell in the selected quadrant glows a dim, pulsing yellow rather than staying blank.
+fn toward_yellow(c: Color, amount: f32) -> Color {
+    let a = amount.clamp(0.0, 1.0);
+    let (r0, g0, b0) = match c {
+        Color::Rgb(r, g, b) => (r, g, b),
+        _ => (0, 0, 0),
+    };
+    let lerp = |v: u8, t: u8| (f32::from(v) + (f32::from(t) - f32::from(v)) * a).round() as u8;
+    Color::Rgb(lerp(r0, 255), lerp(g0, 255), lerp(b0, 0))
+}
+
+/// Draw the information pane beside the Gilbert square: what the whole view holds, the subnet, the
+/// selected quadrant (what `Enter` would zoom into), and the zoom path. A light rule separates it.
+fn draw_info_pane(buf: &mut Buffer, pane: Rect, app: &App, grid: &MapGrid, quads: &[(std::ops::Range<usize>, Rect)], used_total: u32) {
+    for row in pane.y..pane.y + pane.height {
+        buf.set_char(pane.x, row, '│', s_dim());
     }
+    let (x, w) = (pane.x + 2, pane.width.saturating_sub(3));
+    let mut y = pane.y;
+    let line = |buf: &mut Buffer, y: &mut u16, text: &str, style| {
+        if *y < pane.y + pane.height {
+            btxt(buf, x, *y, &clip(text, w), style);
+        }
+        *y += 1;
+    };
+
+    let addrs = grid.range.block_len();
+    let cell_addrs = addrs / grid.cells().max(1) as u128;
+    line(buf, &mut y, "VIEW", s_title());
+    line(buf, &mut y, &app.range.label(), s_accent());
+    line(buf, &mut y, &format!("{used_total} used / {addrs} addr"), s_dim());
+    line(buf, &mut y, &format!("{} cells · {cell_addrs}/cell", grid.cells()), s_dim());
+    y += 1;
+
+    if let Some(s) = Subnet::most_specific(&app.subnets, app.range.base()) {
+        line(buf, &mut y, "SUBNET", s_title());
+        let name = if s.name.is_empty() { String::new() } else { format!(" {}", s.name) };
+        line(buf, &mut y, &format!("{}/{}{name}", s.cidr.base, s.cidr.prefix_len), s_dim());
+        y += 1;
+    }
+
+    if let Some((dr, _)) = quads.get(app.zoom_sel) {
+        let q = grid.range.span_slices(grid.cells() as u128, dr.start as u128, dr.end as u128);
+        let used: u32 = (dr.start..dr.end).filter_map(|d| grid.used.get(d)).sum();
+        line(buf, &mut y, &format!("QUADRANT {}/{}", app.zoom_sel + 1, quads.len()), s_title());
+        line(buf, &mut y, &q.label(), s_accent());
+        line(buf, &mut y, &format!("{} – {}", q.base(), q.last()), s_dim());
+        line(buf, &mut y, &format!("{used} used"), s_dim());
+        line(buf, &mut y, &names_in(&app.facts, q, 3), s_dim());
+        if !app.can_zoom_in() {
+            line(buf, &mut y, "(1 addr/cell — max zoom)", s_dim());
+        }
+        y += 1;
+    }
+
+    line(buf, &mut y, "PALETTE", s_title());
+    line(buf, &mut y, &format!("{} [s]", app.scheme.name()), s_dim());
+    let (kn, ..) = KNOBS[app.active_knob];
+    line(buf, &mut y, &format!("{kn} = {:.2}  [ ] ,.", app.knobs.get(app.active_knob)), s_dim());
+    y += 1;
+
+    let crumb = app.scope_chain().iter().map(mullion_label).collect::<Vec<_>>().join(" › ");
+    line(buf, &mut y, "PATH", s_title());
+    line(buf, &mut y, &crumb, s_dim());
+}
+
+/// A range's short label — a free function so it can be used in an iterator map.
+fn mullion_label(r: &AddrRange) -> String {
+    r.label()
 }
 
 /// Draw a rounded boundary around the subnet the cursor sits in. Membership is by **most-specific**
@@ -162,24 +223,6 @@ fn draw_subnet_outline(buf: &mut Buffer, body: Rect, grid: &MapGrid, app: &App) 
 }
 
 
-/// Draw the palette key at `(x, y)`: the scheme name, an `empty → full` swatch strip
-/// generated from the scheme itself (so it is self-documenting under any knob setting), and
-/// the currently-selected knob and its value.
-fn draw_legend_key(buf: &mut Buffer, x: u16, y: u16, scheme: Scheme, knobs: &Knobs, active_knob: usize) {
-    let cx = buf.set_string(x, y, &format!("scheme: {} [p] · ", scheme.name()), s_dim());
-    // Background swatches sampled from the scheme across the occupancy range (empty → full).
-    let mut sx = cx;
-    for k in 0..12u16 {
-        let frac = if k == 0 { 0.0 } else { 10f32.powf((f32::from(k) / 11.0 - 1.0) * knobs.decades) };
-        let (bg, _) = scheme.paint(frac, 0.5, knobs);
-        buf.set_char(sx + k, y, ' ', Style::default().bg(bg));
-    }
-    sx += 12;
-    // The active knob + value (selected with [ ], adjusted with , .).
-    let (name, ..) = KNOBS[active_knob];
-    buf.set_string(sx, y, &format!("  knob [{}] {} = {:.2}  [,.]", active_knob, name, knobs.get(active_knob)), s_dim());
-}
-
 /// A short, comma-separated list of the hostnames inside `sub` — what lives in the
 /// block under the cursor. Shows up to `max` names, then `+N` for the rest; `—` when
 /// the block is empty. Names come from the reconciled facts (PTR or NetBox name).
@@ -206,7 +249,7 @@ fn clip(text: &str, w: u16) -> String {
     text.chars().take(w as usize).collect()
 }
 
-/// Paint the map view for the current [`App`] state.
+/// Paint the map view (zoom mode) for the current [`App`] state.
 pub fn screen(buf: &mut Buffer, app: &mut App) {
     let full = buf.area;
     if full.width < 26 || full.height < 8 {
@@ -217,96 +260,40 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
     let title = format!("canopy — map: {}", app.range.label());
     let prog = app.progress.as_ref().map(|(f, l)| (*f, l.as_str()));
     let area = super::draw::frame(buf, full, &title, s_title(), Some(super::draw::data_badge(app)), prog, &app.heartbeat());
-
-    // Layout: three header rows — legend, cursor info, scope — ABOVE the Hilbert square, so
-    // the "what am I looking at" lines lead; then the grid; then the footer on the last row.
-    let legend_y = area.y;
-    let info_y = area.y + 1;
-    let scope_y = area.y + 2;
     let foot_y = area.y + area.height - 1;
-    let body = Rect::new(area.x, area.y + 3, area.width, area.height.saturating_sub(4));
 
-    let (gw, gh) = curve_map::fit_dims(body, app.range.block_len());
+    // Layout: the Gilbert square (with a rounded edge) on the left, an information pane on the
+    // right. The pane is dropped on a narrow terminal so the square keeps its room.
+    let pane_w = if area.width >= 66 { (area.width / 3).clamp(26, 42) } else { 0 };
+    let map_region = Rect::new(area.x, area.y, area.width - pane_w, area.height.saturating_sub(1));
+
+    // The grid sits one cell inside the region, leaving a ring for its rounded edge.
+    let inner = Rect::new(map_region.x + 1, map_region.y + 1, map_region.width.saturating_sub(2), map_region.height.saturating_sub(2));
+    let (gw, gh) = curve_map::fit_dims(inner, app.range.block_len());
     let grid = MapGrid::build(app.range, &app.facts, gw, gh);
+    let body = Rect::new(inner.x, inner.y, (gw as u16) * 2, gh as u16);
     let used_total: u32 = grid.used.iter().sum();
 
-    // Sync the app's cursor state to this frame's grid: the dims set what `Enter` zooms
-    // into, and a shrunk terminal may need the cursor clamped back in-bounds.
     app.map_dims = (grid.width, grid.height);
-    app.map_area = body; // remember the grid's screen rect so the mouse can hit-test cells
-    app.map_cur = (app.map_cur.0.min(grid.width.saturating_sub(1)), app.map_cur.1.min(grid.height.saturating_sub(1)));
+    app.map_area = body;
+    let quads = app.map_quadrants();
+    app.zoom_sel = app.zoom_sel.min(quads.len().saturating_sub(1));
+    // Keep the vestigial cell cursor on the selected quadrant's corner (used by the subnet outline).
+    app.map_cur = quads.get(app.zoom_sel).map_or((0, 0), |(_, b)| (u32::from(b.x), u32::from(b.y)));
 
-    // Row 0 — grid structure + density key (a Gilbert curve has no meaningful linear axis).
-    // The grid is sized so cells() divides the block evenly, so every cell holds exactly this
-    // power-of-two address count.
-    let cell_addrs = grid.range.block_len() / grid.cells().max(1) as u128;
-    let head = format!(
-        "Gilbert · {gw}×{gh} · cell = {cell_addrs} addrs · {used_total} used / {} total   ",
-        grid.range.block_len()
-    );
-    btxt(buf, area.x, legend_y, &head, s_dim());
-    draw_legend_key(buf, area.x + head.chars().count() as u16, legend_y, app.scheme, &app.knobs, app.active_knob);
-
-    // Rows 1–2 — the slice under the cursor (its range, occupancy, hostnames) and the scope
-    // breadcrumb + real NetBox subnet. When the grid is one cell, that slice is the whole
-    // current scope.
-    let cursor_d = grid.xy_to_d(app.map_cur.0, app.map_cur.1);
-    let zoomable = cursor_d.is_some() && grid.cells() > 1;
-    let (cell, used) = match cursor_d {
-        Some(d) => (grid.cell_range(d as usize), grid.used.get(d as usize).copied().unwrap_or(0)),
-        None => (app.range, used_total),
-    };
-    // For a sparse (huge) slice the "/block" denominator is astronomically large and
-    // unhelpful, so show just the used count; for an enumerable slice show used/total.
-    let block = cell.block_len();
-    let occ = if cell.is_enumerable() { format!("{used}/{block} used") } else { format!("{used} used") };
-    let info = format!(
-        "▸ {}   {} – {}   {occ}   {}",
-        cell.label(),
-        cell.base(),
-        cell.last(),
-        names_in(&app.facts, cell, 3),
-    );
-    btxt(buf, area.x, info_y, &clip(&info, area.width), s_accent());
-
-    let crumb = app
-        .scope_chain()
-        .iter()
-        .map(|c| c.label())
-        .collect::<Vec<_>>()
-        .join(" › ");
-    let subnet_txt = match Subnet::most_specific(&app.subnets, cell.base()) {
-        Some(s) if !s.name.is_empty() => format!("   ·   subnet: {}/{} ({})", s.cidr.base, s.cidr.prefix_len, s.name),
-        Some(s) => format!("   ·   subnet: {}/{}", s.cidr.base, s.cidr.prefix_len),
-        None => String::new(),
-    };
-    btxt(
-        buf,
-        area.x,
-        scope_y,
-        &clip(&format!("scope: {crumb}{subnet_txt}   ·   the line is the Gilbert curve · bg = occupancy"), area.width),
-        s_dim(),
-    );
-
-    // The Gilbert grid. mullion's `curve_map::render` owns the geometry — it draws each cell's
-    // segment of the curve with our per-cell `(fg, bg)`; this view only decides the colour.
-    // `clock` (seconds since start) animates the cluster bitstream; the loop ticks ~20×/s.
     let clock = app.anim_t();
     let total = grid.cells();
 
-    // The group treatment per cell, computed once (each lookup scans the facts). `None` when not
-    // in group mode or the cell has no group; an animated group is overdrawn as a bitstream below.
     let group_cells: Vec<Option<(crate::group::Look, f32)>> =
         if app.color_by_group { (0..total).map(|d| group_look_at(app, &grid, d)).collect() } else { Vec::new() };
 
-    // Quadrant chooser: the selected sub-block's curve luma-pulses, tapering to nothing at the
-    // joins so there is no seam with its neighbours (mullion's `pulse_segment`).
-    let pulse = app.chooser.and_then(|i| {
-        grid.gilbert().subblocks().get(i).map(|sb| curve_map::pulse_segment(total, sb.d_range.clone(), clock, 3))
-    });
+    // The selected quadrant's curve pulses **toward yellow at 2 Hz** (`t = clock·4π`, since the
+    // pulse period is 2π in `t`), tapering to nothing at the joins so there is no seam.
+    let pulse = quads
+        .get(app.zoom_sel)
+        .map(|(dr, _)| curve_map::pulse_segment(total, dr.clone(), clock * 4.0 * std::f32::consts::PI, 3));
 
-    // Base layer: occupancy heat, or a quiet static tint for a non-animated group, then the
-    // chooser pulse boosts the selected sub-block's luma.
+    // Base layer: occupancy heat / static group tint, then the quadrant pulse blends toward yellow.
     curve_map::render(buf, body, grid.gilbert(), |d| {
         let pos = if total > 1 { d as f32 / (total - 1) as f32 } else { 0.0 };
         let (bg, fg) = app.scheme.paint(grid.fraction(d), pos, &app.knobs);
@@ -315,16 +302,15 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
             _ => (fg, bg), // curve_map wants (fg, bg); Scheme::paint yields (bg, fg)
         };
         if let Some(p) = &pulse {
-            let g = p(d);
-            if g > 0.0 {
-                (fg, bg) = (boost(fg, 1.0 + g), boost(bg, 1.0 + g));
+            let a = p(d) * 0.9;
+            if a > 0.0 {
+                (fg, bg) = (toward_yellow(fg, a), toward_yellow(bg, a));
             }
         }
         (fg, bg)
     });
 
-    // Overlay: animated clusters/services as the flowing coloured-square bitstream. Each cluster
-    // fills its whole curve span — occupied members are lit bits, the gaps between them dim bits.
+    // Overlay: animated clusters as the flowing bitstream (span-filled: members lit, gaps dim).
     if app.color_by_group {
         let bits = bitstream_cells(app, &grid);
         for (d, cell) in bits.iter().enumerate() {
@@ -339,31 +325,24 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
         }
     }
 
-    // Overlay: the cursor cell, always on top so it stays findable.
-    if let Some(cd) = grid.xy_to_d(app.map_cur.0, app.map_cur.1) {
-        let (gx, gy) = grid.cell_xy(cd as usize);
-        let (x, y) = (body.x + (gx as u16) * 2, body.y + gy as u16);
-        if x + 1 < body.x + body.width && y < body.y + body.height {
-            buf.set_char(x, y, curve_map::cell_glyph(grid.gilbert(), cd as usize), s_sel());
-            buf.set_char(x + 1, y, ' ', s_sel());
-        }
-    }
-
-    // Subnet boundary: a rounded outline around the subnet under the cursor (mullion's region
-    // outline), a frame we can later hang VLAN/subnet info on.
     if app.show_subnets {
         draw_subnet_outline(buf, body, &grid, app);
     }
 
-    // Footer key hints — context-aware: the quadrant chooser has its own bindings.
-    let hints: &[(&str, &str)] = if app.chooser.is_some() {
-        &[("hjkl", "quadrant"), ("↵", "zoom in"), ("z", "cells"), ("Bksp", "out"), ("q", "quit")]
-    } else if zoomable {
-        &[("hl", "walk"), ("kj", "leap"), ("nf", "occ/free"), ("↵", "in"), ("z", "quadrant"), ("g", "groups"), ("b", "subnets"), ("q", "quit")]
-    } else {
-        &[("p", "palette"), ("g", "groups"), ("b", "subnets"), (", .", "tune"), ("Tab", "table"), ("q", "quit")]
-    };
-    keyhints(buf, area.x, foot_y, area.width, hints);
+    // The rounded edge around the whole Gilbert square (a frame for zoom animation + info later).
+    let edge = Rect::new(body.x.saturating_sub(1), body.y.saturating_sub(1), body.width + 2, body.height + 2);
+    let estyle = BorderStyle { weight: LineWeight::Light, corners: CornerStyle::Rounded, style: s_dim() };
+    mullion::border::draw_box(buf, edge, mullion::border::Borders::ALL, &estyle);
+
+    // The information pane beside the square.
+    if pane_w > 0 {
+        let pane = Rect::new(area.x + area.width - pane_w, area.y, pane_w, area.height.saturating_sub(1));
+        draw_info_pane(buf, pane, app, &grid, &quads, used_total);
+    }
+
+    let hints: &[(&str, &str)] =
+        &[("← ↑ ↓ →", "quadrant"), ("↵/click", "zoom in"), ("Esc/rclick", "out"), ("g", "groups"), ("b", "subnets"), ("q", "quit")];
+    keyhints(buf, area.x, foot_y, map_region.width, hints);
 }
 
 #[cfg(test)]
@@ -455,26 +434,24 @@ mod tests {
         println!("{}", dump_ansi(&mut app, 96, 48));
     }
 
-    /// Dump the **quadrant chooser** over a larger range: a sub-block selected, its curve
-    /// luma-pulsing seam-free across 12 frames. Run with
-    /// `cargo test --bin canopy map::tests::dump_chooser -- --ignored --nocapture`.
+    /// Dump the **zoom-mode** view over a `/16`: four quadrants, one selected and pulsing toward
+    /// yellow, the rounded edge, and the info pane — across 12 frames of the 2 Hz pulse. Run with
+    /// `cargo test --bin canopy map::tests::dump_zoom -- --ignored --nocapture`.
     #[test]
     #[ignore]
-    fn dump_chooser() {
+    fn dump_zoom() {
         use crate::reconcile::Cidr;
-        let range = Cidr::parse("10.87.0.0/18").unwrap();
+        let range = Cidr::parse("145.124.0.0/16").unwrap();
         let mut app = App::new(range, Vec::new(), false, false, false, crate::config::Config::default());
         app.view = super::super::app::View::Map;
-        // Render once to fix map_dims, then enter the chooser and select a middle sub-block.
-        let _ = dump_ansi(&mut app, 96, 48);
-        app.on_key(mullion::KeyCode::Char('z'));
-        app.on_key(mullion::KeyCode::Char('l'));
+        let _ = dump_ansi(&mut app, 100, 40); // fix map_dims
+        app.on_key(mullion::KeyCode::Right); // select a non-default quadrant
         let frames = 12;
         for i in 0..frames {
-            let t = i as f32 / frames as f32 * (std::f32::consts::TAU);
-            app.set_anim_clock(Some(t));
+            // One 2 Hz cycle: pulse uses t = clock·4π, so clock spans 0..0.5 s over 12 frames.
+            app.set_anim_clock(Some(i as f32 / frames as f32 * 0.5));
             println!("@@@FRAME {i}@@@");
-            println!("{}", dump_ansi(&mut app, 96, 48));
+            println!("{}", dump_ansi(&mut app, 100, 40));
         }
     }
 
