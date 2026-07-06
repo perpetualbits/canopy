@@ -621,6 +621,20 @@ impl AddrRange {
         AddrRange { first: self.first + lo, len: size.max(1), v6: self.v6 }
     }
 
+    /// The contiguous run covering slices `[d0, d1)` of an `n`-way split (see
+    /// [`nth_slice`](AddrRange::nth_slice)) — the address range of a whole **sub-block** of the
+    /// map (a run of adjacent cells on the curve), used to zoom into a chosen quadrant. Uses the
+    /// same slice boundaries as `nth_slice`, so `span_slices(n, d, d+1)` equals `nth_slice(n, d)`.
+    #[must_use]
+    pub fn span_slices(self, n: u128, d0: u128, d1: u128) -> AddrRange {
+        let n = n.max(1);
+        let block = self.len / n;
+        let rem = self.len % n;
+        let lo = |d: u128| d.min(n) * block + d.min(rem);
+        let (a, b) = (lo(d0.min(d1)), lo(d0.max(d1)));
+        AddrRange { first: self.first + a, len: (b - a).max(1), v6: self.v6 }
+    }
+
     /// Which of the `n` slices (see [`nth_slice`](AddrRange::nth_slice)) an in-run
     /// `offset` falls into — the exact inverse used to bucket a known address into its
     /// map cell. `offset` is `0..len`; the result is `0..n`.
@@ -870,5 +884,23 @@ mod tests {
             }
             assert_eq!(expected_lo, 256, "slices must tile the whole /24 for n={n}");
         }
+    }
+
+    /// `span_slices` covers exactly the union of the slices in `[d0, d1)`: a single-slice span
+    /// equals `nth_slice`, and adjacent spans tile the run with no gap.
+    #[test]
+    fn span_slices_covers_a_run_of_cells() {
+        let r = AddrRange::from(Cidr::parse("10.87.3.0/24").unwrap()); // 256
+        // A single-slice span is exactly that slice.
+        for d in [0u128, 3, 15] {
+            assert_eq!(r.span_slices(16, d, d + 1), r.nth_slice(16, d));
+        }
+        // The two halves of a 16-way split tile the whole /24.
+        let lo = r.span_slices(16, 0, 8);
+        let hi = r.span_slices(16, 8, 16);
+        assert_eq!(lo.base(), r.base());
+        assert_eq!(hi.last(), r.last());
+        assert_eq!(r.offset_of(hi.base()), Some(128)); // second half starts at the midpoint
+        assert_eq!(lo.block_len() + hi.block_len(), 256);
     }
 }

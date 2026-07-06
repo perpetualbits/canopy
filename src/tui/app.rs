@@ -158,6 +158,10 @@ pub struct App {
     /// `true` when the map colours cells by **group identity** (hue = which cluster) instead of
     /// occupancy; toggled with `g`. Occupancy still sets the brightness of a grouped cell.
     pub color_by_group: bool,
+    /// The **quadrant chooser**: `Some(i)` selects the `i`-th top-level sub-block of the current
+    /// map view (its curve segment luma-pulses); the arrows step between sub-blocks and `Enter`
+    /// zooms into the selected one. `None` is the normal per-cell cursor mode. Toggled with `z`.
+    pub chooser: Option<usize>,
     /// The human-asserted groups (from `conf.d/<site>.groups.toml`) and native NetBox clusters,
     /// kept so the grouping can be re-fused with inference whenever the facts change (a zoom).
     /// Empty on the demo/offline path; populated by [`set_group_sources`](App::set_group_sources).
@@ -243,6 +247,7 @@ impl App {
             active_knob: 0,
             grouping,
             color_by_group: false,
+            chooser: None,
             asserted_groups: Vec::new(),
             native_groups: Vec::new(),
             anim_override: None,
@@ -652,6 +657,24 @@ impl App {
     /// into the highlighted cell (its exact address slice), `Backspace`/`-` zooms back out.
     fn on_key_map(&mut self, code: KeyCode) {
         let (last_x, last_y) = (self.map_dims.0.saturating_sub(1), self.map_dims.1.saturating_sub(1));
+        // `z` toggles the quadrant chooser; while it is on, the arrows step between sub-blocks
+        // and Enter zooms into the selected one, so its keys are handled separately.
+        if code == KeyCode::Char('z') {
+            self.toggle_chooser();
+            return;
+        }
+        if self.chooser.is_some() {
+            match code {
+                KeyCode::Char('q') | KeyCode::Char('Q') => self.quit = true,
+                KeyCode::Left | KeyCode::Char('h') | KeyCode::Up | KeyCode::Char('k') => self.chooser_step(-1),
+                KeyCode::Right | KeyCode::Char('l') | KeyCode::Down | KeyCode::Char('j') => self.chooser_step(1),
+                KeyCode::Enter | KeyCode::Char('+') => self.zoom_into_chooser(),
+                KeyCode::Esc => self.chooser = None, // leave the chooser without zooming
+                KeyCode::Backspace | KeyCode::Char('-') => self.zoom_out(),
+                _ => {}
+            }
+            return;
+        }
         match code {
             KeyCode::Char('q') | KeyCode::Char('Q') => self.quit = true,
             // Esc only ever zooms out — never quits, so an extra zoom-out is harmless. Only q/Q
@@ -673,6 +696,58 @@ impl App {
             KeyCode::Char('.') => self.knobs.adjust(self.active_knob, 1.0),
             _ => {}
         }
+    }
+
+    /// The current map view's top-level sub-blocks (the curve's own quadrant partition), from
+    /// mullion. Empty when the grid is a single cell (nothing to choose).
+    #[must_use]
+    pub fn map_subblocks(&self) -> Vec<mullion::spacefill::SubBlock> {
+        let (w, h) = self.map_dims;
+        if u128::from(w) * u128::from(h) <= 1 {
+            return Vec::new();
+        }
+        mullion::spacefill::Gilbert::new(w, h).subblocks()
+    }
+
+    /// Enter the quadrant chooser (selecting the sub-block under the cursor) or leave it.
+    fn toggle_chooser(&mut self) {
+        if self.chooser.is_some() {
+            self.chooser = None;
+            return;
+        }
+        let (w, h) = self.map_dims;
+        let subs = self.map_subblocks();
+        if subs.is_empty() {
+            return; // one cell — nothing to choose
+        }
+        // Start on the sub-block containing the current cursor cell.
+        let g = mullion::spacefill::Gilbert::new(w, h);
+        let start = g.xy_to_d(self.map_cur.0, self.map_cur.1).map_or(0, |d| g.subblock_at(d as usize));
+        self.chooser = Some(start.min(subs.len() - 1));
+    }
+
+    /// Step the chooser selection by `delta` sub-blocks, wrapping.
+    fn chooser_step(&mut self, delta: isize) {
+        let n = self.map_subblocks().len();
+        if let (Some(i), true) = (self.chooser, n > 0) {
+            let next = (i as isize + delta).rem_euclid(n as isize) as usize;
+            self.chooser = Some(next);
+        }
+    }
+
+    /// Zoom into the selected sub-block: narrow the scope to the address run its cells cover.
+    fn zoom_into_chooser(&mut self) {
+        let (w, h) = self.map_dims;
+        let cells = u128::from(w) * u128::from(h);
+        let subs = self.map_subblocks();
+        let Some(sb) = self.chooser.and_then(|i| subs.get(i)) else { return };
+        let sub = self.range.span_slices(cells, sb.d_range.start as u128, sb.d_range.end as u128);
+        self.zoom_stack.push(ZoomFrame { range: self.range, facts: Rc::clone(&self.facts) });
+        let sub_facts: HashMap<IpAddr, AddressFacts> =
+            self.facts.iter().filter(|(a, _)| sub.contains(**a)).map(|(a, f)| (*a, f.clone())).collect();
+        self.chooser = None;
+        self.set_scope(sub, Rc::new(sub_facts));
+        self.status = Some((format!("zoomed into {}", self.range.label()), false));
     }
 
     /// The chain of ranges from the outermost scope down to the current one — the map's
@@ -757,6 +832,7 @@ impl App {
         self.tree_expanded.clear();
         self.pan = (0, 0);
         self.map_cur = (0, 0);
+        self.chooser = None; // a new scope has different sub-blocks; leave the chooser
         self.detail = false;
     }
 
@@ -1298,6 +1374,40 @@ mod tests {
         assert_eq!(app.range, top);
         assert_eq!(app.total, parent_total);
         assert_eq!(app.scope_chain(), vec![top]); // back to just the top scope
+    }
+
+    #[test]
+    fn quadrant_chooser_steps_and_zooms_into_a_subblock() {
+        let range = Cidr::parse("10.0.0.0/8").unwrap();
+        let mut app = App::new(range, Vec::new(), false, false, false, Config::default());
+        app.view = View::Map;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 50));
+        crate::tui::map::screen(&mut buf, &mut app); // sets map_dims
+        let top = AddrRange::from(range);
+        let subs = app.map_subblocks();
+        assert!(subs.len() >= 2, "a big grid has ≥2 sub-blocks to choose between");
+
+        // `z` enters the chooser on the sub-block under the cursor (cursor at (0,0) → block 0).
+        app.on_key(KeyCode::Char('z'));
+        assert_eq!(app.chooser, Some(0));
+        app.on_key(KeyCode::Char('l')); // step to the next sub-block
+        let sel = app.chooser.unwrap();
+        assert!(sel < subs.len() && sel != 0);
+
+        // Enter zooms into exactly that sub-block's address run, and leaves the chooser.
+        let expected = top.span_slices(u128::from(app.map_dims.0) * u128::from(app.map_dims.1), subs[sel].d_range.start as u128, subs[sel].d_range.end as u128);
+        app.on_key(KeyCode::Enter);
+        assert_eq!(app.chooser, None);
+        assert_eq!(app.range, expected);
+        assert!(app.total < (top.host_count().min(usize::MAX as u128) as usize));
+        assert_eq!(app.scope_chain(), vec![top, expected]);
+
+        // Esc leaves the chooser without zooming; Backspace restored parent already, so re-enter.
+        app.on_key(KeyCode::Char('z'));
+        assert!(app.chooser.is_some());
+        app.on_key(KeyCode::Esc);
+        assert_eq!(app.chooser, None);
+        assert_eq!(app.range, expected); // Esc in chooser did NOT zoom out
     }
 
     #[test]

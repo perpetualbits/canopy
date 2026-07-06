@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 
 use mullion::curve_map;
-use mullion::style::Style;
+use mullion::style::{Color, Style};
 use mullion::{Buffer, Rect};
 
 use super::app::App;
@@ -67,6 +67,18 @@ fn paint_bitstream(buf: &mut Buffer, x: u16, y: u16, band: usize, pos: f32, t: f
     let style = mullion::FlowStyle { band, ..Default::default() }.color(pos, t, active);
     buf.set_char(x, y, '█', style);
     buf.set_char(x + 1, y, '█', style);
+}
+
+/// Scale an RGB colour's luma by `f` (clamped), for the chooser's pulse glow. A non-RGB colour
+/// (e.g. the terminal-default `Reset` background of empty space) is left untouched.
+fn boost(c: Color, f: f32) -> Color {
+    match c {
+        Color::Rgb(r, g, b) => {
+            let s = |v: u8| (f32::from(v) * f).round().clamp(0.0, 255.0) as u8;
+            Color::Rgb(s(r), s(g), s(b))
+        }
+        other => other,
+    }
 }
 
 
@@ -206,16 +218,28 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
     let group_cells: Vec<Option<(crate::group::Look, f32)>> =
         if app.color_by_group { (0..total).map(|d| group_look_at(app, &grid, d)).collect() } else { Vec::new() };
 
-    // Base layer: occupancy heat, or a quiet static tint for a non-animated group.
+    // Quadrant chooser: the selected sub-block's curve luma-pulses, tapering to nothing at the
+    // joins so there is no seam with its neighbours (mullion's `pulse_segment`).
+    let pulse = app.chooser.and_then(|i| {
+        grid.gilbert().subblocks().get(i).map(|sb| curve_map::pulse_segment(total, sb.d_range.clone(), clock, 3))
+    });
+
+    // Base layer: occupancy heat, or a quiet static tint for a non-animated group, then the
+    // chooser pulse boosts the selected sub-block's luma.
     curve_map::render(buf, body, grid.gilbert(), |d| {
         let pos = if total > 1 { d as f32 / (total - 1) as f32 } else { 0.0 };
         let (bg, fg) = app.scheme.paint(grid.fraction(d), pos, &app.knobs);
-        if let Some(Some((look, occ))) = group_cells.get(d) {
-            if !look.animate {
-                return (fg, super::palette::hsl_rgb(look.hue, look.sat, 0.16 + 0.30 * occ));
+        let (mut fg, mut bg) = match group_cells.get(d) {
+            Some(Some((look, occ))) if !look.animate => (fg, super::palette::hsl_rgb(look.hue, look.sat, 0.16 + 0.30 * occ)),
+            _ => (fg, bg), // curve_map wants (fg, bg); Scheme::paint yields (bg, fg)
+        };
+        if let Some(p) = &pulse {
+            let g = p(d);
+            if g > 0.0 {
+                (fg, bg) = (boost(fg, 1.0 + g), boost(bg, 1.0 + g));
             }
         }
-        (fg, bg) // curve_map wants (fg, bg); Scheme::paint yields (bg, fg)
+        (fg, bg)
     });
 
     // Overlay: animated clusters/services as the flowing coloured-square bitstream.
@@ -242,11 +266,13 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
         }
     }
 
-    // Footer key hints (zoom only offered while there's a finer subnet to reach).
-    let hints: &[(&str, &str)] = if zoomable {
-        &[("hjkl", "move"), ("↵", "in"), ("Bksp", "out"), ("p", "palette"), ("[ ]", "knob"), (", .", "tune"), ("Tab", "table"), ("q", "quit")]
+    // Footer key hints — context-aware: the quadrant chooser has its own bindings.
+    let hints: &[(&str, &str)] = if app.chooser.is_some() {
+        &[("hjkl", "quadrant"), ("↵", "zoom in"), ("z", "cells"), ("Bksp", "out"), ("q", "quit")]
+    } else if zoomable {
+        &[("hjkl", "move"), ("↵", "in"), ("z", "quadrant"), ("Bksp", "out"), ("p", "palette"), ("g", "groups"), ("Tab", "table"), ("q", "quit")]
     } else {
-        &[("p", "palette"), ("[ ]", "knob"), (", .", "tune"), ("Tab", "table"), ("q", "quit")]
+        &[("p", "palette"), ("g", "groups"), ("[ ]", "knob"), (", .", "tune"), ("Tab", "table"), ("q", "quit")]
     };
     keyhints(buf, area.x, foot_y, area.width, hints);
 }
