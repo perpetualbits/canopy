@@ -3,7 +3,7 @@
 //! The IP-map view: the range laid on a **generalized-Hilbert (Gilbert) curve** as a grid of
 //! little cells sized so **every cell covers the same power-of-two number of addresses** (1, 2,
 //! 4, 8, …). The grid's cell count is a power of two that divides the range, so each cell is a
-//! clean, aligned sub-block rather than a ragged slice — see [`fit_dims`]. Built from
+//! clean, aligned sub-block rather than a ragged slice (see [`mullion::curve_map::fit_dims`]). Built from
 //! [`crate::map::MapGrid`] each frame (`O(width·height + facts)`), so a `/8` maps as cheaply as a
 //! `/24`. The legend labels the grid structure — dimensions, per-cell address count, and the
 //! covered range — not linear x/y ticks, which a space-filling layout has no use for.
@@ -26,7 +26,8 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 
-use mullion::style::{Color, Style};
+use mullion::curve_map;
+use mullion::style::Style;
 use mullion::{Buffer, Rect};
 
 use super::app::App;
@@ -36,67 +37,9 @@ use super::theme::{s_accent, s_dim, s_sel, s_title};
 use crate::map::MapGrid;
 use crate::reconcile::{self, AddrRange, AddressFacts, Subnet};
 
-/// A grid direction from one cell to an adjacent one.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Dir {
-    L,
-    R,
-    U,
-    D,
-}
-
-/// The direction from grid cell `a` to an adjacent cell `b` (`None` if not 4-adjacent).
-fn dir_between(a: (u32, u32), b: (u32, u32)) -> Option<Dir> {
-    match (i64::from(b.0) - i64::from(a.0), i64::from(b.1) - i64::from(a.1)) {
-        (1, 0) => Some(Dir::R),
-        (-1, 0) => Some(Dir::L),
-        (0, 1) => Some(Dir::D),
-        (0, -1) => Some(Dir::U),
-        _ => None,
-    }
-}
-
-/// The rounded box-drawing glyph for the Hilbert curve through a cell, from the ports toward
-/// its previous and next cell on the curve — plus whether the segment continues to the
-/// **right** (so the 2-wide cell's spacer is drawn as `─` and the line stays unbroken).
-///
-/// A cell has two ports (the curve enters and leaves), one at the curve's endpoints, or none
-/// for a lone order-0 cell. The glyph joins them: `─│` straight, `╭╮╰╯` for a turn.
-fn curve_glyph(a: Option<Dir>, b: Option<Dir>) -> (char, bool) {
-    let has = |d: Dir| a == Some(d) || b == Some(d);
-    let (l, r, u, dn) = (has(Dir::L), has(Dir::R), has(Dir::U), has(Dir::D));
-    let ch = if l && r {
-        '─'
-    } else if u && dn {
-        '│'
-    } else if r && u {
-        '╰'
-    } else if l && u {
-        '╯'
-    } else if r && dn {
-        '╭'
-    } else if l && dn {
-        '╮'
-    } else if l || r {
-        '─' // single horizontal port (an endpoint of the curve)
-    } else if u || dn {
-        '│' // single vertical port
-    } else {
-        '·' // a lone cell (order 0)
-    };
-    (ch, r)
-}
-
-/// Paint one map cell at `(x, y)`: the Hilbert-curve `glyph` in column `x` on background
-/// `bg`, foreground `fg`, then a spacer in `x + 1` — a `─` when the curve continues right so
-/// the line is unbroken, otherwise blank. The colours come from the active
-/// [`Scheme`](super::palette::Scheme); `selected` paints both columns in the cursor style.
-fn paint_cell(buf: &mut Buffer, x: u16, y: u16, bg: Color, fg: Color, selected: bool, curve: (char, bool)) {
-    let (glyph, connects_right) = curve;
-    let cell = if selected { s_sel() } else { Style::default().fg(fg).bg(bg) };
-    buf.set_char(x, y, glyph, cell);
-    buf.set_char(x + 1, y, if connects_right { '─' } else { ' ' }, cell);
-}
+// The Gilbert grid geometry — cell sizing, the rounded curve glyphs, and the per-cell paint
+// loop — now lives in [`mullion::curve_map`]; this view only supplies what a cell *means*
+// (its address slice and occupancy) as colours.
 
 /// The group treatment for cell `d` when colouring by **group identity**: the [`Look`] of the
 /// logical group that owns an address in the cell (its shared hue/saturation and whether it
@@ -119,59 +62,13 @@ fn group_look_at(app: &App, grid: &MapGrid, d: usize) -> Option<(crate::group::L
 /// the curve position `pos` and scrolls with the clock `t`, and `active` (the cell is occupied —
 /// a *set bit* in the stream) makes it glow while empty cells recede. Both of the cell's columns
 /// are filled with a solid block so the cluster reads as a run of flowing little squares. The
-/// cursor style still wins so the selection stays findable.
-fn paint_bitstream(buf: &mut Buffer, x: u16, y: u16, band: usize, pos: f32, t: f32, active: bool, selected: bool) {
-    let style = if selected {
-        s_sel()
-    } else {
-        mullion::FlowStyle { band, ..Default::default() }.color(pos, t, active)
-    };
+/// map cursor is drawn as a later overlay, so it still shows on top of a bitstream cell.
+fn paint_bitstream(buf: &mut Buffer, x: u16, y: u16, band: usize, pos: f32, t: f32, active: bool) {
+    let style = mullion::FlowStyle { band, ..Default::default() }.color(pos, t, active);
     buf.set_char(x, y, '█', style);
     buf.set_char(x + 1, y, '█', style);
 }
 
-/// Choose the Gilbert grid `(width, height)` for `body`, in cells (each cell is two columns
-/// wide, one row tall). **Every cell covers the same power-of-two number of addresses.**
-///
-/// The cell count `width · height` is itself a power of two (both dimensions are powers of two)
-/// that is at most the range's `block_len`, so `block_len / (width · height)` — the addresses per
-/// cell — is a clean `2ⁿ` (1, 2, 4, 8, …), identical for every cell. This deliberately trades
-/// filling the whole rectangle for clean, aligned blocks: a cell is always a real sub-block the
-/// eye and the zoom can reason about, never a ragged slice with an odd host count.
-///
-/// Both dimensions are ≥ 2 (or the grid is a single 1×1 cell), which also makes `width + height`
-/// even so the Gilbert curve is strictly continuous (see `mullion::spacefill`). Among grids with
-/// the finest resolution the squarest is chosen, then the wider.
-fn fit_dims(body: Rect, block_len: u128) -> (u32, u32) {
-    let w_max = u32::from(body.width / 2).max(1);
-    let h_max = u32::from(body.height).max(1);
-    // Largest power-of-two extent that fits each axis, as an exponent (`2^aw ≤ w_max`).
-    let aw = w_max.ilog2();
-    let ah = h_max.ilog2();
-    // Cap the total cell-count exponent at the address count so every cell holds ≥ 1 address.
-    let kb = if block_len <= 1 { 0 } else { block_len.ilog2() };
-
-    // Maximize the cell-count exponent `a + b` (finest resolution) with `a ∈ [1, aw]`,
-    // `b ∈ [1, ah]`, `a + b ≤ kb`. Score higher-is-better as `(a+b, squareness, a)` — most cells,
-    // then squarest (largest `MAX − |a−b|`), then wider. `None` (no split — a tiny range or a
-    // one-cell-wide screen) falls back to a single 1×1 cell.
-    let mut best: Option<(u32, u32, (u32, u32, u32))> = None;
-    for a in 1..=aw {
-        for b in 1..=ah {
-            if a + b > kb {
-                break; // b only grows; no larger b helps for this a
-            }
-            let score = (a + b, u32::MAX - a.abs_diff(b), a);
-            if best.is_none_or(|(_, _, bs)| score > bs) {
-                best = Some((a, b, score));
-            }
-        }
-    }
-    match best {
-        Some((a, b, _)) => (1 << a, 1 << b),
-        None => (1, 1),
-    }
-}
 
 /// Draw the palette key at `(x, y)`: the scheme name, an `empty → full` swatch strip
 /// generated from the scheme itself (so it is self-documenting under any knob setting), and
@@ -237,7 +134,7 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
     let foot_y = area.y + area.height - 1;
     let body = Rect::new(area.x, area.y + 3, area.width, area.height.saturating_sub(4));
 
-    let (gw, gh) = fit_dims(body, app.range.block_len());
+    let (gw, gh) = curve_map::fit_dims(body, app.range.block_len());
     let grid = MapGrid::build(app.range, &app.facts, gw, gh);
     let used_total: u32 = grid.used.iter().sum();
 
@@ -298,40 +195,50 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
         s_dim(),
     );
 
-    // The Gilbert grid: each cell draws its segment of the actual curve (rounded box glyphs)
-    // over a background coloured by occupancy, so the serpentine path is visible directly.
+    // The Gilbert grid. mullion's `curve_map::render` owns the geometry — it draws each cell's
+    // segment of the curve with our per-cell `(fg, bg)`; this view only decides the colour.
     // `clock` (seconds since start) animates the cluster bitstream; the loop ticks ~20×/s.
     let clock = app.anim_t();
     let total = grid.cells();
+
+    // The group treatment per cell, computed once (each lookup scans the facts). `None` when not
+    // in group mode or the cell has no group; an animated group is overdrawn as a bitstream below.
+    let group_cells: Vec<Option<(crate::group::Look, f32)>> =
+        if app.color_by_group { (0..total).map(|d| group_look_at(app, &grid, d)).collect() } else { Vec::new() };
+
+    // Base layer: occupancy heat, or a quiet static tint for a non-animated group.
+    curve_map::render(buf, body, grid.gilbert(), |d| {
+        let pos = if total > 1 { d as f32 / (total - 1) as f32 } else { 0.0 };
+        let (bg, fg) = app.scheme.paint(grid.fraction(d), pos, &app.knobs);
+        if let Some(Some((look, occ))) = group_cells.get(d) {
+            if !look.animate {
+                return (fg, super::palette::hsl_rgb(look.hue, look.sat, 0.16 + 0.30 * occ));
+            }
+        }
+        (fg, bg) // curve_map wants (fg, bg); Scheme::paint yields (bg, fg)
+    });
+
+    // Overlay: animated clusters/services as the flowing coloured-square bitstream.
     for d in 0..total {
-        let cur = grid.cell_xy(d);
-        let (gx, gy) = cur;
-        let selected = (gx, gy) == app.map_cur;
-        let x = body.x + (gx as u16) * 2;
-        let y = body.y + gy as u16;
-        if x + 1 < body.x + body.width && y < body.y + body.height {
-            // The ports toward the previous and next cell give the glyph; the active scheme
-            // gives the (background, curve) colours from occupancy and curve position.
-            let prev = (d > 0).then(|| grid.cell_xy(d - 1)).and_then(|p| dir_between(cur, p));
-            let next = (d + 1 < total).then(|| grid.cell_xy(d + 1)).and_then(|n| dir_between(cur, n));
-            let pos = if total > 1 { d as f32 / (total - 1) as f32 } else { 0.0 };
-            let (mut bg, fg) = app.scheme.paint(grid.fraction(d), pos, &app.knobs);
-            // In group mode, a cell owned by a logical group takes that group's identity. An
-            // animated group (a cluster/service) renders as the coloured-square bitstream — a
-            // brightness wave flowing along the curve; a quiet group just tints the background.
-            if app.color_by_group {
-                if let Some((look, occ)) = group_look_at(app, &grid, d) {
-                    if look.animate {
-                        // The hue streams along the curve (position d/total) and scrolls with the
-                        // clock; an occupied cell is a lit bit in the stream.
-                        let pos = if total > 1 { d as f32 / (total - 1) as f32 } else { 0.0 };
-                        paint_bitstream(buf, x, y, look.band, pos, clock, occ > 0.0, selected);
-                        continue;
-                    }
-                    bg = super::palette::hsl_rgb(look.hue, look.sat, 0.16 + 0.30 * occ);
+        if let Some(Some((look, occ))) = group_cells.get(d) {
+            if look.animate {
+                let (gx, gy) = grid.cell_xy(d);
+                let (x, y) = (body.x + (gx as u16) * 2, body.y + gy as u16);
+                if x + 1 < body.x + body.width && y < body.y + body.height {
+                    let pos = if total > 1 { d as f32 / (total - 1) as f32 } else { 0.0 };
+                    paint_bitstream(buf, x, y, look.band, pos, clock, *occ > 0.0);
                 }
             }
-            paint_cell(buf, x, y, bg, fg, selected, curve_glyph(prev, next));
+        }
+    }
+
+    // Overlay: the cursor cell, always on top so it stays findable.
+    if let Some(cd) = grid.xy_to_d(app.map_cur.0, app.map_cur.1) {
+        let (gx, gy) = grid.cell_xy(cd as usize);
+        let (x, y) = (body.x + (gx as u16) * 2, body.y + gy as u16);
+        if x + 1 < body.x + body.width && y < body.y + body.height {
+            buf.set_char(x, y, curve_map::cell_glyph(grid.gilbert(), cd as usize), s_sel());
+            buf.set_char(x + 1, y, ' ', s_sel());
         }
     }
 
@@ -426,52 +333,6 @@ mod tests {
         }
     }
 
-    /// Whatever the screen size and range, `fit_dims` yields a power-of-two cell count that
-    /// divides the block evenly, so every cell holds the same power-of-two number of addresses —
-    /// never a ragged count like 15.
-    #[test]
-    fn fit_dims_gives_equal_power_of_two_cells() {
-        let is_pow2 = |n: u128| n > 0 && n & (n - 1) == 0;
-        // A spread of terminal sizes and block sizes (all real CIDR block lengths).
-        for &(w, h) in &[(120u16, 50u16), (96, 48), (80, 24), (40, 10), (200, 60), (26, 8)] {
-            for pow in [0u32, 1, 4, 8, 12, 16, 20, 24] {
-                let block_len: u128 = 1 << pow;
-                let body = Rect::new(0, 0, w, h);
-                let (gw, gh) = fit_dims(body, block_len);
-                let cells = u128::from(gw) * u128::from(gh);
-                assert!(is_pow2(cells), "cell count {cells} not a power of two ({gw}×{gh})");
-                assert!(cells <= block_len, "more cells ({cells}) than addresses ({block_len})");
-                assert_eq!(block_len % cells, 0, "block {block_len} not divisible by {cells} cells");
-                assert!(is_pow2(block_len / cells), "addresses/cell {} not a power of two", block_len / cells);
-                // Fits the drawable rectangle and keeps the curve continuous (even w+h).
-                assert!(u32::from(w / 2) >= gw && u32::from(h) >= gh, "grid {gw}×{gh} overflows {w}×{h}");
-                assert_eq!((gw + gh) % 2, 0, "w+h must be even for a continuous curve");
-            }
-        }
-    }
-
-    #[test]
-    fn curve_glyph_joins_the_ports() {
-        // Straights, turns, endpoints, and the lone cell.
-        assert_eq!(curve_glyph(Some(Dir::L), Some(Dir::R)).0, '─');
-        assert_eq!(curve_glyph(Some(Dir::U), Some(Dir::D)).0, '│');
-        assert_eq!(curve_glyph(Some(Dir::R), Some(Dir::D)).0, '╭');
-        assert_eq!(curve_glyph(Some(Dir::L), Some(Dir::D)).0, '╮');
-        assert_eq!(curve_glyph(Some(Dir::R), Some(Dir::U)).0, '╰');
-        assert_eq!(curve_glyph(Some(Dir::L), Some(Dir::U)).0, '╯');
-        assert_eq!(curve_glyph(None, Some(Dir::R)).0, '─'); // endpoint
-        assert_eq!(curve_glyph(None, None).0, '·'); // order-0 lone cell
-        // The connects-right flag (drives the horizontal spacer) is set iff a port faces right.
-        assert!(curve_glyph(Some(Dir::L), Some(Dir::R)).1);
-        assert!(!curve_glyph(Some(Dir::L), Some(Dir::U)).1);
-    }
-
-    #[test]
-    fn dir_between_reads_grid_adjacency() {
-        assert_eq!(dir_between((2, 2), (3, 2)), Some(Dir::R));
-        assert_eq!(dir_between((2, 2), (2, 1)), Some(Dir::U));
-        assert_eq!(dir_between((2, 2), (4, 2)), None); // not 4-adjacent
-    }
 
     #[test]
     fn renders_both_styles_without_panicking() {

@@ -117,6 +117,13 @@ impl MapGrid {
     pub fn xy_to_d(&self, x: u32, y: u32) -> Option<u32> {
         self.gilbert.xy_to_d(x, y)
     }
+
+    /// The underlying Gilbert curve — for mullion's [`curve_map`](mullion::curve_map) helpers
+    /// (`render`, `subblocks`), which own the geometry the map only supplies data for.
+    #[must_use]
+    pub fn gilbert(&self) -> &Gilbert {
+        &self.gilbert
+    }
 }
 
 #[cfg(test)]
