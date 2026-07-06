@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026  Epsilon Null Operation
 //! The IP-map view: the range laid on a **generalized-Hilbert (Gilbert) curve** as a grid of
-//! little cells that **fills the whole terminal rectangle** — any `width × height`, not just a
-//! square power of two — each cell a contiguous address slice coloured by how full it is. Built
-//! from [`crate::map::MapGrid`] each frame (`O(width·height + facts)`), so a `/8` maps as cheaply
-//! as a `/24`. The legend labels the grid structure — dimensions, per-cell address count, and the
+//! little cells sized so **every cell covers the same power-of-two number of addresses** (1, 2,
+//! 4, 8, …). The grid's cell count is a power of two that divides the range, so each cell is a
+//! clean, aligned sub-block rather than a ragged slice — see [`fit_dims`]. Built from
+//! [`crate::map::MapGrid`] each frame (`O(width·height + facts)`), so a `/8` maps as cheaply as a
+//! `/24`. The legend labels the grid structure — dimensions, per-cell address count, and the
 //! covered range — not linear x/y ticks, which a space-filling layout has no use for.
 //!
 //! Each cell **draws its segment of the actual Gilbert curve** with rounded box-drawing
@@ -134,47 +135,46 @@ fn paint_bitstream(buf: &mut Buffer, x: u16, y: u16, look: crate::group::Look, o
 }
 
 /// Choose the Gilbert grid `(width, height)` for `body`, in cells (each cell is two columns
-/// wide, one row tall). The grid **fills** the drawable rectangle, but never asks for more
-/// cells than the range has addresses (`block_len`): a large range uses the whole screen at
-/// a coarse resolution; a small range shrinks to a power-of-two rectangle so each cell is a
-/// clean single sub-block. The two dimensions are nudged to share parity so the Gilbert
-/// curve is strictly 4-continuous — an unbroken line (see `mullion::spacefill::strictly_continuous`).
+/// wide, one row tall). **Every cell covers the same power-of-two number of addresses.**
+///
+/// The cell count `width · height` is itself a power of two (both dimensions are powers of two)
+/// that is at most the range's `block_len`, so `block_len / (width · height)` — the addresses per
+/// cell — is a clean `2ⁿ` (1, 2, 4, 8, …), identical for every cell. This deliberately trades
+/// filling the whole rectangle for clean, aligned blocks: a cell is always a real sub-block the
+/// eye and the zoom can reason about, never a ragged slice with an odd host count.
+///
+/// Both dimensions are ≥ 2 (or the grid is a single 1×1 cell), which also makes `width + height`
+/// even so the Gilbert curve is strictly continuous (see `mullion::spacefill`). Among grids with
+/// the finest resolution the squarest is chosen, then the wider.
 fn fit_dims(body: Rect, block_len: u128) -> (u32, u32) {
     let w_max = u32::from(body.width / 2).max(1);
     let h_max = u32::from(body.height).max(1);
-    let area = u128::from(w_max) * u128::from(h_max);
+    // Largest power-of-two extent that fits each axis, as an exponent (`2^aw ≤ w_max`).
+    let aw = w_max.ilog2();
+    let ah = h_max.ilog2();
+    // Cap the total cell-count exponent at the address count so every cell holds ≥ 1 address.
+    let kb = if block_len <= 1 { 0 } else { block_len.ilog2() };
 
-    let (mut w, mut h) = if block_len >= area {
-        // More addresses than cells: fill the whole rectangle (cells become ragged slices).
-        (w_max, h_max)
-    } else {
-        // Fewer addresses than the screen holds: block_len is a power of two, so pick the
-        // largest power-of-two rectangle (2^a × 2^b) that fits — this keeps each cell a
-        // clean, aligned sub-block. Prefer a wider grid to use horizontal space.
-        let k = (block_len as u64).trailing_zeros();
-        let mut best = (1u32, 1u32);
-        'outer: for m in (0..=k).rev() {
-            for a in (0..=m).rev() {
-                let (ww, hh) = (1u64 << a, 1u64 << (m - a));
-                if ww <= u64::from(w_max) && hh <= u64::from(h_max) {
-                    best = (ww as u32, hh as u32);
-                    break 'outer;
-                }
+    // Maximize the cell-count exponent `a + b` (finest resolution) with `a ∈ [1, aw]`,
+    // `b ∈ [1, ah]`, `a + b ≤ kb`. Score higher-is-better as `(a+b, squareness, a)` — most cells,
+    // then squarest (largest `MAX − |a−b|`), then wider. `None` (no split — a tiny range or a
+    // one-cell-wide screen) falls back to a single 1×1 cell.
+    let mut best: Option<(u32, u32, (u32, u32, u32))> = None;
+    for a in 1..=aw {
+        for b in 1..=ah {
+            if a + b > kb {
+                break; // b only grows; no larger b helps for this a
+            }
+            let score = (a + b, u32::MAX - a.abs_diff(b), a);
+            if best.is_none_or(|(_, _, bs)| score > bs) {
+                best = Some((a, b, score));
             }
         }
-        best
-    };
-
-    // A strictly-continuous curve (a clean, unbroken line) needs the dimensions to share
-    // parity; if they differ, trim one cell off the larger axis.
-    if (w + h) % 2 != 0 {
-        if h > 1 {
-            h -= 1;
-        } else if w > 1 {
-            w -= 1;
-        }
     }
-    (w.max(1), h.max(1))
+    match best {
+        Some((a, b, _)) => (1 << a, 1 << b),
+        None => (1, 1),
+    }
 }
 
 /// Draw the palette key at `(x, y)`: the scheme name, an `empty → full` swatch strip
@@ -251,9 +251,11 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
     app.map_cur = (app.map_cur.0.min(grid.width.saturating_sub(1)), app.map_cur.1.min(grid.height.saturating_sub(1)));
 
     // Row 0 — grid structure + density key (a Gilbert curve has no meaningful linear axis).
+    // The grid is sized so cells() divides the block evenly, so every cell holds exactly this
+    // power-of-two address count.
     let cell_addrs = grid.range.block_len() / grid.cells().max(1) as u128;
     let head = format!(
-        "Gilbert · {gw}×{gh} · cell ≈ {cell_addrs} addrs · {used_total} used / {} total   ",
+        "Gilbert · {gw}×{gh} · cell = {cell_addrs} addrs · {used_total} used / {} total   ",
         grid.range.block_len()
     );
     btxt(buf, area.x, legend_y, &head, s_dim());
@@ -425,6 +427,30 @@ mod tests {
             app.set_anim_clock(Some(t));
             println!("@@@FRAME {i}@@@");
             println!("{}", dump_ansi(&mut app, 96, 48));
+        }
+    }
+
+    /// Whatever the screen size and range, `fit_dims` yields a power-of-two cell count that
+    /// divides the block evenly, so every cell holds the same power-of-two number of addresses —
+    /// never a ragged count like 15.
+    #[test]
+    fn fit_dims_gives_equal_power_of_two_cells() {
+        let is_pow2 = |n: u128| n > 0 && n & (n - 1) == 0;
+        // A spread of terminal sizes and block sizes (all real CIDR block lengths).
+        for &(w, h) in &[(120u16, 50u16), (96, 48), (80, 24), (40, 10), (200, 60), (26, 8)] {
+            for pow in [0u32, 1, 4, 8, 12, 16, 20, 24] {
+                let block_len: u128 = 1 << pow;
+                let body = Rect::new(0, 0, w, h);
+                let (gw, gh) = fit_dims(body, block_len);
+                let cells = u128::from(gw) * u128::from(gh);
+                assert!(is_pow2(cells), "cell count {cells} not a power of two ({gw}×{gh})");
+                assert!(cells <= block_len, "more cells ({cells}) than addresses ({block_len})");
+                assert_eq!(block_len % cells, 0, "block {block_len} not divisible by {cells} cells");
+                assert!(is_pow2(block_len / cells), "addresses/cell {} not a power of two", block_len / cells);
+                // Fits the drawable rectangle and keeps the curve continuous (even w+h).
+                assert!(u32::from(w / 2) >= gw && u32::from(h) >= gh, "grid {gw}×{gh} overflows {w}×{h}");
+                assert_eq!((gw + gh) % 2, 0, "w+h must be even for a continuous curve");
+            }
         }
     }
 
