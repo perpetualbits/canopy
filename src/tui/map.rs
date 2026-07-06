@@ -115,10 +115,42 @@ fn bitstream_cells(app: &App, grid: &MapGrid) -> Vec<Option<(usize, bool)>> {
 /// a *set bit* in the stream) makes it glow while empty cells recede. Both of the cell's columns
 /// are filled with a solid block so the cluster reads as a run of flowing little squares. The
 /// map cursor is drawn as a later overlay, so it still shows on top of a bitstream cell.
-fn paint_bitstream(buf: &mut Buffer, x: u16, y: u16, band: usize, pos: f32, t: f32, active: bool) {
-    let style = mullion::FlowStyle { band, ..Default::default() }.color(pos, t, active);
+fn paint_bitstream(buf: &mut Buffer, x: u16, y: u16, band: usize, pos: f32, t: f32, active: bool, glow: f32) {
+    let mut style = mullion::FlowStyle { band, ..Default::default() }.color(pos, t, active);
+    if glow > 0.0 {
+        style = style.fg(lighten(style.fg, glow));
+    }
     buf.set_char(x, y, '█', style);
     buf.set_char(x + 1, y, '█', style);
+}
+
+/// The **hover glow** value per curve cell: a soft gaussian band centred on the synced cell
+/// `hover`, fading along the curve (σ ≈ 3 cells) and pulsing gently. `0` everywhere when nothing
+/// is hovered. Returned as an owned `Vec` so the render closures can index it cheaply.
+fn hover_glow(hover: Option<usize>, total: usize, clock: f32) -> Vec<f32> {
+    let Some(hd) = hover else { return Vec::new() };
+    const SIGMA: f32 = 3.0;
+    let pulse = 0.65 + 0.35 * (clock * std::f32::consts::TAU * 0.7).sin(); // slow, restrained breath
+    (0..total)
+        .map(|d| {
+            let dist = (d as isize - hd as isize).abs() as f32;
+            let g = (-(dist * dist) / (2.0 * SIGMA * SIGMA)).exp();
+            (g * pulse * 0.9).clamp(0.0, 1.0)
+        })
+        .collect()
+}
+
+/// Brighten an RGB colour by `amount` (0..1) — a luma lift that keeps the hue, so the hover glow
+/// *lifts* each cell's own palette rather than whitening it. Non-RGB colours are untouched.
+fn lighten(c: Color, amount: f32) -> Color {
+    match c {
+        Color::Rgb(r, g, b) => {
+            let f = 1.0 + amount.clamp(0.0, 1.0);
+            let s = |v: u8| (f32::from(v) * f).round().min(255.0) as u8;
+            Color::Rgb(s(r), s(g), s(b))
+        }
+        other => other,
+    }
 }
 
 /// Blend a colour `amount` (0..1) of the way toward **yellow** — the selected-quadrant pulse.
@@ -137,7 +169,7 @@ fn toward_yellow(c: Color, amount: f32) -> Color {
 /// Draw the information pane beside the Gilbert square (text left-aligned to the square, no
 /// divider): VIEW, PATH, SUBNET, QUADRANT, then a scrollable host list. The palette lives in the
 /// square's edge, not here.
-fn draw_info_pane(buf: &mut Buffer, pane: Rect, app: &App, grid: &MapGrid, quads: &[(std::ops::Range<usize>, Rect)], used_total: u32) {
+fn draw_info_pane(buf: &mut Buffer, pane: Rect, app: &App, grid: &MapGrid, quads: &[(std::ops::Range<usize>, Rect)], used_total: u32) -> Rect {
     let (x, w, bottom) = (pane.x, pane.width, pane.y + pane.height);
     let mut y = pane.y;
     let line = |buf: &mut Buffer, y: &mut u16, text: &str, style| {
@@ -179,23 +211,29 @@ fn draw_info_pane(buf: &mut Buffer, pane: Rect, app: &App, grid: &MapGrid, quads
     // hosts, never the address space).
     let hosts = app.hosts_in_view();
     let list_box = Rect::new(pane.x, y, w, bottom.saturating_sub(y));
-    if list_box.height >= 3 {
-        let bstyle = BorderStyle { weight: LineWeight::Light, corners: CornerStyle::Rounded, style: s_dim() };
-        mullion::border::draw_box(buf, list_box, mullion::border::Borders::ALL, &bstyle);
-        let rows = list_box.height.saturating_sub(2) as usize; // inside the top/bottom border
-        let text_w = list_box.width.saturating_sub(3); // a border each side + a scrollbar column
-        let scroll = app.host_scroll.min(hosts.len().saturating_sub(1));
-        let shown = rows.min(hosts.len().saturating_sub(scroll));
-        // The count sits in a gap in the box's top edge, like the palette on the square.
-        let label = format!("┤ hosts {}–{}/{} ├", (scroll + 1).min(hosts.len().max(1)), scroll + shown, hosts.len());
-        btxt(buf, list_box.x + 2, list_box.y, &clip(&label, list_box.width.saturating_sub(4)), s_dim());
-        for (i, (addr, name)) in hosts.iter().skip(scroll).take(rows).enumerate() {
-            btxt(buf, list_box.x + 1, list_box.y + 1 + i as u16, &clip(&format!("{addr}  {name}"), text_w), s_dim());
-        }
-        // A scrollbar on the right inside edge shows where the window sits in the whole list.
-        let track = Rect::new(list_box.x + list_box.width - 1, list_box.y + 1, 1, rows as u16);
-        mullion::render_scrollbar(buf, track, mullion::ScrollMetrics::from_window(scroll, rows, hosts.len()), s_dim());
+    if list_box.height < 3 {
+        return Rect::new(0, 0, 0, 0);
     }
+    let bstyle = BorderStyle { weight: LineWeight::Light, corners: CornerStyle::Rounded, style: s_dim() };
+    mullion::border::draw_box(buf, list_box, mullion::border::Borders::ALL, &bstyle);
+    let rows = list_box.height.saturating_sub(2) as usize; // inside the top/bottom border
+    let text_w = list_box.width.saturating_sub(3); // a border each side + a scrollbar column
+    let scroll = app.host_scroll.min(hosts.len().saturating_sub(1));
+    let shown = rows.min(hosts.len().saturating_sub(scroll));
+    // The count sits in a gap in the box's top edge, like the palette on the square.
+    let label = format!("┤ hosts {}–{}/{} ├", (scroll + 1).min(hosts.len().max(1)), scroll + shown, hosts.len());
+    btxt(buf, list_box.x + 2, list_box.y, &clip(&label, list_box.width.saturating_sub(4)), s_dim());
+    for (i, (addr, name)) in hosts.iter().skip(scroll).take(rows).enumerate() {
+        // A host in the synced cell lights up with the rest of its cell — the hover sync.
+        let synced = app.hover_d.is_some() && app.cell_of_addr(*addr) == app.hover_d;
+        let style = if synced { s_sel() } else { s_dim() };
+        btxt(buf, list_box.x + 1, list_box.y + 1 + i as u16, &clip(&format!("{addr}  {name}"), text_w), style);
+    }
+    // A scrollbar on the right inside edge shows where the window sits in the whole list.
+    let track = Rect::new(list_box.x + list_box.width - 1, list_box.y + 1, 1, rows as u16);
+    mullion::render_scrollbar(buf, track, mullion::ScrollMetrics::from_window(scroll, rows, hosts.len()), s_dim());
+    // The rows rectangle, so a pointer over a name can be mapped back to its host (reciprocal sync).
+    Rect::new(list_box.x + 1, list_box.y + 1, text_w, shown as u16)
 }
 
 /// A range's short label — a free function so it can be used in an iterator map.
@@ -279,7 +317,12 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
         .get(app.zoom_sel)
         .map(|(dr, _)| curve_map::pulse_segment(total, dr.clone(), clock * 4.0 * std::f32::consts::PI, 3));
 
-    // Base layer: occupancy heat / static group tint, then the quadrant pulse blends toward yellow.
+    // The hover glow: a soft luminous band threading the curve, brightest at the synced cell and
+    // fading along the curve (a gaussian), gently pulsing. Keeps each cell's own colour — it
+    // *lifts* the palette rather than washing it out — so the band reads as multicoloured light.
+    let glow = hover_glow(app.hover_d, total, clock);
+
+    // Base layer: occupancy heat / static group tint, then the quadrant pulse and the hover glow.
     curve_map::render(buf, body, grid.gilbert(), |d| {
         let pos = if total > 1 { d as f32 / (total - 1) as f32 } else { 0.0 };
         let (bg, fg) = app.scheme.paint(grid.fraction(d), pos, &app.knobs);
@@ -294,6 +337,9 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
                 fg = toward_yellow(fg, a);
             }
         }
+        if let Some(&g) = glow.get(d) {
+            fg = lighten(fg, g);
+        }
         (fg, bg)
     });
 
@@ -306,7 +352,7 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
                 let (x, y) = (body.x + (gx as u16) * 2, body.y + gy as u16);
                 if x + 1 < body.x + body.width && y < body.y + body.height {
                     let pos = if total > 1 { d as f32 / (total - 1) as f32 } else { 0.0 };
-                    paint_bitstream(buf, x, y, band, pos, clock, active);
+                    paint_bitstream(buf, x, y, band, pos, clock, active, glow.get(d).copied().unwrap_or(0.0));
                 }
             }
         }
@@ -338,9 +384,11 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
     let pane_x = edge.x + edge.width + 2;
     let pane = Rect::new(pane_x, area.y, (area.x + area.width).saturating_sub(pane_x), area.height.saturating_sub(1));
     app.pane_area = pane;
-    if pane.width >= 20 {
-        draw_info_pane(buf, pane, app, &grid, &quads, used_total);
-    }
+    app.host_list_area = if pane.width >= 20 {
+        draw_info_pane(buf, pane, app, &grid, &quads, used_total)
+    } else {
+        Rect::new(0, 0, 0, 0)
+    };
 
     let hints: &[(&str, &str)] =
         &[("← ↑ ↓ →", "quadrant"), ("↵/click", "zoom in"), ("Esc/rclick", "out"), ("g", "groups"), ("b", "subnets"), ("q", "quit")];

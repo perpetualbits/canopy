@@ -164,6 +164,12 @@ pub struct App {
     pub pane_area: Rect,
     /// Scroll offset (first visible row) of the pane's host list.
     pub host_scroll: usize,
+    /// The host list's on-screen rows rectangle at the last render — lets a pointer over a name
+    /// be mapped to its host (and thence its curve cell) for the hover synchronisation.
+    pub host_list_area: Rect,
+    /// The curve cell (`d` index) the pointer is synchronised to, if any — the shared key of the
+    /// hover glow: the cell lights up on the curve and every host inside it lights up in the pane.
+    pub hover_d: Option<usize>,
     /// An in-flight zoom sweep, if any — the map view suppresses new zooms while it runs.
     zoom_anim: Option<ZoomAnim>,
     /// Parent scopes to return to on zoom-out (each a range + its facts).
@@ -278,6 +284,8 @@ impl App {
             map_area: Rect::new(0, 0, 0, 0),
             pane_area: Rect::new(0, 0, 0, 0),
             host_scroll: 0,
+            host_list_area: Rect::new(0, 0, 0, 0),
+            hover_d: None,
             zoom_anim: None,
             asserted_groups: Vec::new(),
             native_groups: Vec::new(),
@@ -901,18 +909,48 @@ impl App {
         p.width > 0 && (p.x..p.x + p.width).contains(&column) && (p.y..p.y + p.height).contains(&row)
     }
 
-    /// Mouse control for the map (zoom mode): moving the pointer selects the quadrant under it,
-    /// left-click (or wheel-up) zooms into it, right-click (or wheel-down) zooms out. Over the info
-    /// pane, the wheel scrolls the host list instead of zooming.
+    /// The curve cell (`d`) under a mouse `(column, row)` over the square, if any.
+    fn cell_at_mouse(&self, column: u16, row: u16) -> Option<usize> {
+        let (gx, gy) = self.map_cell_at(column, row)?;
+        let (w, h) = self.map_dims;
+        mullion::spacefill::Gilbert::new(w, h).xy_to_d(gx, gy).map(|d| d as usize)
+    }
+
+    /// The curve cell holding `addr` in the current view, if `addr` is in range. Works for both
+    /// families (all `u128`), so a v6 address syncs exactly like a v4 one.
+    #[must_use]
+    pub fn cell_of_addr(&self, addr: IpAddr) -> Option<usize> {
+        let (w, h) = self.map_dims;
+        let cells = u128::from(w) * u128::from(h);
+        let off = self.range.offset_of(addr)?;
+        Some(self.range.slice_index(cells, off) as usize)
+    }
+
+    /// The curve cell of the host under a pointer `row` over the pane's host list, if any — the
+    /// reciprocal of the hover sync: pointing at a name lights up its place on the curve.
+    fn hover_from_pane_row(&self, row: u16) -> Option<usize> {
+        let a = self.host_list_area;
+        if a.height == 0 || row < a.y || row >= a.y + a.height {
+            return None;
+        }
+        let idx = self.host_scroll + usize::from(row - a.y);
+        let (addr, _) = self.hosts_in_view().into_iter().nth(idx)?;
+        self.cell_of_addr(addr)
+    }
+
+    /// Mouse control for the map (zoom mode): moving the pointer selects the quadrant under it and
+    /// **synchronises the hover glow** (the cell on the curve and its hosts in the pane light up
+    /// together); left-click (or wheel-up) zooms in, right-click (or wheel-down) zooms out. Over
+    /// the pane, the wheel scrolls the host list and hovering a name lights up its curve cell.
     pub fn on_mouse(&mut self, ev: MouseEvent) {
         if self.view != View::Map {
             return;
         }
-        // The wheel scrolls the host list when the pointer is over the pane.
         if self.over_pane(ev.column, ev.row) {
             match ev.kind {
                 MouseEventKind::ScrollDown => self.scroll_hosts(3),
                 MouseEventKind::ScrollUp => self.scroll_hosts(-3),
+                MouseEventKind::Moved | MouseEventKind::Drag(_) => self.hover_d = self.hover_from_pane_row(ev.row),
                 _ => {}
             }
             return;
@@ -922,6 +960,7 @@ impl App {
                 if let Some(q) = self.quadrant_at(ev.column, ev.row) {
                     self.zoom_sel = q;
                 }
+                self.hover_d = self.cell_at_mouse(ev.column, ev.row);
             }
             MouseEventKind::Down(MouseButton::Left) | MouseEventKind::ScrollUp => {
                 if let Some(q) = self.quadrant_at(ev.column, ev.row) {
@@ -985,6 +1024,7 @@ impl App {
         self.map_cur = (0, 0);
         self.zoom_sel = 0; // a new scope has fresh quadrants; select the first
         self.host_scroll = 0; // and a fresh host list
+        self.hover_d = None; // the cells changed; drop the hover sync
         self.detail = false;
     }
 
@@ -1650,6 +1690,38 @@ mod tests {
         let before = app.knobs.get(1);
         app.on_key(KeyCode::Char(',')); // decrease
         assert!(app.knobs.get(1) < before);
+    }
+
+    #[test]
+    fn hover_sync_links_names_to_curve_cells_ipv6() {
+        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+        use std::net::Ipv6Addr;
+        // A real IPv6 /48 with two hosts — the whole path is u128, so v6 works like v4.
+        let range = Cidr::parse("2001:db8::/48").unwrap();
+        let mk = |lo: u16| AddressFacts {
+            addr: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, lo)),
+            netbox: None,
+            ptr: Some(format!("h{lo}.nfra.nl.")),
+            live: true,
+        };
+        let mut app = App::new(range, vec![mk(9), mk(1)], false, false, false, Config::default());
+        app.view = View::Map;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 50));
+        crate::tui::map::screen(&mut buf, &mut app);
+
+        // A v6 address resolves to a curve cell — IPv6 end-to-end.
+        let first = app.hosts_in_view()[0].0; // sorted → 2001:db8::1
+        assert_eq!(first.to_string(), "2001:db8::1");
+        assert!(app.cell_of_addr(first).is_some(), "v6 address maps to a curve cell");
+
+        // Hovering the first name in the pane syncs `hover_d` to that host's cell (reciprocal sync).
+        let a = app.host_list_area;
+        assert!(a.height > 0, "the host list rendered");
+        app.on_mouse(MouseEvent { kind: MouseEventKind::Moved, column: a.x + 2, row: a.y, modifiers: KeyModifiers::empty() });
+        assert_eq!(app.hover_d, app.cell_of_addr(first), "the top row lit its curve cell");
+        // Moving off the pane and over empty space clears the sync.
+        app.on_mouse(MouseEvent { kind: MouseEventKind::Moved, column: 0, row: 0, modifiers: KeyModifiers::empty() });
+        assert_eq!(app.hover_d, None);
     }
 
     #[test]
