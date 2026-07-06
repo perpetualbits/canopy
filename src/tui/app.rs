@@ -158,6 +158,14 @@ pub struct App {
     /// `true` when the map colours cells by **group identity** (hue = which cluster) instead of
     /// occupancy; toggled with `g`. Occupancy still sets the brightness of a grouped cell.
     pub color_by_group: bool,
+    /// The human-asserted groups (from `conf.d/<site>.groups.toml`) and native NetBox clusters,
+    /// kept so the grouping can be re-fused with inference whenever the facts change (a zoom).
+    /// Empty on the demo/offline path; populated by [`set_group_sources`](App::set_group_sources).
+    asserted_groups: Vec<crate::group::Group>,
+    native_groups: Vec<crate::group::Group>,
+    /// When set, the fixed animation clock value used instead of the real elapsed time — a
+    /// headless-render hook (see [`set_anim_clock`](App::set_anim_clock)); `None` in normal use.
+    anim_override: Option<f32>,
     /// NetBox-defined subnets (variable-length) covering the range — used to label the
     /// real subnet the map cursor sits in. Empty until live data (or demo) supplies them.
     pub subnets: Vec<Subnet>,
@@ -235,6 +243,9 @@ impl App {
             active_knob: 0,
             grouping,
             color_by_group: false,
+            asserted_groups: Vec::new(),
+            native_groups: Vec::new(),
+            anim_override: None,
             subnets: Vec::new(),
             // Live CLI start means the endpoints already answered; otherwise we are on
             // demo data, not yet connected.
@@ -329,7 +340,14 @@ impl App {
     /// prompt), which is precisely the "am I frozen?" signal it exists to give.
     #[must_use]
     pub fn anim_t(&self) -> f32 {
-        self.started.elapsed().as_secs_f32()
+        self.anim_override.unwrap_or_else(|| self.started.elapsed().as_secs_f32())
+    }
+
+    /// Pin the animation clock to a fixed value (a headless render hook, so a frame at a chosen
+    /// phase can be captured deterministically). `None` restores the real elapsed clock. Test-only.
+    #[cfg(test)]
+    pub fn set_anim_clock(&mut self, t: Option<f32>) {
+        self.anim_override = t;
     }
 
     /// The heartbeat to draw on the frame this tick: its phase (from the clock) and the
@@ -709,6 +727,25 @@ impl App {
         }
     }
 
+    /// Install the human-asserted and native-cluster group sources (from `groups.toml` and, when
+    /// live, NetBox), then re-fuse the grouping. Called once at startup so the map's `g` mode
+    /// reflects the canopy config, not just naming inference.
+    pub fn set_group_sources(&mut self, asserted: Vec<crate::group::Group>, native: Vec<crate::group::Group>) {
+        self.asserted_groups = asserted;
+        self.native_groups = native;
+        self.rebuild_grouping();
+    }
+
+    /// Re-fuse the grouping from the stored asserted + native sources and the current facts'
+    /// inference. Called whenever the facts change (startup, a zoom) so identity stays in sync.
+    fn rebuild_grouping(&mut self) {
+        self.grouping = crate::group::merge(
+            self.asserted_groups.clone(),
+            self.native_groups.clone(),
+            crate::group::infer(&self.facts),
+        );
+    }
+
     /// Point the whole app at `range` with `facts` (already narrowed to it), rebuilding
     /// every derived view. Used by both zoom directions so all four views stay in sync.
     fn set_scope(&mut self, range: AddrRange, facts: Rc<HashMap<IpAddr, AddressFacts>>) {
@@ -718,8 +755,8 @@ impl App {
         let (graph, canvas) = build_graph(&facts);
         self.graph = graph;
         self.graph_canvas = canvas;
-        self.grouping = crate::group::merge(Vec::new(), Vec::new(), crate::group::infer(&facts));
         self.facts = facts;
+        self.rebuild_grouping();
         self.cur = ListCursor::new();
         self.tree_cur = 0;
         self.tree_expanded.clear();
@@ -878,9 +915,11 @@ pub fn run(
     live: bool,
     cfg: Config,
     initial_status: Option<String>,
+    groups: (Vec<crate::group::Group>, Vec<crate::group::Group>),
 ) -> anyhow::Result<()> {
     let mut app = App::new(range, facts, write_mode, dry_run, live, cfg);
     app.set_subnets(subnets);
+    app.set_group_sources(groups.0, groups.1);
     // A note carried in from startup (e.g. "discovered N blocks; browsing this one").
     if let Some(msg) = initial_status {
         app.status = Some((msg, false));

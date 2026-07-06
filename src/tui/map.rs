@@ -97,24 +97,40 @@ fn paint_cell(buf: &mut Buffer, x: u16, y: u16, bg: Color, fg: Color, selected: 
     buf.set_char(x + 1, y, if connects_right { '─' } else { ' ' }, cell);
 }
 
-/// The background colour for cell `d` when the map is colouring by **group identity**: the hue
-/// of the logical group that owns an address in the cell (shared across the whole cluster), at a
-/// lightness set by how full the cell is — so a group reads as one coloured region that
-/// brightens where it is packed. `None` when the cell holds no grouped address (the caller then
-/// keeps the occupancy colour, which leaves empty space at the terminal default).
+/// The group treatment for cell `d` when colouring by **group identity**: the [`Look`] of the
+/// logical group that owns an address in the cell (its shared hue/saturation and whether it
+/// animates) plus the cell's occupancy fraction. `None` when the cell holds no grouped address
+/// (the caller then keeps the occupancy colour, which leaves empty space at the terminal default).
 ///
 /// A coarse cell can span several groups; it takes the first grouped member in address order —
 /// enough to show a cluster's extent, and exact once zoomed to leaf cells.
-fn group_bg(app: &App, grid: &MapGrid, d: usize) -> Option<mullion::style::Color> {
+fn group_look_at(app: &App, grid: &MapGrid, d: usize) -> Option<(crate::group::Look, f32)> {
     let cr = grid.cell_range(d);
     let mut grouped: Vec<_> = app.facts.values().filter(|f| cr.contains(f.addr)).collect();
     grouped.sort_by_key(|f| f.addr);
     let g = grouped.iter().find_map(|f| app.grouping.group_of(f.addr))?;
-    let look = app.grouping.look(&g.id);
-    // Occupancy → lightness: any presence is clearly visible (0.20), a full cell brighter (0.48),
-    // staying dim enough that the bright curve line still reads on top.
-    let light = 0.20 + 0.28 * grid.fraction(d).clamp(0.0, 1.0);
-    Some(super::palette::hsl_rgb(look.hue, look.sat, light))
+    Some((app.grouping.look(&g.id), grid.fraction(d).clamp(0.0, 1.0)))
+}
+
+/// The block-glyph ramp for the animated cluster **bitstream** — the "stream of little coloured
+/// squares" of the vision doc. A brightness wave travels along the curve over time, and each
+/// cell picks a denser block as the wave crests, so a cluster's run of cells shimmers like data
+/// flowing down the Hilbert path.
+const BITSTREAM: [char; 5] = ['░', '▒', '▓', '█', '▓'];
+
+/// Paint one animated cluster cell as a coloured square: both of the cell's columns filled with a
+/// block from [`BITSTREAM`], in the group's hue, at a lightness that pulses with the travelling
+/// wave `phase`. `occ` sets the baseline brightness (fuller = brighter). The `selected` cursor
+/// still overrides the style so it stays findable.
+fn paint_bitstream(buf: &mut Buffer, x: u16, y: u16, look: crate::group::Look, occ: f32, phase: f32, selected: bool) {
+    let wave = 0.5 + 0.5 * phase.sin(); // 0..1
+    let glyph = BITSTREAM[((wave * (BITSTREAM.len() - 1) as f32).round() as usize).min(BITSTREAM.len() - 1)];
+    let base = 0.16 + 0.30 * occ;
+    let fg = super::palette::hsl_rgb(look.hue, look.sat, base * (0.5 + 0.5 * wave));
+    let bg = super::palette::hsl_rgb(look.hue, look.sat, base * 0.35);
+    let style = if selected { s_sel() } else { Style::default().fg(fg).bg(bg) };
+    buf.set_char(x, y, glyph, style);
+    buf.set_char(x + 1, y, glyph, style);
 }
 
 /// Choose the Gilbert grid `(width, height)` for `body`, in cells (each cell is two columns
@@ -286,6 +302,8 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
 
     // The Gilbert grid: each cell draws its segment of the actual curve (rounded box glyphs)
     // over a background coloured by occupancy, so the serpentine path is visible directly.
+    // `clock` (seconds since start) animates the cluster bitstream; the loop ticks ~20×/s.
+    let clock = app.anim_t();
     let total = grid.cells();
     for d in 0..total {
         let cur = grid.cell_xy(d);
@@ -300,11 +318,19 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
             let next = (d + 1 < total).then(|| grid.cell_xy(d + 1)).and_then(|n| dir_between(cur, n));
             let pos = if total > 1 { d as f32 / (total - 1) as f32 } else { 0.0 };
             let (mut bg, fg) = app.scheme.paint(grid.fraction(d), pos, &app.knobs);
-            // In group mode, a cell owned by a logical group takes that group's stable hue
-            // (occupancy still sets its brightness), so a cluster reads as one coloured region.
+            // In group mode, a cell owned by a logical group takes that group's identity. An
+            // animated group (a cluster/service) renders as the coloured-square bitstream — a
+            // brightness wave flowing along the curve; a quiet group just tints the background.
             if app.color_by_group {
-                if let Some(gbg) = group_bg(app, &grid, d) {
-                    bg = gbg;
+                if let Some((look, occ)) = group_look_at(app, &grid, d) {
+                    if look.animate {
+                        // Phase travels along the curve (index d) and scrolls with the clock, so
+                        // the squares appear to flow down the Hilbert path.
+                        let phase = d as f32 * 0.6 - clock * 3.0;
+                        paint_bitstream(buf, x, y, look, occ, phase, selected);
+                        continue;
+                    }
+                    bg = super::palette::hsl_rgb(look.hue, look.sat, 0.16 + 0.30 * occ);
                 }
             }
             paint_cell(buf, x, y, bg, fg, selected, curve_glyph(prev, next));
@@ -381,7 +407,9 @@ mod tests {
         println!("{}", dump_ansi(&mut app, 96, 48));
     }
 
-    /// Dump the **group-identity**-coloured map (`g` mode): each logical group's stable hue.
+    /// Dump the **group-identity**-coloured map (`g` mode): each logical group's stable hue, with
+    /// clusters as the animated coloured-square bitstream. Emits several frames across the
+    /// animation cycle (separated by `@@@FRAME t@@@` markers) so a viewer can replay the motion.
     /// Run with `cargo test --bin canopy map::tests::dump_groups -- --ignored --nocapture`.
     #[test]
     #[ignore]
@@ -390,7 +418,14 @@ mod tests {
         let mut app = App::new(range, facts, false, false, false, crate::config::Config::default());
         app.view = super::super::app::View::Map;
         app.color_by_group = true;
-        println!("{}", dump_ansi(&mut app, 96, 48));
+        // 12 frames over one wave period (2π / speed 3.0 ≈ 2.09s) → a smooth loop.
+        let frames = 12;
+        for i in 0..frames {
+            let t = i as f32 / frames as f32 * (std::f32::consts::TAU / 3.0);
+            app.set_anim_clock(Some(t));
+            println!("@@@FRAME {i}@@@");
+            println!("{}", dump_ansi(&mut app, 96, 48));
+        }
     }
 
     #[test]

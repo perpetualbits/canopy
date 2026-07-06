@@ -205,7 +205,26 @@ fn main() -> anyhow::Result<()> {
         return preview_push_group(&name, range, &args, &cfg, &facts);
     }
 
-    tui::run(range, facts, subnets, args.write, args.dry_run, args.live, cfg, None)
+    let groups = load_group_sources(&args, &cfg, &range, &facts);
+    tui::run(range, facts, subnets, args.write, args.dry_run, args.live, cfg, None, groups)
+}
+
+/// Load the group sources for the TUI: the human-asserted staging file
+/// (`conf.d/<site>.groups.toml`) and, when `--live`, the native NetBox clusters in `range`.
+/// Returns `(asserted, native)` for [`tui::run`]; a missing/unreadable staging file or a native
+/// fetch failure degrades to empty (inference still colours the map). Read-only.
+fn load_group_sources(args: &Args, cfg: &Config, range: &Cidr, _facts: &[reconcile::AddressFacts]) -> (Vec<group::Group>, Vec<group::Group>) {
+    let asserted = std::fs::read_to_string(config::groups_path(&args.site))
+        .ok()
+        .and_then(|t| toml::from_str::<group::GroupsFile>(&t).ok())
+        .map(group::GroupsFile::into_groups)
+        .unwrap_or_default();
+    let native = if args.live {
+        group::from_native(live::gather_native_clusters(range, cfg).unwrap_or_default())
+    } else {
+        Vec::new()
+    };
+    (asserted, native)
 }
 
 /// Discover the DNS estate (which server masters which zones) and print it as a
@@ -300,7 +319,8 @@ fn run_discovery(args: &Args, cfg: &Config) -> anyhow::Result<()> {
         primary.cidr.prefix_len
     );
     let data = live::gather_live_with_token(&primary.cidr, cfg, token, |_, _| {})?;
-    tui::run(primary.cidr, data.facts, data.subnets, args.write, args.dry_run, true, cfg.clone(), Some(note))
+    let groups = load_group_sources(args, cfg, &primary.cidr, &data.facts);
+    tui::run(primary.cidr, data.facts, data.subnets, args.write, args.dry_run, true, cfg.clone(), Some(note), groups)
 }
 
 /// Build and preview (or, with `--write`, apply) a plan to allocate one address.
