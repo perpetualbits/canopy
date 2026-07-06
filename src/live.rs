@@ -123,6 +123,21 @@ pub fn gather_native_clusters(range: &Cidr, cfg: &Config) -> anyhow::Result<Vec<
     netbox.gather_native_clusters(range)
 }
 
+/// Gather the current tag slugs on every IP object in `range` (keyed by address), fetching the
+/// token first. Read-only; the live state a `--push-group` preview diffs against.
+///
+/// # Errors
+/// Propagates a token failure or the NetBox fetch.
+pub fn gather_ip_tags(range: &Cidr, cfg: &Config) -> anyhow::Result<std::collections::HashMap<std::net::IpAddr, Vec<String>>> {
+    let token = get_token(&cfg.token_pass)?;
+    let netbox = NetboxSource {
+        vantage: Vantage::with_jump(&cfg.vantage, &cfg.jump),
+        base_url: cfg.netbox_url.clone(),
+        token,
+    };
+    netbox.gather_ip_tags(range)
+}
+
 /// Fetch the NetBox token from `$CANOPY_NETBOX_TOKEN`, else from `pass`.
 ///
 /// Keeping it out of argv and config: the env var wins for CI, otherwise we shell

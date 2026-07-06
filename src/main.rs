@@ -105,6 +105,12 @@ struct Args {
     #[arg(long)]
     list_groups: bool,
 
+    /// Preview the NetBox tag writes that would record one group (by name/slug). Read-only: it
+    /// shows the exact per-address diff and writes nothing. Pass `--live` to diff against the
+    /// real current tags.
+    #[arg(long, value_name = "GROUP")]
+    push_group: Option<String>,
+
     /// Plan allocating an address (see --addr) as this FQDN; prints the change plan.
     #[arg(long, value_name = "FQDN")]
     allocate: Option<String>,
@@ -193,6 +199,10 @@ fn main() -> anyhow::Result<()> {
         let native = if args.live { live::gather_native_clusters(&range, &cfg)? } else { Vec::new() };
         list_groups(&facts, &args.site, native);
         return Ok(());
+    }
+
+    if let Some(name) = args.push_group.clone() {
+        return preview_push_group(&name, range, &args, &cfg, &facts);
     }
 
     tui::run(range, facts, subnets, args.write, args.dry_run, args.live, cfg, None)
@@ -462,6 +472,62 @@ fn list_groups(facts: &[reconcile::AddressFacts], site: &str, native: Vec<group:
 
     let pending = grouping.pending_pushes();
     println!("\n{} group(s); {} not yet in NetBox.", grouping.groups.len(), pending.len());
+}
+
+/// Preview the NetBox tag writes that would record one group — **read-only**. Builds the
+/// grouping, finds the named group, and (when `--live`) diffs its intended `cluster:<slug>` tag
+/// against each member's current NetBox tags, printing exactly what would change. Nothing is
+/// sent; `--write` is deliberately refused until the apply path is built and verified.
+///
+/// This is the deliberately-cautious first half of the write path: make the change legible and
+/// prove it on a single group before any mutation exists.
+///
+/// # Errors
+/// Propagates the live tag/native-cluster fetch when `--live` is set.
+fn preview_push_group(name: &str, range: Cidr, args: &Args, cfg: &Config, facts: &[reconcile::AddressFacts]) -> anyhow::Result<()> {
+    let map: std::collections::HashMap<std::net::IpAddr, reconcile::AddressFacts> =
+        facts.iter().cloned().map(|f| (f.addr, f)).collect();
+    let native = if args.live { live::gather_native_clusters(&range, cfg)? } else { Vec::new() };
+    let asserted = std::fs::read_to_string(config::groups_path(&args.site))
+        .ok()
+        .and_then(|t| toml::from_str::<group::GroupsFile>(&t).ok())
+        .map(group::GroupsFile::into_groups)
+        .unwrap_or_default();
+    let grouping = group::merge(asserted, group::from_native(native), group::infer(&map));
+
+    let want = group::GroupId::slug(name);
+    let Some(g) = grouping.groups.iter().find(|g| g.id == want || g.label == name) else {
+        eprintln!("no group named {name:?}. Try `canopy --list-groups{}`.", if args.live { " --live" } else { "" });
+        std::process::exit(1);
+    };
+
+    if !g.needs_push() {
+        println!("Group {:?} is already in NetBox (native cluster) — nothing to push.", g.label);
+        return Ok(());
+    }
+
+    // The live current-tag state to diff against; offline we assume no tags yet.
+    let current = if args.live { live::gather_ip_tags(&range, cfg)? } else { std::collections::HashMap::new() };
+    let writes = g.plan_tag_writes(&current);
+    let (to_add, present): (Vec<_>, Vec<_>) = writes.iter().partition(|w| !w.already_present);
+
+    println!("Preview: record group {:?} in NetBox", g.label);
+    println!("  tag: {}", g.netbox_target_tag().unwrap_or_default());
+    println!("  members: {}   would add: {}   already tagged: {}\n", writes.len(), to_add.len(), present.len());
+    for w in &writes {
+        let mark = if w.already_present { "=" } else { "+" };
+        let host = g.host_of(w.addr).unwrap_or("");
+        println!("  {mark} {:<16} {host}", w.addr.to_string());
+    }
+    if !args.live {
+        println!("\n(offline — pass --live to diff against the real current tags)");
+    }
+    println!("\nPREVIEW ONLY — no changes sent to NetBox.");
+    if args.write {
+        eprintln!("refusing --write: the tag-apply path is not implemented yet; verify this preview first.");
+        std::process::exit(2);
+    }
+    Ok(())
 }
 
 fn list_table(range: Cidr, facts: &[reconcile::AddressFacts]) {

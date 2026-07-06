@@ -191,6 +191,23 @@ impl NetboxSource {
             .collect())
     }
 
+    /// Gather the current **tag slugs** on every IP object in `range`, keyed by address — the
+    /// live state a tag-write preview diffs against. Read-only.
+    ///
+    /// # Errors
+    /// Propagates SSH/HTTP failures or a non-JSON body.
+    pub fn gather_ip_tags(&self, range: &Cidr) -> anyhow::Result<std::collections::HashMap<std::net::IpAddr, Vec<String>>> {
+        let (net, pl) = (range.network(), range.prefix_len);
+        let first = format!("{}/api/ipam/ip-addresses/?parent={net}/{pl}&limit=1000", self.base_url.trim_end_matches('/'));
+        let mut out = std::collections::HashMap::new();
+        for json in self.paginate(first)? {
+            for (addr, tags) in parse_ip_tags(&json, range)? {
+                out.insert(addr, tags);
+            }
+        }
+        Ok(out)
+    }
+
     /// Follow NetBox's `next` links from `first`, returning every page's raw JSON body.
     ///
     /// NetBox paginates list endpoints (`{count, next, results}`); a single `limit=1000`
@@ -418,9 +435,52 @@ pub fn parse_vm_ip_members(json: &str, range: &Cidr) -> anyhow::Result<Vec<(u32,
         .collect())
 }
 
+/// Parse an `ip-addresses` page into `(addr, tag_slugs)` for objects inside `range`. An object
+/// with no tags yields an empty vec (so the address is still known to exist).
+///
+/// # Errors
+/// Fails if the body is not the expected `{results: [...]}` JSON.
+pub fn parse_ip_tags(json: &str, range: &Cidr) -> anyhow::Result<Vec<(std::net::IpAddr, Vec<String>)>> {
+    let v: serde_json::Value = serde_json::from_str(json).context("NetBox ip-addresses response was not JSON")?;
+    let results = v.get("results").and_then(|r| r.as_array()).context("ip-addresses response had no `results`")?;
+    Ok(results
+        .iter()
+        .filter_map(|o| {
+            let addr: std::net::IpAddr = o.get("address")?.as_str()?.split('/').next()?.parse().ok()?;
+            if !range.contains(addr) {
+                return None;
+            }
+            let tags = o
+                .get("tags")
+                .and_then(|t| t.as_array())
+                .map(|arr| arr.iter().filter_map(|t| t.get("slug").and_then(|s| s.as_str()).map(str::to_string)).collect())
+                .unwrap_or_default();
+            Some((addr, tags))
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tag slugs are read per address; an object without a matching family/range is skipped.
+    #[test]
+    fn parses_ip_tags() {
+        let range = Cidr::parse("10.87.3.0/24").unwrap();
+        let tags = parse_ip_tags(
+            r#"{"results":[
+                {"address":"10.87.3.20/24","tags":[{"slug":"cluster:aether"},{"slug":"install-interface"}]},
+                {"address":"10.87.3.21/24","tags":[]},
+                {"address":"10.99.9.9/24","tags":[{"slug":"other"}]}
+            ]}"#,
+            &range,
+        )
+        .unwrap();
+        assert_eq!(tags.len(), 2); // the out-of-range IP is dropped
+        let a20 = &tags.iter().find(|(a, _)| a.to_string() == "10.87.3.20").unwrap().1;
+        assert!(a20.contains(&"cluster:aether".to_string()));
+    }
 
     /// The native-cluster join: cluster name + VM→cluster + VM-interface IP all resolve, and a
     /// device-assigned IP is ignored.

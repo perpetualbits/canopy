@@ -200,6 +200,58 @@ impl Group {
     pub fn needs_push(&self) -> bool {
         !self.origin.in_netbox()
     }
+
+    /// The tag slug this group would be pushed as (`cluster:aether`), or `None` for a native
+    /// group whose target is a cluster object rather than a tag.
+    #[must_use]
+    pub fn netbox_target_tag(&self) -> Option<String> {
+        match self.netbox_target() {
+            NetboxTarget::Tag(t) => Some(t),
+            NetboxTarget::Cluster(_) => None,
+        }
+    }
+
+    /// The best hostname we hold for `addr` among this group's members, for display.
+    #[must_use]
+    pub fn host_of(&self, addr: IpAddr) -> Option<&str> {
+        self.members.iter().find(|m| m.addr == Some(addr)).and_then(|m| m.host.as_deref())
+    }
+
+    /// The tag writes that would record this group in NetBox: the group's tag applied to each
+    /// member IP, each marked `already_present` where the member's current tags (keyed by
+    /// address in `current`) already carry it. **Pure — computes intent only; nothing is sent.**
+    ///
+    /// One entry per (address, tag) so a preview lists exactly what would change and an apply can
+    /// be gated item-by-item, never in bulk. A native-origin group targets a cluster, not a tag,
+    /// so it yields no writes (it is already in NetBox). Members with no address are skipped — a
+    /// NetBox IP-tag write is keyed on the address.
+    #[must_use]
+    pub fn plan_tag_writes(&self, current: &HashMap<IpAddr, Vec<String>>) -> Vec<TagWrite> {
+        let NetboxTarget::Tag(tag) = self.netbox_target() else {
+            return Vec::new();
+        };
+        self.members
+            .iter()
+            .filter_map(|m| m.addr)
+            .map(|addr| {
+                let already_present = current.get(&addr).is_some_and(|ts| ts.iter().any(|t| t == &tag));
+                TagWrite { addr, tag: tag.clone(), already_present }
+            })
+            .collect()
+    }
+}
+
+/// One intended NetBox tag write: apply `tag` to the IP object for `addr`, unless it is
+/// `already_present`. Deliberately the smallest unit — a single address and a single tag — so a
+/// preview enumerates every change and applying can be confirmed per item and never at scale.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TagWrite {
+    /// The member address whose NetBox IP object would be tagged.
+    pub addr: IpAddr,
+    /// The tag slug to apply (`cluster:aether`).
+    pub tag: String,
+    /// `true` when the object already carries the tag — a no-op, shown but never written.
+    pub already_present: bool,
 }
 
 // ─── groups.toml (the staging file) ───────────────────────────────────────────────────────
@@ -640,6 +692,33 @@ mod tests {
         assert_eq!(g.group_of(v4(52)).unwrap().id.0, "special");
         // .54 was not asserted, so it stays with the inferred family.
         assert_eq!(g.group_of(v4(54)).unwrap().id.0, "netapp-dw");
+    }
+
+    /// The tag-write plan marks an already-tagged member as a no-op and a native group as nothing
+    /// to write.
+    #[test]
+    fn plan_tag_writes_is_idempotent_and_native_free() {
+        let g = Group {
+            id: GroupId::slug("aether"),
+            label: "aether".into(),
+            kind: GroupKind::Cluster,
+            origin: Origin::Inferred { rule: InferRule::NameFamily, confidence: 0.9 },
+            members: vec![
+                Member { addr: Some(v4(20)), host: None },
+                Member { addr: Some(v4(21)), host: None },
+                Member { addr: None, host: Some("noaddr".into()) }, // skipped: no address
+            ],
+        };
+        let mut current = std::collections::HashMap::new();
+        current.insert(v4(20), vec!["cluster:aether".to_string()]); // already tagged
+        let writes = g.plan_tag_writes(&current);
+        assert_eq!(writes.len(), 2); // the host-only member is skipped
+        assert!(writes.iter().find(|w| w.addr == v4(20)).unwrap().already_present);
+        assert!(!writes.iter().find(|w| w.addr == v4(21)).unwrap().already_present);
+
+        // A native cluster is already in NetBox → no tag writes at all.
+        let native = Group { origin: Origin::Netbox { cluster_id: 1 }, ..g };
+        assert!(native.plan_tag_writes(&current).is_empty());
     }
 
     /// Hue is stable and differs between distinct slugs.
