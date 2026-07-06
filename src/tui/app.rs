@@ -39,10 +39,23 @@ pub enum AllocPhase {
     Preview,
 }
 
-/// A saved map scope for zoom-out: a range and the facts within it.
+/// A saved map scope for zoom-out: a range, the facts within it, and the on-screen rectangle of
+/// the quadrant we zoomed *out of* (so the zoom-out sweep can shrink back onto that slot).
 struct ZoomFrame {
     range: AddrRange,
     facts: Rc<HashMap<IpAddr, AddressFacts>>,
+    from_rect: Rect,
+}
+
+/// An in-flight zoom transition: the selected quadrant's edge sweeping between its sub-rectangle
+/// (`small`) and the full square. `grow` = zooming in (small → square, then commit `pending`);
+/// otherwise zooming out (square → small, the scope already switched to the parent). The big
+/// (square) rect is recomputed each frame from the render, so it always matches what's drawn.
+struct ZoomAnim {
+    small: Rect,
+    start_t: f32,
+    grow: bool,
+    pending: Option<(AddrRange, Rc<HashMap<IpAddr, AddressFacts>>)>,
 }
 
 /// The in-progress "allocate this address" flow.
@@ -151,6 +164,8 @@ pub struct App {
     pub pane_area: Rect,
     /// Scroll offset (first visible row) of the pane's host list.
     pub host_scroll: usize,
+    /// An in-flight zoom sweep, if any — the map view suppresses new zooms while it runs.
+    zoom_anim: Option<ZoomAnim>,
     /// Parent scopes to return to on zoom-out (each a range + its facts).
     zoom_stack: Vec<ZoomFrame>,
     /// How the map colours cells by occupancy.
@@ -263,6 +278,7 @@ impl App {
             map_area: Rect::new(0, 0, 0, 0),
             pane_area: Rect::new(0, 0, 0, 0),
             host_scroll: 0,
+            zoom_anim: None,
             asserted_groups: Vec::new(),
             native_groups: Vec::new(),
             anim_override: None,
@@ -672,6 +688,14 @@ impl App {
     /// sub-squares, `Enter` zooms into the selected one, `Esc`/`Backspace` zooms back out. (A
     /// per-host *trace* mode will share these keys later.)
     fn on_key_map(&mut self, code: KeyCode) {
+        // While a zoom sweep runs, swallow navigation/zoom keys so it plays out cleanly.
+        let nav = matches!(
+            code,
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('+') | KeyCode::Char('-')
+        );
+        if self.zoom_anim.is_some() && nav {
+            return;
+        }
         match code {
             KeyCode::Char('q') | KeyCode::Char('Q') => self.quit = true,
             KeyCode::Left => self.quadrant_move(-1, 0),
@@ -768,22 +792,55 @@ impl App {
         cells > 1 && self.range.block_len() > cells
     }
 
-    /// Zoom into the selected quadrant: narrow the scope to its address run and its facts.
+    /// The on-screen rectangle of quadrant `bounds` (in grid cells): each cell is two columns wide.
+    fn quadrant_screen_rect(&self, bounds: Rect) -> Rect {
+        let b = self.map_area;
+        Rect::new(b.x + bounds.x * 2, b.y + bounds.y, bounds.width * 2, bounds.height)
+    }
+
+    /// Zoom into the selected quadrant: start the edge **grow** sweep; the scope is narrowed to its
+    /// address run when the sweep completes (see [`advance_zoom_anim`](App::advance_zoom_anim)).
     fn zoom_into_selected(&mut self) {
+        if self.zoom_anim.is_some() {
+            return; // a sweep is already running
+        }
         if !self.can_zoom_in() {
             self.status = Some(("already at one address per cell — can't zoom further".into(), false));
             return;
         }
         let quads = self.map_quadrants();
-        let Some((d_range, _)) = quads.get(self.zoom_sel) else { return };
+        let Some((d_range, bounds)) = quads.get(self.zoom_sel).cloned() else { return };
         let (w, h) = self.map_dims;
         let cells = u128::from(w) * u128::from(h);
         let sub = self.range.span_slices(cells, d_range.start as u128, d_range.end as u128);
-        self.zoom_stack.push(ZoomFrame { range: self.range, facts: Rc::clone(&self.facts) });
         let sub_facts: HashMap<IpAddr, AddressFacts> =
             self.facts.iter().filter(|(a, _)| sub.contains(**a)).map(|(a, f)| (*a, f.clone())).collect();
-        self.set_scope(sub, Rc::new(sub_facts));
-        self.status = Some((format!("zoomed into {}", self.range.label()), false));
+        let quad_rect = self.quadrant_screen_rect(bounds);
+        self.zoom_stack.push(ZoomFrame { range: self.range, facts: Rc::clone(&self.facts), from_rect: quad_rect });
+        self.zoom_anim =
+            Some(ZoomAnim { small: quad_rect, start_t: self.anim_t(), grow: true, pending: Some((sub, Rc::new(sub_facts))) });
+    }
+
+    /// The zoom sweep's edge rect this frame and whether it just completed. `square` is the current
+    /// square-edge rect (recomputed each render). On completion a grow commits its pending scope.
+    #[must_use]
+    pub fn advance_zoom_anim(&mut self, clock: f32, square: Rect, duration: f32) -> Option<Rect> {
+        let anim = self.zoom_anim.as_ref()?;
+        let eased = mullion::smoothstep(((clock - anim.start_t) / duration).clamp(0.0, 1.0));
+        let rect = if anim.grow {
+            mullion::lerp_rect(anim.small, square, eased)
+        } else {
+            mullion::lerp_rect(square, anim.small, eased)
+        };
+        if eased >= 1.0 {
+            if let Some(a) = self.zoom_anim.take() {
+                if let Some((range, facts)) = a.pending {
+                    self.set_scope(range, facts);
+                    self.status = Some((format!("zoomed into {}", self.range.label()), false));
+                }
+            }
+        }
+        Some(rect)
     }
 
     /// The chain of ranges from the outermost scope down to the current one — the map's
@@ -877,10 +934,16 @@ impl App {
         }
     }
 
-    /// Return to the parent scope (a no-op at the top).
+    /// Return to the parent scope (a no-op at the top), starting the edge **shrink** sweep onto the
+    /// quadrant slot we came from. The parent is switched in immediately; the sweep is decoration.
     fn zoom_out(&mut self) {
+        if self.zoom_anim.is_some() {
+            return;
+        }
         if let Some(f) = self.zoom_stack.pop() {
+            let slot = f.from_rect;
             self.set_scope(f.range, f.facts);
+            self.zoom_anim = Some(ZoomAnim { small: slot, start_t: self.anim_t(), grow: false, pending: None });
             self.status = Some((format!("zoomed out to {}", self.range.label()), false));
         }
     }
@@ -1453,14 +1516,17 @@ mod tests {
         let expected = top.span_slices(cells, quads[app.zoom_sel].0.start as u128, quads[app.zoom_sel].0.end as u128);
         assert!(expected.contains(host));
 
+        // Enter starts the zoom **sweep**; the scope narrows when the sweep completes.
         app.on_key(KeyCode::Enter);
+        assert_eq!(app.range, top, "scope only changes when the sweep finishes");
+        let _ = app.advance_zoom_anim(10.0, Rect::new(0, 0, 20, 20), 0.32); // drive it past the end
         assert_eq!(app.range, expected);
         assert_eq!(app.scope_chain(), vec![top, expected]);
         assert!(app.total < parent_total);
         assert_eq!(app.counts.dns_only, 1); // the host survived the narrowing
         assert_eq!(app.zoom_sel, 0); // selection reset on scope change
 
-        app.on_key(KeyCode::Esc); // Esc zooms out (never quits)
+        app.on_key(KeyCode::Esc); // Esc switches to the parent immediately (sweep is decoration)
         assert_eq!(app.range, top);
         assert_eq!(app.scope_chain(), vec![top]);
         assert!(!app.quit);
@@ -1504,12 +1570,36 @@ mod tests {
         app.on_mouse(ev(MouseEventKind::Moved, col, row));
         assert_eq!(app.zoom_sel, 3);
 
-        // Left-click zooms in; right-click zooms out.
+        // Left-click starts the zoom-in sweep; driving it to the end narrows the scope.
         let parent = app.range;
         app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), col, row));
+        let _ = app.advance_zoom_anim(10.0, Rect::new(0, 0, 20, 20), 0.32);
         assert_ne!(app.range, parent);
+        // Right-click switches back to the parent immediately.
         app.on_mouse(ev(MouseEventKind::Down(MouseButton::Right), a.x, a.y));
         assert_eq!(app.range, parent);
+    }
+
+    #[test]
+    fn zoom_sweep_interpolates_then_commits_the_scope() {
+        let range = Cidr::parse("10.0.0.0/8").unwrap();
+        let mut app = App::new(range, Vec::new(), false, false, false, Config::default());
+        app.view = View::Map;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 50));
+        crate::tui::map::screen(&mut buf, &mut app);
+        let top = AddrRange::from(range);
+        let square = Rect::new(10, 10, 60, 40);
+
+        app.on_key(KeyCode::Enter); // start the grow sweep
+        let start = app.anim_t();
+        // Midway: an intermediate rect (not yet the full square), scope still the parent.
+        let mid = app.advance_zoom_anim(start + 0.16, square, 0.32).unwrap();
+        assert_ne!(mid, square, "the sweep is mid-flight, smaller than the square");
+        assert_eq!(app.range, top, "scope unchanged until the sweep finishes");
+        // At the end it reaches the square and commits the narrowed scope.
+        let end = app.advance_zoom_anim(start + 0.4, square, 0.32).unwrap();
+        assert_eq!(end, square);
+        assert_ne!(app.range, top, "scope narrowed on completion");
     }
 
     #[test]

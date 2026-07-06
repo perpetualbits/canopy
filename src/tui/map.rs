@@ -31,9 +31,12 @@ use mullion::{Buffer, Rect};
 use super::app::App;
 use super::draw::{btxt, keyhints};
 use super::palette::KNOBS;
-use super::theme::{s_accent, s_dim, s_title};
+use super::theme::{s_accent, s_dim, s_sel, s_title};
 use crate::map::MapGrid;
 use crate::reconcile::{AddrRange, Subnet};
+
+/// How long the zoom edge-sweep animation lasts, in seconds.
+const ZOOM_ANIM_SECS: f32 = 0.32;
 
 // The Gilbert grid geometry — cell sizing, the rounded curve glyphs, and the per-cell paint
 // loop — now lives in [`mullion::curve_map`]; this view only supplies what a cell *means*
@@ -318,6 +321,14 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
     let estyle = BorderStyle { weight: LineWeight::Light, corners: CornerStyle::Rounded, style: s_dim() };
     mullion::border::draw_box(buf, edge, mullion::border::Borders::ALL, &estyle);
 
+    // A zoom sweep in flight: the selected quadrant's edge grows to fill the square (zoom-in) or
+    // shrinks back onto its slot (zoom-out), eased with mullion's `smoothstep`/`lerp_rect`. Drawn
+    // bright, over the static edge; on completion `advance_zoom_anim` commits the scope change.
+    if let Some(rect) = app.advance_zoom_anim(clock, edge, ZOOM_ANIM_SECS) {
+        let sweep = BorderStyle { weight: LineWeight::Light, corners: CornerStyle::Rounded, style: s_sel() };
+        mullion::border::draw_box(buf, rect, mullion::border::Borders::ALL, &sweep);
+    }
+
     // The palette menu lives in a gap in the square's bottom edge — `┤ scheme · knob=val ├`.
     let (kn, ..) = KNOBS[app.active_knob];
     let palette = format!("┤ {} · {}={:.2} ├", app.scheme.name(), kn, app.knobs.get(app.active_knob));
@@ -441,6 +452,28 @@ mod tests {
         for i in 0..frames {
             // One 2 Hz cycle: pulse uses t = clock·4π, so clock spans 0..0.5 s over 12 frames.
             app.set_anim_clock(Some(i as f32 / frames as f32 * 0.5));
+            println!("@@@FRAME {i}@@@");
+            println!("{}", dump_ansi(&mut app, 100, 40));
+        }
+    }
+
+    /// Dump the **zoom edge-sweep**: press Enter on a quadrant and capture the growing edge frame
+    /// by frame, up to the commit. Run with
+    /// `cargo test --bin canopy map::tests::dump_zoom_anim -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dump_zoom_anim() {
+        use crate::reconcile::Cidr;
+        let range = Cidr::parse("145.124.0.0/16").unwrap();
+        let mut app = App::new(range, Vec::new(), false, false, false, crate::config::Config::default());
+        app.view = super::super::app::View::Map;
+        app.set_anim_clock(Some(0.0));
+        let _ = dump_ansi(&mut app, 100, 40); // fix map_dims
+        app.on_key(mullion::KeyCode::Right); // pick a quadrant (top-right)
+        app.on_key(mullion::KeyCode::Enter); // start the grow sweep (start_t = 0.0)
+        let frames = 12;
+        for i in 0..frames {
+            app.set_anim_clock(Some(i as f32 / (frames - 1) as f32 * ZOOM_ANIM_SECS)); // 0..0.32 s
             println!("@@@FRAME {i}@@@");
             println!("{}", dump_ansi(&mut app, 100, 40));
         }
