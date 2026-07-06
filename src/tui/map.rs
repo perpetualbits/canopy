@@ -266,6 +266,63 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
 mod tests {
     use super::*;
 
+    /// Render the fixture map to a buffer and print it as ANSI truecolor — a way to *see*
+    /// the Hilbert map on a terminal without a tty. Ignored by default (it writes escape
+    /// codes to stdout); run with `cargo test --lib map::tests::dump_map -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dump_map() {
+        use crate::fixture;
+        use mullion::style::Color;
+        use mullion::{Buffer, Rect};
+
+        // Map a mullion [`Color`] to an SGR parameter string for `fg` (base 30/38) or `bg`
+        // (base 40/48). Rgb becomes a truecolor triple; named colours use the ANSI 16.
+        fn sgr(c: Color, bg: bool) -> String {
+            let (fg_base, tc, bright_base) = if bg { (40, 48, 100) } else { (30, 38, 90) };
+            match c {
+                Color::Rgb(r, g, b) => format!("{tc};2;{r};{g};{b}"),
+                Color::Reset => format!("{}", fg_base + 9),
+                Color::Black => format!("{}", fg_base),
+                Color::Red => format!("{}", fg_base + 1),
+                Color::Green => format!("{}", fg_base + 2),
+                Color::Yellow => format!("{}", fg_base + 3),
+                Color::Blue => format!("{}", fg_base + 4),
+                Color::Magenta => format!("{}", fg_base + 5),
+                Color::Cyan => format!("{}", fg_base + 6),
+                Color::Gray => format!("{}", fg_base + 7),
+                Color::DarkGray => format!("{}", bright_base),
+                Color::LightRed => format!("{}", bright_base + 1),
+                Color::LightGreen => format!("{}", bright_base + 2),
+                Color::LightYellow => format!("{}", bright_base + 3),
+                Color::LightBlue => format!("{}", bright_base + 4),
+                Color::LightMagenta => format!("{}", bright_base + 5),
+                Color::LightCyan => format!("{}", bright_base + 6),
+                Color::White => format!("{}", bright_base + 7),
+                Color::Indexed(i) => format!("{tc};5;{i}"),
+            }
+        }
+
+        let (range, facts) = fixture::demo();
+        let mut app = App::new(range, facts, false, false, false, crate::config::Config::default());
+        app.view = super::super::app::View::Map;
+
+        let (w, h) = (96u16, 48u16);
+        let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
+        screen(&mut buf, &mut app);
+
+        let mut out = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                let cell = buf.get(x, y);
+                out.push_str(&format!("\x1b[0;{};{}m", sgr(cell.style.fg, false), sgr(cell.style.bg, true)));
+                out.push_str(if cell.symbol.is_empty() { " " } else { &cell.symbol });
+            }
+            out.push_str("\x1b[0m\n");
+        }
+        println!("{out}");
+    }
+
     #[test]
     fn curve_glyph_joins_the_ports() {
         // Straights, turns, endpoints, and the lone cell.

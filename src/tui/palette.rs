@@ -64,14 +64,11 @@ fn luma_curve(t: f32, empty: bool, hue: f32, sat: f32) -> Color {
     hsl_rgb(hue, sat, lerp(0.44, 0.98, t))
 }
 
-/// A **dim** background lightness — colourful (the chroma-biased signal) but never bright,
-/// so the bright curve reads on top. `empty` cells are near-black.
-fn dim_bg(t: f32, empty: bool, k: &Knobs) -> f32 {
-    if empty {
-        0.05
-    } else {
-        lerp(k.floor, k.ceiling, t)
-    }
+/// A **dim** occupancy-tinted background lightness — colourful (the chroma-biased signal) but
+/// never bright, so the bright curve reads on top. Only called for non-empty cells; empty IP
+/// space keeps the terminal default background (see [`Scheme::paint`]).
+fn dim_bg(t: f32, k: &Knobs) -> f32 {
+    lerp(k.floor, k.ceiling, t)
 }
 
 /// The tunable parameters shared by every scheme — a flat, bounded vector (see [`KNOBS`]),
@@ -191,25 +188,36 @@ impl Scheme {
     pub fn paint(self, frac: f32, pos: f32, k: &Knobs) -> (Color, Color) {
         let t = occ(frac, k.decades);
         let empty = frac <= 0.0;
+        // Empty IP space is not the low end of the *used* ramp — it is the absence of use, so
+        // its cell background stays the terminal default (`Reset`) and reads as truly empty
+        // rather than "barely used". Only the curve line paints on an empty cell; occupancy
+        // tints the background only once a block actually holds an address.
+        if empty {
+            let fg = match self {
+                Scheme::CurveHue => hsl_rgb(0.0, 0.0, 0.34),
+                _ => luma_curve(t, true, 0.0, 0.0),
+            };
+            return (Color::Reset, fg);
+        }
         match self {
             Scheme::ChromaLuma => {
                 let hue = lerp(k.hue_lo, k.hue_hi, t);
-                let bg = hsl_rgb(hue, k.bg_sat, dim_bg(t, empty, k));
+                let bg = hsl_rgb(hue, k.bg_sat, dim_bg(t, k));
                 (bg, luma_curve(t, empty, hue, k.fg_sat)) // bright line, faint occupancy tint
             }
             Scheme::Heat => {
                 let hue = lerp(0.0, 40.0, t);
-                let bg = hsl_rgb(hue, k.bg_sat, dim_bg(t, empty, k));
+                let bg = hsl_rgb(hue, k.bg_sat, dim_bg(t, k));
                 (bg, luma_curve(t, empty, hue, k.fg_sat * 0.5))
             }
             Scheme::CurveHue => {
                 // The curve is the star: full-spectrum hue by position, bright; dim bg under it.
-                let bg = hsl_rgb(lerp(k.hue_lo, k.hue_hi, t), k.bg_sat * 0.6, dim_bg(t, empty, k) * 0.7);
-                let fg = if empty { hsl_rgb(0.0, 0.0, 0.34) } else { hsl_rgb(pos * 330.0, k.fg_sat.max(0.7), lerp(0.55, 0.95, t)) };
+                let bg = hsl_rgb(lerp(k.hue_lo, k.hue_hi, t), k.bg_sat * 0.6, dim_bg(t, k) * 0.7);
+                let fg = hsl_rgb(pos * 330.0, k.fg_sat.max(0.7), lerp(0.55, 0.95, t));
                 (bg, fg)
             }
             Scheme::Mono => {
-                let g = (dim_bg(t, empty, k) * 255.0).round() as u8;
+                let g = (dim_bg(t, k) * 255.0).round() as u8;
                 (Color::Rgb(g, g, g), luma_curve(t, empty, 0.0, 0.0)) // grey background, grey line
             }
         }
@@ -246,17 +254,18 @@ mod tests {
     }
 
     #[test]
-    fn curve_is_brighter_than_background_and_empty_is_dim_grey() {
+    fn curve_is_brighter_than_background_and_empty_is_transparent() {
         let k = Knobs::default();
         // A full cell: the luma curve is brighter than the dim chroma background.
         let (bg, fg) = Scheme::ChromaLuma.paint(1.0, 0.5, &k);
         assert!(luma(fg) > luma(bg), "curve must be brighter than bg: fg={} bg={}", luma(fg), luma(bg));
-        // An empty cell: near-black background, a dim grey line (equal RGB, mid-low luma).
+        // An empty cell: the background is the terminal default (empty space carries no
+        // occupancy tint), and only a dim grey curve line paints over it (equal RGB, mid-low luma).
         let (ebg, efg) = Scheme::ChromaLuma.paint(0.0, 0.2, &k);
-        assert!(luma(ebg) < 0.15, "empty bg should be near-black, got {}", luma(ebg));
+        assert_eq!(ebg, Color::Reset, "empty bg should be the terminal default");
         let Color::Rgb(r, g, b) = efg else { panic!("rgb") };
         assert!(r == g && g == b, "empty curve should be grey, got {r},{g},{b}");
-        assert!(luma(efg) > luma(ebg) && luma(efg) < 0.5, "empty curve should be a dim grey");
+        assert!(luma(efg) < 0.5, "empty curve should be a dim grey");
     }
 
     #[test]
@@ -265,7 +274,10 @@ mod tests {
         for _ in 0..Scheme::ALL.len() {
             for &(f, p) in &[(0.0, 0.0), (0.001, 0.5), (1.0, 1.0)] {
                 let (bg, fg) = s.paint(f, p, &Knobs::default());
-                assert!(matches!(bg, Color::Rgb(..)) && matches!(fg, Color::Rgb(..)));
+                // Empty cells (f == 0) leave the background at the terminal default; any used
+                // cell paints an Rgb background. The curve is always a concrete Rgb colour.
+                let bg_ok = if f <= 0.0 { bg == Color::Reset } else { matches!(bg, Color::Rgb(..)) };
+                assert!(bg_ok && matches!(fg, Color::Rgb(..)));
             }
             s = s.cycle();
         }
