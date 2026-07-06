@@ -171,16 +171,27 @@ fn draw_info_pane(buf: &mut Buffer, pane: Rect, app: &App, grid: &MapGrid, quads
         y += 1;
     }
 
-    // The scrollable, paginated host list — only the visible window is drawn, so it is instant
-    // even over a huge range (it lists the bounded known hosts, never the address space).
+    // The scrollable, paginated host list — an outlined box with a mullion scrollbar. Only the
+    // visible window is drawn, so it is instant even over a huge range (it lists the bounded known
+    // hosts, never the address space).
     let hosts = app.hosts_in_view();
-    let rows = (bottom.saturating_sub(y + 1)) as usize; // leave the header row
-    let scroll = app.host_scroll.min(hosts.len().saturating_sub(1));
-    let more = hosts.len().saturating_sub(scroll + rows);
-    let label = if more > 0 { format!("HOSTS {}-{}/{} ↕", scroll + 1, scroll + rows.min(hosts.len() - scroll), hosts.len()) } else { format!("HOSTS ({})", hosts.len()) };
-    line(buf, &mut y, &label, s_title());
-    for (addr, name) in hosts.iter().skip(scroll).take(rows) {
-        line(buf, &mut y, &format!("{addr}  {name}"), s_dim());
+    let list_box = Rect::new(pane.x, y, w, bottom.saturating_sub(y));
+    if list_box.height >= 3 {
+        let bstyle = BorderStyle { weight: LineWeight::Light, corners: CornerStyle::Rounded, style: s_dim() };
+        mullion::border::draw_box(buf, list_box, mullion::border::Borders::ALL, &bstyle);
+        let rows = list_box.height.saturating_sub(2) as usize; // inside the top/bottom border
+        let text_w = list_box.width.saturating_sub(3); // a border each side + a scrollbar column
+        let scroll = app.host_scroll.min(hosts.len().saturating_sub(1));
+        let shown = rows.min(hosts.len().saturating_sub(scroll));
+        // The count sits in a gap in the box's top edge, like the palette on the square.
+        let label = format!("┤ hosts {}–{}/{} ├", (scroll + 1).min(hosts.len().max(1)), scroll + shown, hosts.len());
+        btxt(buf, list_box.x + 2, list_box.y, &clip(&label, list_box.width.saturating_sub(4)), s_dim());
+        for (i, (addr, name)) in hosts.iter().skip(scroll).take(rows).enumerate() {
+            btxt(buf, list_box.x + 1, list_box.y + 1 + i as u16, &clip(&format!("{addr}  {name}"), text_w), s_dim());
+        }
+        // A scrollbar on the right inside edge shows where the window sits in the whole list.
+        let track = Rect::new(list_box.x + list_box.width - 1, list_box.y + 1, 1, rows as u16);
+        mullion::render_scrollbar(buf, track, mullion::ScrollMetrics::from_window(scroll, rows, hosts.len()), s_dim());
     }
 }
 
