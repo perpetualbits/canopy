@@ -138,6 +138,21 @@ pub fn gather_ip_tags(range: &Cidr, cfg: &Config) -> anyhow::Result<std::collect
     netbox.gather_ip_tags(range)
 }
 
+/// Gather the slugs of every tag defined in NetBox, fetching the token first. Read-only; tells a
+/// `--push-group` preview whether a group's tag object already exists.
+///
+/// # Errors
+/// Propagates a token failure or the NetBox fetch.
+pub fn gather_tag_slugs(cfg: &Config) -> anyhow::Result<std::collections::HashSet<String>> {
+    let token = get_token(&cfg.token_pass)?;
+    let netbox = NetboxSource {
+        vantage: Vantage::with_jump(&cfg.vantage, &cfg.jump),
+        base_url: cfg.netbox_url.clone(),
+        token,
+    };
+    netbox.gather_tag_slugs()
+}
+
 /// Fetch the NetBox token from `$CANOPY_NETBOX_TOKEN`, else from `pass`.
 ///
 /// Keeping it out of argv and config: the env var wins for CI, otherwise we shell

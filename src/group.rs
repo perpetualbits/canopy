@@ -160,10 +160,23 @@ pub struct Member {
 /// native mechanism exists, so callers can migrate the *sink* without reshaping the *model*.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NetboxTarget {
-    /// Apply this tag slug to each member's NetBox IP/device object (`cluster:aether`).
-    Tag(String),
+    /// Apply this tag to each member's NetBox IP object.
+    Tag(NetboxTag),
     /// Assign each member to this native NetBox cluster id (future mechanism).
     Cluster(u32),
+}
+
+/// A NetBox tag as canopy would create and assign it. The `name` is the human-readable,
+/// namespaced form (`cluster:aether`); the `slug` is the URL-safe identity NetBox actually keys
+/// on (`cluster-aether`) — NetBox's `SlugField` is `[-a-zA-Z0-9_]+`, so the namespace joins the
+/// group slug with a **hyphen**, never a colon. Assignment and the already-present check go by
+/// **slug**; the name is for people and for filtering (`name__isw=cluster:`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetboxTag {
+    /// Human-readable, colon-namespaced (`cluster:aether`).
+    pub name: String,
+    /// URL-safe identity NetBox keys on (`cluster-aether`).
+    pub slug: String,
 }
 
 /// A reconciled logical group: a stable id, a display label, its kind, its provenance, and its
@@ -184,15 +197,21 @@ pub struct Group {
 }
 
 impl Group {
-    /// The NetBox write target that would persist this group. Today always a namespaced tag
-    /// (`<namespace>:<slug>`); when a group came *from* a native NetBox cluster it already has
-    /// one, but we still express the tag form so re-tagging is idempotent and uniform.
+    /// The tag this group projects into NetBox, namespaced by kind: name `cluster:aether`, slug
+    /// `cluster-aether`. Computed unconditionally (used by both the target and the write plan).
+    fn make_tag(&self) -> NetboxTag {
+        let ns = self.kind.netbox_namespace();
+        NetboxTag { name: format!("{ns}:{}", self.id.0), slug: format!("{ns}-{}", self.id.0) }
+    }
+
+    /// The NetBox write target that would persist this group: a namespaced [tag](NetboxTag) for
+    /// an asserted/inferred group, or the native cluster object it already belongs to.
     #[must_use]
     pub fn netbox_target(&self) -> NetboxTarget {
-        if let Origin::Netbox { cluster_id } = self.origin {
-            return NetboxTarget::Cluster(cluster_id);
+        match self.origin {
+            Origin::Netbox { cluster_id } => NetboxTarget::Cluster(cluster_id),
+            _ => NetboxTarget::Tag(self.make_tag()),
         }
-        NetboxTarget::Tag(format!("{}:{}", self.kind.netbox_namespace(), self.id.0))
     }
 
     /// Whether this group still needs writing to NetBox (asserted/inferred, not already native).
@@ -201,14 +220,20 @@ impl Group {
         !self.origin.in_netbox()
     }
 
-    /// The tag slug this group would be pushed as (`cluster:aether`), or `None` for a native
-    /// group whose target is a cluster object rather than a tag.
+    /// The [tag](NetboxTag) this group would be pushed as, or `None` for a native group whose
+    /// target is a cluster object rather than a tag.
     #[must_use]
-    pub fn netbox_target_tag(&self) -> Option<String> {
-        match self.netbox_target() {
-            NetboxTarget::Tag(t) => Some(t),
-            NetboxTarget::Cluster(_) => None,
-        }
+    pub fn netbox_tag(&self) -> Option<NetboxTag> {
+        (!self.origin.in_netbox()).then(|| self.make_tag())
+    }
+
+    /// The tag this group would need **created** in NetBox before it could be assigned:
+    /// `Some(tag)` when the group's slug is not among the `existing` tag slugs, else `None` (the
+    /// tag already exists, or the group is native). Read-model only — creates nothing.
+    #[must_use]
+    pub fn tag_needs_creating(&self, existing: &std::collections::HashSet<String>) -> Option<NetboxTag> {
+        let tag = self.netbox_tag()?;
+        (!existing.contains(&tag.slug)).then_some(tag)
     }
 
     /// The best hostname we hold for `addr` among this group's members, for display.
@@ -227,29 +252,33 @@ impl Group {
     /// NetBox IP-tag write is keyed on the address.
     #[must_use]
     pub fn plan_tag_writes(&self, current: &HashMap<IpAddr, Vec<String>>) -> Vec<TagWrite> {
-        let NetboxTarget::Tag(tag) = self.netbox_target() else {
+        let Some(tag) = self.netbox_tag() else {
             return Vec::new();
         };
         self.members
             .iter()
             .filter_map(|m| m.addr)
             .map(|addr| {
-                let already_present = current.get(&addr).is_some_and(|ts| ts.iter().any(|t| t == &tag));
-                TagWrite { addr, tag: tag.clone(), already_present }
+                // Compare by SLUG — that is what NetBox stores and returns on an IP object.
+                let already_present = current.get(&addr).is_some_and(|ts| ts.iter().any(|t| t == &tag.slug));
+                TagWrite { addr, slug: tag.slug.clone(), name: tag.name.clone(), already_present }
             })
             .collect()
     }
 }
 
-/// One intended NetBox tag write: apply `tag` to the IP object for `addr`, unless it is
-/// `already_present`. Deliberately the smallest unit — a single address and a single tag — so a
-/// preview enumerates every change and applying can be confirmed per item and never at scale.
+/// One intended NetBox tag write: apply the tag (`name`/`slug`) to the IP object for `addr`,
+/// unless it is `already_present`. Deliberately the smallest unit — a single address and a
+/// single tag — so a preview enumerates every change and applying can be confirmed per item and
+/// never at scale.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TagWrite {
     /// The member address whose NetBox IP object would be tagged.
     pub addr: IpAddr,
-    /// The tag slug to apply (`cluster:aether`).
-    pub tag: String,
+    /// The tag slug that identifies the change (`cluster-aether`).
+    pub slug: String,
+    /// The tag's human-readable name (`cluster:aether`), for the preview.
+    pub name: String,
     /// `true` when the object already carries the tag — a no-op, shown but never written.
     pub already_present: bool,
 }
@@ -648,11 +677,15 @@ mod tests {
             origin: Origin::Inferred { rule: InferRule::NameFamily, confidence: 0.8 },
             members: vec![Member { addr: Some(v4(1)), host: None }],
         };
-        assert_eq!(g.netbox_target(), NetboxTarget::Tag("cluster:aether".into()));
+        let tag = g.netbox_tag().unwrap();
+        assert_eq!(tag.name, "cluster:aether"); // colon in the human name
+        assert_eq!(tag.slug, "cluster-aether"); // hyphen in the NetBox slug (no ':')
+        assert_eq!(g.netbox_target(), NetboxTarget::Tag(tag));
         assert!(g.needs_push());
 
         let native = Group { origin: Origin::Netbox { cluster_id: 7 }, ..g };
         assert_eq!(native.netbox_target(), NetboxTarget::Cluster(7));
+        assert!(native.netbox_tag().is_none());
         assert!(!native.needs_push());
     }
 
@@ -710,7 +743,7 @@ mod tests {
             ],
         };
         let mut current = std::collections::HashMap::new();
-        current.insert(v4(20), vec!["cluster:aether".to_string()]); // already tagged
+        current.insert(v4(20), vec!["cluster-aether".to_string()]); // already tagged (by SLUG)
         let writes = g.plan_tag_writes(&current);
         assert_eq!(writes.len(), 2); // the host-only member is skipped
         assert!(writes.iter().find(|w| w.addr == v4(20)).unwrap().already_present);
@@ -719,6 +752,26 @@ mod tests {
         // A native cluster is already in NetBox → no tag writes at all.
         let native = Group { origin: Origin::Netbox { cluster_id: 1 }, ..g };
         assert!(native.plan_tag_writes(&current).is_empty());
+    }
+
+    /// A group's tag needs creating only when its slug is absent from NetBox's existing tags; a
+    /// native group never needs one.
+    #[test]
+    fn tag_needs_creating_checks_slug_presence() {
+        let g = Group {
+            id: GroupId::slug("aether"),
+            label: "aether".into(),
+            kind: GroupKind::Cluster,
+            origin: Origin::Inferred { rule: InferRule::NameFamily, confidence: 0.9 },
+            members: vec![Member { addr: Some(v4(20)), host: None }],
+        };
+        let mut existing = std::collections::HashSet::new();
+        assert_eq!(g.tag_needs_creating(&existing).unwrap().slug, "cluster-aether"); // absent → create
+        existing.insert("cluster-aether".to_string());
+        assert!(g.tag_needs_creating(&existing).is_none()); // now present → no create
+
+        let native = Group { origin: Origin::Netbox { cluster_id: 1 }, ..g };
+        assert!(native.tag_needs_creating(&std::collections::HashSet::new()).is_none());
     }
 
     /// Hue is stable and differs between distinct slugs.

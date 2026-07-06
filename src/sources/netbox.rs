@@ -208,6 +208,20 @@ impl NetboxSource {
         Ok(out)
     }
 
+    /// Gather the slugs of every **tag** defined in NetBox (`extras/tags`) — used to tell whether
+    /// a group's tag object already exists or would need creating. Read-only.
+    ///
+    /// # Errors
+    /// Propagates SSH/HTTP failures or a non-JSON body.
+    pub fn gather_tag_slugs(&self) -> anyhow::Result<std::collections::HashSet<String>> {
+        let first = format!("{}/api/extras/tags/?limit=1000", self.base_url.trim_end_matches('/'));
+        let mut out = std::collections::HashSet::new();
+        for json in self.paginate(first)? {
+            out.extend(parse_tag_slugs(&json)?);
+        }
+        Ok(out)
+    }
+
     /// Follow NetBox's `next` links from `first`, returning every page's raw JSON body.
     ///
     /// NetBox paginates list endpoints (`{count, next, results}`); a single `limit=1000`
@@ -458,6 +472,16 @@ pub fn parse_ip_tags(json: &str, range: &Cidr) -> anyhow::Result<Vec<(std::net::
             Some((addr, tags))
         })
         .collect())
+}
+
+/// Parse an `extras/tags` page into the set of tag slugs it defines.
+///
+/// # Errors
+/// Fails if the body is not the expected `{results: [...]}` JSON.
+pub fn parse_tag_slugs(json: &str) -> anyhow::Result<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_str(json).context("NetBox tags response was not JSON")?;
+    let results = v.get("results").and_then(|r| r.as_array()).context("tags response had no `results`")?;
+    Ok(results.iter().filter_map(|o| o.get("slug").and_then(|s| s.as_str()).map(str::to_string)).collect())
 }
 
 #[cfg(test)]

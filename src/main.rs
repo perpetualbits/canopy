@@ -452,7 +452,7 @@ fn list_groups(facts: &[reconcile::AddressFacts], site: &str, native: Vec<group:
 
     for g in &grouping.groups {
         let target = match g.netbox_target() {
-            group::NetboxTarget::Tag(t) => t,
+            group::NetboxTarget::Tag(t) => t.name,
             group::NetboxTarget::Cluster(id) => format!("cluster #{id}"),
         };
         let origin = match &g.origin {
@@ -506,25 +506,39 @@ fn preview_push_group(name: &str, range: Cidr, args: &Args, cfg: &Config, facts:
         return Ok(());
     }
 
-    // The live current-tag state to diff against; offline we assume no tags yet.
+    // The live state to diff against: the tag objects that exist, and each member IP's current
+    // tags. Offline we assume nothing exists yet (so the preview shows the full intended change).
+    let existing_tags = if args.live { live::gather_tag_slugs(cfg)? } else { std::collections::HashSet::new() };
     let current = if args.live { live::gather_ip_tags(&range, cfg)? } else { std::collections::HashMap::new() };
+
+    let tag = g.netbox_tag().unwrap_or(group::NetboxTag { name: String::new(), slug: String::new() });
     let writes = g.plan_tag_writes(&current);
     let (to_add, present): (Vec<_>, Vec<_>) = writes.iter().partition(|w| !w.already_present);
 
     println!("Preview: record group {:?} in NetBox", g.label);
-    println!("  tag: {}", g.netbox_target_tag().unwrap_or_default());
-    println!("  members: {}   would add: {}   already tagged: {}\n", writes.len(), to_add.len(), present.len());
+    println!("  tag:  name {:?}  slug {:?}", tag.name, tag.slug);
+
+    // Step 1 — the tag object must exist before it can be assigned.
+    match g.tag_needs_creating(&existing_tags) {
+        Some(t) if args.live => println!("  step 1: CREATE tag  (name {:?}, slug {:?}) — does not exist yet", t.name, t.slug),
+        Some(_) => println!("  step 1: create tag if absent (run --live to check what exists)"),
+        None if args.live => println!("  step 1: tag already exists — no create needed"),
+        None => println!("  step 1: create tag if absent"),
+    }
+
+    // Step 2 — assign the tag to each member IP (skipping any that already carry it).
+    println!("  step 2: assign to {} member IP(s) — would add {}, already tagged {}\n", writes.len(), to_add.len(), present.len());
     for w in &writes {
         let mark = if w.already_present { "=" } else { "+" };
         let host = g.host_of(w.addr).unwrap_or("");
         println!("  {mark} {:<16} {host}", w.addr.to_string());
     }
     if !args.live {
-        println!("\n(offline — pass --live to diff against the real current tags)");
+        println!("\n(offline — pass --live to diff against the real tags and existing tag objects)");
     }
     println!("\nPREVIEW ONLY — no changes sent to NetBox.");
     if args.write {
-        eprintln!("refusing --write: the tag-apply path is not implemented yet; verify this preview first.");
+        eprintln!("refusing --write: the tag create/apply path is not implemented yet; verify this preview first.");
         std::process::exit(2);
     }
     Ok(())
