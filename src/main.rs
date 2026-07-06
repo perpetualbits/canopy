@@ -7,6 +7,7 @@
 //! [`fixture`]) so the UI works offline; live NetBox/DNS sources slot in behind the
 //! same [`reconcile::AddressFacts`] shape.
 
+mod cache;
 mod config;
 mod discover;
 mod dns;
