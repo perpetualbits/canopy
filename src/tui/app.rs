@@ -63,8 +63,24 @@ struct ZoomAnim {
 pub enum LassoSnap {
     /// Exactly the cells between the two endpoints — a free-hand snake along the curve.
     Raw,
-    /// Grown to the most-specific NetBox subnet the moving end sits in — a clean CIDR selection.
+    /// Grown to the smallest **aligned CIDR block** that encloses the span — always available (pure
+    /// geometry, no data needed), so it's the dependable "clean it up to a real prefix" snap.
+    Cidr,
+    /// Grown to the most-specific NetBox subnet the moving end sits in — needs loaded subnets.
     Subnet,
+}
+
+impl LassoSnap {
+    /// A short label for the key hint, so the snap mode is visible (confirmation that `s` did
+    /// something even when the geometry doesn't visibly move).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            LassoSnap::Raw => "raw",
+            LassoSnap::Cidr => "CIDR",
+            LassoSnap::Subnet => "subnet",
+        }
+    }
 }
 
 /// An in-progress **lasso** on the map: a snake of cells between a fixed `anchor` and a moving
@@ -844,7 +860,8 @@ impl App {
     fn lasso_cycle_snap(&mut self) {
         if let Some(l) = self.lasso.as_mut() {
             l.snap = match l.snap {
-                LassoSnap::Raw => LassoSnap::Subnet,
+                LassoSnap::Raw => LassoSnap::Cidr,
+                LassoSnap::Cidr => LassoSnap::Subnet,
                 LassoSnap::Subnet => LassoSnap::Raw,
             };
         }
@@ -858,6 +875,21 @@ impl App {
         let raw = (l.anchor.min(l.head), l.anchor.max(l.head));
         match l.snap {
             LassoSnap::Raw => Some(raw),
+            LassoSnap::Cidr => {
+                // The smallest aligned power-of-two block [a, a+size) that encloses the raw span —
+                // in slice-index space, which is a clean CIDR because the geometry is power-of-two.
+                let last = self.map_cells().saturating_sub(1);
+                let (lo, hi) = raw;
+                let mut size = 1usize;
+                while size < self.map_cells() {
+                    let a = lo & !(size - 1); // align the low end down to a multiple of `size`
+                    if a + size > hi {
+                        return Some((a, (a + size - 1).min(last)));
+                    }
+                    size <<= 1;
+                }
+                Some((0, last)) // the span needs the whole grid
+            }
             LassoSnap::Subnet => {
                 // Grow to the most-specific subnet covering the head cell's address.
                 let head_addr = self.range.nth_slice(cells, l.head as u128).base();
@@ -1935,6 +1967,46 @@ mod tests {
         // `l` again leaves lasso mode.
         app.on_key(KeyCode::Char('l'));
         assert!(app.lasso.is_none(), "l toggles the lasso off");
+    }
+
+    #[test]
+    fn lasso_cidr_snap_is_clean_and_the_callout_is_legible() {
+        use mullion::style::Color;
+        let facts: Vec<AddressFacts> = ["10.87.3.10", "10.87.3.20", "10.87.3.44"]
+            .iter()
+            .map(|a| AddressFacts { addr: a.parse().unwrap(), netbox: None, ptr: Some("dop.".into()), live: true })
+            .collect();
+        let mut app = App::new(Cidr::parse("10.87.3.0/24").unwrap(), facts, false, false, false, Config::default());
+        app.view = View::Map;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 40));
+        crate::tui::map::screen(&mut buf, &mut app);
+
+        app.on_key(KeyCode::Char('l'));
+        for _ in 0..6 {
+            app.on_key(KeyCode::Right);
+        }
+        app.on_key(KeyCode::Char('s')); // Raw → Cidr
+        assert_eq!(app.lasso.unwrap().snap, LassoSnap::Cidr, "s cycles the snap mode");
+        let ranges = app.lasso_ranges();
+        assert_eq!(ranges.len(), 1, "CIDR snap collapses the snake to one aligned block");
+        assert!(ranges[0].as_cidr().is_some(), "and it is a clean CIDR");
+
+        // Render and inspect the buffer: bright legible label text, and no blue selection block.
+        crate::tui::map::screen(&mut buf, &mut app);
+        let (mut bright_label, mut blue_bg) = (false, false);
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let c = buf.get(x, y);
+                if c.style.fg == Color::Rgb(240, 238, 230) && c.symbol.chars().next().is_some_and(|ch| ch.is_ascii_alphanumeric()) {
+                    bright_label = true;
+                }
+                if c.style.bg == Color::Rgb(80, 120, 210) {
+                    blue_bg = true;
+                }
+            }
+        }
+        assert!(bright_label, "the callout paints bright, legible label text");
+        assert!(!blue_bg, "the old black-on-blue selection style is gone");
     }
 
     #[test]

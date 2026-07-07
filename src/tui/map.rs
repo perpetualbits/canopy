@@ -280,21 +280,57 @@ fn draw_lasso_callout(buf: &mut Buffer, body: Rect, grid: &MapGrid, app: &App, c
         grid.xy_to_d(u32::from(gx), u32::from(gy)).is_some_and(|d| (lo..=hi).contains(&(d as usize)))
     };
 
-    // Anchor the leader at the moving head cell — where the eye is.
-    let head = app.lasso.map_or(hi, |l| l.head).min(grid.cells().saturating_sub(1));
-    let (hx, hy) = grid.cell_xy(head);
-    let anchor = (body.x + hx as u16 * 2, body.y + hy as u16);
+    // The selection's screen bounding box — the leader must anchor *outside* this and the box must
+    // sit clear of it, or the wire crosses the region it encloses.
+    let last = grid.cells().saturating_sub(1);
+    let (mut x0, mut y0, mut x1, mut y1) = (u16::MAX, u16::MAX, 0u16, 0u16);
+    for d in lo..=hi.min(last) {
+        let (gx, gy) = grid.cell_xy(d);
+        let (sx, sy) = (body.x + gx as u16 * 2, body.y + gy as u16);
+        x0 = x0.min(sx);
+        y0 = y0.min(sy);
+        x1 = x1.max(sx + 1); // cells are two columns wide
+        y1 = y1.max(sy);
+    }
 
-    // Place the box top-right of the body, sized to its lines (v1: canopy places, mullion routes).
     let lines = summary.lines();
     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
     let longest = refs.iter().map(|s| s.chars().count()).max().unwrap_or(0) as u16;
-    let bw = (longest + 2).clamp(12, body.width.max(12)).min(body.width);
+    let bw = (longest + 3).clamp(14, body.width.max(14)).min(body.width);
     let bh = (refs.len() as u16 + 2).min(body.height.max(3));
-    let box_rect = Rect::new((body.x + body.width).saturating_sub(bw), body.y, bw, bh);
+    let (anchor, box_rect) = place_callout(body, (x0, y0, x1, y1), bw, bh);
 
-    let style = BorderStyle { weight: LineWeight::Light, corners: CornerStyle::Rounded, style: s_sel() };
-    curve_map::callout(buf, body, inside, anchor, box_rect, &refs, &style, clock, curve_map::CalloutDuty::default());
+    // Bright warm-white chrome with **no background** (so no blue block, and the map shows around
+    // it); the box carries its own dark fill internally, so this fg is the legible label colour.
+    let style = BorderStyle { weight: LineWeight::Light, corners: CornerStyle::Rounded, style: Style::default().fg(Color::Rgb(240, 238, 230)) };
+    // Crisp chrome — the ring/leader read as definite shapes, not a dashed marching line; only the
+    // box interior keeps a faint breath so the map still shimmers behind the text.
+    let duty = curve_map::CalloutDuty { ring: 1.0, leader: 1.0, box_border: 1.0, box_fill: 0.82 };
+    curve_map::callout(buf, body, inside, anchor, box_rect, &refs, &style, clock, duty);
+}
+
+/// Place the callout box on the side of the selection with the most room, and return the leader
+/// anchor **just outside** the selection on the facing side — so mullion's L-leader travels through
+/// empty space to the box and never crosses the region it encloses. `sel` is the selection's screen
+/// bounding box `(x0, y0, x1, y1)`.
+fn place_callout(body: Rect, sel: (u16, u16, u16, u16), bw: u16, bh: u16) -> ((u16, u16), Rect) {
+    let (x0, y0, x1, y1) = sel;
+    let (bx_lo, by_lo) = (body.x, body.y);
+    let (bx_hi, by_hi) = (body.x + body.width, body.y + body.height);
+    let (midx, midy) = ((x0 + x1) / 2, (y0 + y1) / 2);
+    let clampx = |x: u16| x.min(bx_hi.saturating_sub(bw)).max(bx_lo);
+    let clampy = |y: u16| y.min(by_hi.saturating_sub(bh)).max(by_lo);
+
+    // Prefer right, then below, then left, then above — whichever has room for the box plus a gap.
+    if bx_hi.saturating_sub(x1 + 1) >= bw + 2 {
+        ((x1 + 1, midy), Rect::new(clampx(x1 + 3), clampy(midy.saturating_sub(bh / 2)), bw, bh))
+    } else if by_hi.saturating_sub(y1 + 1) >= bh + 1 {
+        ((midx, y1 + 1), Rect::new(clampx(midx.saturating_sub(bw / 2)), clampy(y1 + 2), bw, bh))
+    } else if x0.saturating_sub(bx_lo) >= bw + 2 {
+        ((x0.saturating_sub(1), midy), Rect::new(clampx(x0.saturating_sub(bw + 3)), clampy(midy.saturating_sub(bh / 2)), bw, bh))
+    } else {
+        ((midx, y0.saturating_sub(1)), Rect::new(clampx(midx.saturating_sub(bw / 2)), clampy(y0.saturating_sub(bh + 2)), bw, bh))
+    }
 }
 
 /// Draw a rounded boundary around the subnet the cursor sits in. Membership is by **most-specific**
@@ -470,12 +506,15 @@ pub fn screen(buf: &mut Buffer, app: &mut App) {
         draw_lasso_callout(buf, body, &grid, app, clock);
     }
 
-    let hints: &[(&str, &str)] = if app.lasso.is_some() {
-        &[("← ↑ ↓ →", "stretch"), ("s", "snap"), ("l/Esc", "done"), ("q", "quit")]
+    if let Some(l) = app.lasso {
+        // Show the live snap mode so `s` gives visible confirmation even when the shape doesn't move.
+        let snap = format!("snap: {}", l.snap.label());
+        let hints: &[(&str, &str)] = &[("← ↑ ↓ →", "stretch"), ("s", &snap), ("l/Esc", "done"), ("q", "quit")];
+        keyhints(buf, area.x, foot_y, area.width, hints);
     } else {
-        &[("← ↑ ↓ →", "quadrant"), ("↵/click", "zoom"), ("Esc", "out"), ("l", "lasso"), ("g", "groups"), ("q", "quit")]
-    };
-    keyhints(buf, area.x, foot_y, area.width, hints);
+        let hints: &[(&str, &str)] = &[("← ↑ ↓ →", "quadrant"), ("↵/click", "zoom"), ("Esc", "out"), ("l", "lasso"), ("g", "groups"), ("q", "quit")];
+        keyhints(buf, area.x, foot_y, area.width, hints);
+    }
 }
 
 #[cfg(test)]

@@ -54,18 +54,19 @@ impl Summary {
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
         let mut v = vec![self.title.clone()];
-        if let Some(x) = &self.ipv4 {
-            v.push(format!("v4  {x}"));
-        }
-        if let Some(x) = &self.ipv6 {
-            v.push(format!("v6  {x}"));
-        }
-        if let Some(x) = &self.cluster {
-            v.push(format!("grp {x}"));
-        }
-        if let Some(x) = &self.vlan {
-            v.push(format!("vlan {x}"));
-        }
+        // Skip any line that just repeats the title (which is often the CIDR, subnet, or cluster
+        // name already) — the callout should read clean, not echo itself.
+        let mut push = |label: &str, val: &Option<String>| {
+            if let Some(x) = val {
+                if *x != self.title {
+                    v.push(format!("{label}{x}"));
+                }
+            }
+        };
+        push("v4  ", &self.ipv4);
+        push("v6  ", &self.ipv6);
+        push("grp ", &self.cluster);
+        push("vlan ", &self.vlan);
         v
     }
 }
