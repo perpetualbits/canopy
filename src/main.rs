@@ -8,6 +8,7 @@
 //! same [`reconcile::AddressFacts`] shape.
 
 mod cache;
+mod lasso;
 mod config;
 mod discover;
 mod dns;
