@@ -403,7 +403,9 @@ impl App {
             let progress = |frac: f32, label: &str| {
                 let _ = ptx.send((frac, label.to_string()));
             };
-            let _ = tx.send(live::gather_live_with_token(&range, &cfg, token, progress));
+            // The in-TUI `L` reload is a deliberate "refresh now", so it does a full gather (no
+            // cache); the cached fast path is the launch gather in `main`.
+            let _ = tx.send(live::gather_live_with_token(&range, &cfg, token, None, false, progress));
         });
         self.live_rx = Some(rx);
         self.progress_rx = Some(prx);
@@ -1556,6 +1558,7 @@ mod tests {
                 live: false,
             }],
             subnets: vec![Subnet { cidr: Cidr::parse("10.87.3.0/26").unwrap(), name: "IPMI".into() }],
+            cache: Default::default(),
         });
         assert!(app.live && !app.loading);
         assert_eq!(app.counts.dns_only, 1); // the one supplied PTR

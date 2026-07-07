@@ -202,6 +202,14 @@ pub fn config_path() -> PathBuf {
     config_dir().join("canopy").join("config.toml")
 }
 
+/// `<config-dir>/canopy/mirror/<site>/` — the on-disk snapshot cache (later, git history) for one
+/// site's estate. Per-site so two estates never share zone files, and separate from `conf.d` so a
+/// `git init` here never entangles the config.
+#[must_use]
+pub fn mirror_dir(site: &str) -> PathBuf {
+    config_dir().join("canopy").join("mirror").join(site)
+}
+
 /// `<config-dir>/canopy/conf.d/<site>.toml` — one organization's estate.
 #[must_use]
 pub fn site_path(site: &str) -> PathBuf {

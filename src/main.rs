@@ -59,6 +59,11 @@ struct Args {
     #[arg(long)]
     live: bool,
 
+    /// Force a full DNS transfer, ignoring the on-disk cache — use when a lazy admin left an SOA
+    /// serial un-bumped, so canopy would otherwise trust a stale cached zone as fresh.
+    #[arg(long)]
+    resweep: bool,
+
     /// Discover the DNS estate (which server masters which zones) via SOA lookups on the
     /// vantage, and print it as a [[dns_servers]] block for conf.d/<site>.toml. Read-only.
     #[arg(long)]
@@ -213,7 +218,10 @@ fn main() -> anyhow::Result<()> {
     let range = Cidr::parse(pinned_range.as_deref().unwrap_or(DEMO_RANGE)).map_err(|e| anyhow::anyhow!(e))?;
 
     let (facts, subnets) = if args.live {
-        let data = live::gather_live(&range, &cfg)?;
+        let data = live::gather_live(&range, &cfg, &args.site, args.resweep)?;
+        if let Some(line) = data.cache.line() {
+            eprintln!("{line}");
+        }
         (data.facts, data.subnets)
     } else {
         (demo_facts(&range), demo_subnets(&range))
@@ -402,7 +410,7 @@ fn run_discovery(args: &Args, cfg: &Config) -> anyhow::Result<()> {
     if args.list {
         print!("{}", discover::summary(&blocks));
         for b in &blocks {
-            let data = live::gather_live_with_token(&b.cidr, cfg, token.clone(), |_, _| {})?;
+            let data = live::gather_live_with_token(&b.cidr, cfg, token.clone(), None, false, |_, _| {})?;
             println!();
             list_table(b.cidr, &data.facts);
         }
@@ -419,7 +427,7 @@ fn run_discovery(args: &Args, cfg: &Config) -> anyhow::Result<()> {
         primary.cidr.base,
         primary.cidr.prefix_len
     );
-    let data = live::gather_live_with_token(&primary.cidr, cfg, token, |_, _| {})?;
+    let data = live::gather_live_with_token(&primary.cidr, cfg, token, None, false, |_, _| {})?;
     let groups = load_group_sources(args, cfg, &primary.cidr, &data.facts);
     tui::run(primary.cidr, data.facts, data.subnets, args.write, args.dry_run, true, cfg.clone(), Some(note), groups)
 }

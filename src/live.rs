@@ -6,6 +6,7 @@
 
 use anyhow::Context;
 
+use crate::cache::{CacheReport, Store};
 use crate::config::Config;
 use crate::reconcile::{AddressFacts, Cidr, Subnet};
 use crate::sources::estate::DnsEstate;
@@ -19,6 +20,8 @@ pub struct LiveData {
     pub facts: Vec<AddressFacts>,
     /// The real subnets (NetBox prefixes) inside the range.
     pub subnets: Vec<Subnet>,
+    /// How the DNS reverse cache fared this gather (fresh vs refreshed zones) — for the status line.
+    pub cache: CacheReport,
 }
 
 /// Gather NetBox + DNS + probe facts and merge them, fetching the token first.
@@ -30,14 +33,17 @@ pub struct LiveData {
 ///
 /// # Errors
 /// Propagates a token failure, or the first source that fails (SSH, HTTP, DNS).
-pub fn gather_live(range: &Cidr, cfg: &Config) -> anyhow::Result<LiveData> {
+pub fn gather_live(range: &Cidr, cfg: &Config, site: &str, resweep: bool) -> anyhow::Result<LiveData> {
     let token = get_token(&cfg.token_pass)?;
     // A terse one-liner naming the estate, before the sweep runs (not a wall of zones).
     let estate = DnsEstate::from_config(&cfg.dns_servers)?;
     if !estate.is_empty() {
         eprintln!("Using {}", estate.describe());
     }
-    gather_live_with_token(range, cfg, token, |_, _| {})
+    // The on-disk mirror for this site; `None` if the cache dir can't be opened (best-effort — a
+    // cache failure never blocks a gather, it just means a full sweep).
+    let store = Store::open(crate::config::mirror_dir(site)).ok();
+    gather_live_with_token(range, cfg, token, store.as_ref(), resweep, |_, _| {})
 }
 
 /// Gather and merge the sources using an already-fetched NetBox `token`, reporting
@@ -55,6 +61,8 @@ pub fn gather_live_with_token(
     range: &Cidr,
     cfg: &Config,
     token: String,
+    cache: Option<&Store>,
+    resweep: bool,
     on_progress: impl Fn(f32, &str),
 ) -> anyhow::Result<LiveData> {
     // Every SSH target is reached through the site's jump bastion chain (empty = direct).
@@ -75,10 +83,13 @@ pub fn gather_live_with_token(
     let subnets = netbox.gather_prefixes(range).context("NetBox prefixes")?;
 
     // DNS reverse resolution — the long pole. It reports its own 0–1 fraction (per
-    // address for the sweep, per zone for AXFR); map that onto 5 %–92 % of the bar.
-    let dns_facts = dns
-        .gather_with_progress(range, |frac, label| on_progress(0.05 + 0.87 * frac, label))
-        .context("DNS source")?;
+    // address for the sweep, per zone for AXFR); map that onto 5 %–92 % of the bar. With a cache,
+    // unchanged zones load from disk and the sweep is skipped entirely (the common case).
+    let dns_progress = |frac: f32, label: &str| on_progress(0.05 + 0.87 * frac, label);
+    let (dns_facts, cache) = match cache {
+        Some(store) => dns.gather_cached(range, store, resweep, dns_progress).context("DNS source")?,
+        None => (dns.gather_with_progress(range, dns_progress).context("DNS source")?, CacheReport::default()),
+    };
 
     // The ping probe is best-effort — the probe host may not sit on the target L2, or may
     // block ICMP — so a failure must NOT abort the whole gather (NetBox + DNS are the core).
@@ -90,7 +101,7 @@ pub fn gather_live_with_token(
     });
 
     on_progress(1.0, "merging…");
-    Ok(LiveData { facts: sources::merge(vec![nb, dns_facts, live]), subnets })
+    Ok(LiveData { facts: sources::merge(vec![nb, dns_facts, live]), subnets, cache })
 }
 
 /// Gather the enriched NetBox inventory (prefixes, VLANs, devices, address→device

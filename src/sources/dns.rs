@@ -6,9 +6,11 @@
 //! zones), in parallel with bounded fan-out, and collect the answers.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::estate::DnsEstate;
 use super::{FactSource, Vantage};
+use crate::cache::{is_fresh, CacheReport, Snapshot, Store};
 use crate::reconcile::{AddressFacts, Cidr};
 
 /// Reverse-resolves every host in a range via the vantage's resolver.
@@ -48,6 +50,93 @@ const MAX_ZONES: usize = 512;
 impl FactSource for DnsSource {
     fn gather(&self, range: &Cidr) -> anyhow::Result<Vec<AddressFacts>> {
         self.gather_with_progress(range, |_frac, _label| {})
+    }
+}
+
+/// One reverse zone's freshness key: its name, the view (the master server that answered), and the
+/// SOA serial we just probed. The `(zone, view)` pair keys the on-disk snapshot.
+struct ZoneSerial {
+    zone: String,
+    view: String,
+    serial: u64,
+}
+
+impl DnsSource {
+    /// Reverse-resolve `range`, but **skip the transfer for zones whose SOA serial hasn't moved**
+    /// since the last sync — the launch-time cache (roadmap P13).
+    ///
+    /// A cheap `dig SOA` per reverse zone says what changed; unchanged zones load from `store`, and
+    /// only if something moved (or `resweep`) do we pay for the full transfer, re-snapshotting every
+    /// zone afterwards. **Best-effort**: a range too large to key on zones, an unroutable estate, or
+    /// a failed probe falls straight through to the uncached [`gather_with_progress`](DnsSource::gather_with_progress),
+    /// so the cache can only make a launch faster — never break it.
+    ///
+    /// # Errors
+    /// Propagates only a failure of the underlying transfer/sweep; the cache path itself never
+    /// errors (it degrades to the full gather).
+    pub fn gather_cached(&self, range: &Cidr, store: &Store, resweep: bool, on_progress: impl FnMut(f32, &str)) -> anyhow::Result<(Vec<AddressFacts>, CacheReport)> {
+        let zones = reverse_zones(range);
+        if zones.is_empty() {
+            // No zone granularity (huge range / AXFR off) — nothing to key a cache on.
+            return Ok((self.gather_with_progress(range, on_progress)?, CacheReport::default()));
+        }
+        let probed = self.probe_serials(&zones);
+        if probed.is_empty() {
+            return Ok((self.gather_with_progress(range, on_progress)?, CacheReport::default()));
+        }
+
+        // A zone is fresh when its cached snapshot carries the serial we just probed.
+        let mut fresh_facts = Vec::new();
+        let mut fresh = 0usize;
+        let mut all_fresh = !resweep;
+        for zs in &probed {
+            match store.load(&zs.zone, &zs.view) {
+                Some(snap) if !resweep && is_fresh(Some(snap.serial), zs.serial) => {
+                    fresh_facts.extend(snap.facts);
+                    fresh += 1;
+                }
+                _ => all_fresh = false,
+            }
+        }
+        if all_fresh {
+            // Every zone unchanged → the whole reverse estate is served from disk. The win.
+            return Ok((fresh_facts, CacheReport { fresh, refreshed: 0 }));
+        }
+
+        // Something moved (or a forced resweep): transfer the whole range, then re-snapshot each
+        // zone with its current serial. (Transferring only the moved zones is a later refinement.)
+        let facts = self.gather_with_progress(range, on_progress)?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        self.write_snapshots(&probed, &facts, now, store);
+        Ok((facts, CacheReport { fresh: 0, refreshed: probed.len() }))
+    }
+
+    /// Probe each reverse zone's current SOA serial, routed to the server that masters it (that
+    /// server is the split-horizon **view** key). One `dig SOA` per zone — cheap next to a
+    /// transfer. Zones that don't answer are omitted (treated as stale downstream).
+    fn probe_serials(&self, zones: &[String]) -> Vec<ZoneSerial> {
+        let mut out = Vec::new();
+        for g in self.route_reverse_zones(zones) {
+            for z in &g.zones {
+                let remote = format!("dig +noall +answer SOA {z} @{}", g.host);
+                let Ok(text) = g.vantage.run(&remote) else { continue };
+                if let Some(rec) = crate::dns_discovery::parse_soa_record(&text) {
+                    out.push(ZoneSerial { zone: z.clone(), view: g.host.clone(), serial: rec.serial });
+                }
+            }
+        }
+        out
+    }
+
+    /// Write one snapshot per probed zone: the transfer's facts bucketed into the zone whose
+    /// reverse block contains each address. Best-effort — a write failure never breaks the gather.
+    fn write_snapshots(&self, probed: &[ZoneSerial], facts: &[AddressFacts], now: u64, store: &Store) {
+        for zs in probed {
+            let Some(cidr) = crate::dns_discovery::reverse_zone_to_cidr(&zs.zone) else { continue };
+            let zone_facts: Vec<AddressFacts> = facts.iter().filter(|f| cidr.contains(f.addr)).cloned().collect();
+            let snap = Snapshot { zone: zs.zone.clone(), view: zs.view.clone(), serial: zs.serial, synced: now, facts: zone_facts };
+            let _ = store.save(&snap); // best-effort
+        }
     }
 }
 

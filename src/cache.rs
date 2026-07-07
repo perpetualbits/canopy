@@ -11,15 +11,13 @@
 //!
 //! Stored as **normalised, one-record-per-line text** (a header line, then facts sorted by
 //! address), so P15 can drop it under git and `git diff` reads as the estate's drift. This module
-//! is I/O-light and pure: it (de)serialises snapshots and answers the freshness question; the file
-//! reads/writes and the `dig SOA` probe live in the caller.
-//!
-//! Forward-declared P13 infrastructure: the store + freshness check are built and tested here; the
-//! launch-time wiring (probe SOA → skip fresh zones → load from cache) lands next, at which point
-//! these become used. The `allow` keeps the build warning-free until then.
-#![allow(dead_code)]
+//! (de)serialises snapshots and answers the freshness question; the `dig SOA` probe (which needs
+//! SSH) lives in the caller ([`crate::sources::dns`]), while the file reads/writes live in [`Store`]
+//! below — kept trivial and **best-effort**, so a corrupt or absent cache degrades to a full sweep
+//! rather than failing the launch.
 
 use std::net::IpAddr;
+use std::path::PathBuf;
 
 use crate::reconcile::{AddressFacts, NetBoxRecord};
 
@@ -44,6 +42,67 @@ pub struct Snapshot {
 #[must_use]
 pub fn is_fresh(cached: Option<u64>, probed: u64) -> bool {
     cached == Some(probed)
+}
+
+/// A one-line summary of a cache-aware gather: how many zones came from disk vs the wire.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheReport {
+    /// Zones whose serial was unchanged — served from the cache, no transfer.
+    pub fresh: usize,
+    /// Zones that changed (or were absent) and had to be transferred.
+    pub refreshed: usize,
+}
+
+impl CacheReport {
+    /// The status fragment, e.g. `cache: 3 fresh · 1 refreshed`; `None` when no zones were cache-
+    /// eligible at all (e.g. a per-address sweep with AXFR disabled), so the caller can omit it.
+    #[must_use]
+    pub fn line(&self) -> Option<String> {
+        (self.fresh + self.refreshed > 0).then(|| format!("cache: {} fresh · {} refreshed", self.fresh, self.refreshed))
+    }
+}
+
+/// The on-disk store: a directory holding one text snapshot per `(zone, view)`. Best-effort — a
+/// missing or unparseable file just means "not cached" (which forces a transfer), so a corrupt
+/// cache degrades to a full sweep rather than failing.
+pub struct Store {
+    dir: PathBuf,
+}
+
+impl Store {
+    /// Open the store rooted at `dir`, creating the directory if absent.
+    ///
+    /// # Errors
+    /// Fails only if the directory can't be created.
+    pub fn open(dir: impl Into<PathBuf>) -> std::io::Result<Store> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)?;
+        Ok(Store { dir })
+    }
+
+    /// The snapshot file path for a `(zone, view)`: `<view>__<zone>.txt`, with any character outside
+    /// `[A-Za-z0-9._-]` folded to `_` so an odd zone/view name can't escape the directory. Keying by
+    /// **both** is what keeps the split-horizon `10/8` views in separate files.
+    fn path_for(&self, zone: &str, view: &str) -> PathBuf {
+        let safe = |s: &str| s.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' }).collect::<String>();
+        self.dir.join(format!("{}__{}.txt", safe(view), safe(zone)))
+    }
+
+    /// Load the snapshot for `(zone, view)`, or `None` if it is absent or unparseable. The parsed
+    /// zone/view must match what was asked for (a guard against a mangled filename collision).
+    #[must_use]
+    pub fn load(&self, zone: &str, view: &str) -> Option<Snapshot> {
+        let text = std::fs::read_to_string(self.path_for(zone, view)).ok()?;
+        Snapshot::from_text(&text).filter(|s| s.zone == zone && s.view == view)
+    }
+
+    /// Write `snap` to its `(zone, view)` file, replacing any prior one.
+    ///
+    /// # Errors
+    /// Propagates a write failure (disk full, permissions).
+    pub fn save(&self, snap: &Snapshot) -> std::io::Result<()> {
+        std::fs::write(self.path_for(&snap.zone, &snap.view), snap.to_text())
+    }
 }
 
 impl Snapshot {
@@ -149,5 +208,41 @@ mod tests {
         assert!(is_fresh(Some(2026070300), 2026070300)); // unchanged → skip the AXFR
         assert!(!is_fresh(Some(2026070300), 2026070301)); // bumped → transfer
         assert!(!is_fresh(None, 1)); // never cached → transfer
+    }
+
+    #[test]
+    fn store_round_trips_a_snapshot_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let snap = Snapshot {
+            zone: "3.87.10.in-addr.arpa".into(),
+            view: "dns1".into(),
+            serial: 2026070300,
+            synced: 1_700_000_000,
+            facts: vec![fact("10.87.3.68", None, Some("dop21-ipmi.nfra.nl"), true)],
+        };
+        assert!(store.load(&snap.zone, &snap.view).is_none(), "absent before save");
+        store.save(&snap).unwrap();
+        assert_eq!(store.load(&snap.zone, &snap.view), Some(snap), "loads back exactly");
+    }
+
+    #[test]
+    fn store_keeps_split_horizon_views_separate() {
+        // The same reverse zone under two views must not collide — two files, two answers.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let zone = "10.in-addr.arpa";
+        let a = Snapshot { zone: zone.into(), view: "lcs020".into(), serial: 10, synced: 1, facts: vec![fact("10.0.0.1", None, Some("a."), true)] };
+        let b = Snapshot { zone: zone.into(), view: "ntserver1".into(), serial: 20, synced: 1, facts: vec![fact("10.0.0.1", None, Some("b."), true)] };
+        store.save(&a).unwrap();
+        store.save(&b).unwrap();
+        assert_eq!(store.load(zone, "lcs020").unwrap().serial, 10);
+        assert_eq!(store.load(zone, "ntserver1").unwrap().serial, 20, "the second view did not clobber the first");
+    }
+
+    #[test]
+    fn cache_report_line_omitted_when_no_zones() {
+        assert_eq!(CacheReport::default().line(), None);
+        assert_eq!(CacheReport { fresh: 3, refreshed: 1 }.line().as_deref(), Some("cache: 3 fresh · 1 refreshed"));
     }
 }
