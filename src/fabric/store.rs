@@ -16,10 +16,15 @@ use sha2::{Digest, Sha256};
 /// One artifact's record in a snapshot manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactRecord {
+    /// Artifact name, e.g. `version`, `config`. Becomes the snapshot filename stem.
     pub name: String,
+    /// The exact read-only CLI command that was run.
     pub command: String,
+    /// Lowercase hex checksum of the artifact body.
     pub sha256: String,
+    /// Size in bytes of the artifact body.
     pub bytes: u64,
+    /// The command's exit status code.
     pub exit: i32,
 }
 
@@ -27,27 +32,44 @@ pub struct ArtifactRecord {
 /// writer fills in as it goes).
 #[derive(Debug, Clone)]
 pub struct ManifestHead {
+    /// Device identifier or name, e.g. `acx-a2-0`.
     pub device: String,
+    /// IP address or hostname of the device.
     pub host: String,
+    /// SSH ProxyJump chain used to reach the device (empty if direct).
     pub via: String,
+    /// Username used for collection.
     pub user: String,
+    /// Device's own wall-clock string at collection time (may be skewed).
     pub device_clock: Option<String>,
+    /// Seconds the device clock is behind real time (positive = behind).
     pub clock_skew_secs: Option<i64>,
+    /// Real-clock UTC timestamp when collection was performed.
     pub collected_at: String,
 }
 
 /// The full snapshot manifest written as `manifest.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
+    /// Device identifier or name, e.g. `acx-a2-0`.
     pub device: String,
+    /// IP address or hostname of the device.
     pub host: String,
+    /// SSH ProxyJump chain used to reach the device (empty if direct).
     pub via: String,
+    /// Username used for collection.
     pub user: String,
+    /// Canopy version that performed the collection.
     pub canopy_version: String,
+    /// Always true; collection only ran read-only commands.
     pub read_only: bool,
+    /// Real-clock UTC timestamp when collection was performed.
     pub collected_at: String,
+    /// Device's own wall-clock string at collection time (may be skewed).
     pub device_clock: Option<String>,
+    /// Seconds the device clock is behind real time (positive = behind).
     pub clock_skew_secs: Option<i64>,
+    /// All artifacts collected in this snapshot with their records.
     pub artifacts: Vec<ArtifactRecord>,
 }
 
