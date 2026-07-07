@@ -11,3 +11,4 @@
 #![allow(dead_code)]
 
 pub mod inventory;
+pub mod profile;
