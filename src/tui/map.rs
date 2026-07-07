@@ -296,17 +296,29 @@ fn draw_lasso_callout(buf: &mut Buffer, body: Rect, grid: &MapGrid, app: &App, c
     let lines = summary.lines();
     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
     let longest = refs.iter().map(|s| s.chars().count()).max().unwrap_or(0) as u16;
-    let bw = (longest + 3).clamp(14, body.width.max(14)).min(body.width);
+    // No box border/fill, so the footprint is just the text plus a bookend column and one cell of
+    // breathing room — no wasted frame around it.
+    let bw = (longest + 3).clamp(10, body.width.max(10)).min(body.width);
     let bh = (refs.len() as u16 + 2).min(body.height.max(3));
     let (anchor, box_rect) = place_callout(body, (x0, y0, x1, y1), bw, bh);
 
-    // Bright warm-white chrome with **no background** (so no blue block, and the map shows around
-    // it); the box carries its own dark fill internally, so this fg is the legible label colour.
-    let style = BorderStyle { weight: LineWeight::Light, corners: CornerStyle::Rounded, style: Style::default().fg(Color::Rgb(240, 238, 230)) };
-    // Crisp chrome — the ring/leader read as definite shapes, not a dashed marching line; only the
-    // box interior keeps a faint breath so the map still shimmers behind the text.
-    let duty = curve_map::CalloutDuty { ring: 1.0, leader: 1.0, box_border: 1.0, box_fill: 0.82 };
+    let bright = Style::default().fg(Color::Rgb(240, 238, 230)); // warm white, no background
+    let style = BorderStyle { weight: LineWeight::Light, corners: CornerStyle::Rounded, style: bright };
+    // Temporal alpha: the ring + leader are drawn opaque on even frames and skipped on odd ones
+    // (duty flips 1.0 ⇄ 0.0). At the fast lasso tick this alternation reads as a see-through blend —
+    // no spatial marching-ants dither. Box border/fill stay off (0.0) so only the opaque labels
+    // show: bare text, no wasteful box. Labels are forced opaque inside `callout`, so they persist.
+    let a = f32::from(u8::from(app.lasso_chrome_frame()));
+    let duty = curve_map::CalloutDuty { ring: a, leader: a, box_border: 0.0, box_fill: 0.0 };
     curve_map::callout(buf, body, inside, anchor, box_rect, &refs, &style, clock, duty);
+
+    // A solid vertical **bookend** on the text's leader-facing edge, the height of the text — a
+    // stable anchor the wire lands on (drawn every frame so the label never floats unmoored).
+    let bar_x = if anchor.0 >= box_rect.x + box_rect.width { box_rect.x + box_rect.width - 1 } else { box_rect.x };
+    let (ty0, ty1) = (box_rect.y + 1, (box_rect.y + 1 + refs.len() as u16).min(box_rect.y + box_rect.height));
+    for y in ty0..ty1 {
+        buf.set_char(bar_x, y, '│', bright);
+    }
 }
 
 /// Place the callout box on the side of the selection with the most room, and return the leader

@@ -237,6 +237,10 @@ pub struct App {
     /// The in-progress lasso selection, or `None` when not lassoing. Entered with `l`; arrows (or a
     /// mouse drag) move its head, `Tab` cycles the snap, `Esc`/`l` leaves. Drives the callout.
     pub lasso: Option<Lasso>,
+    /// A monotonic frame counter, bumped once per real redraw in the main loop. Its parity drives
+    /// the **temporal alpha** of the lasso callout chrome: the ring/leader are drawn on even frames
+    /// and skipped on odd ones, so at a fast tick they blend see-through with the map beneath.
+    pub frame: u64,
     /// When `true`, the map draws a rounded boundary around the subnet under the cursor (later
     /// reusable for VLANs). Toggled with `b`.
     pub show_subnets: bool,
@@ -328,6 +332,7 @@ impl App {
             color_by_group: false,
             zoom_sel: 0,
             lasso: None,
+            frame: 0,
             show_subnets: false,
             map_area: Rect::new(0, 0, 0, 0),
             pane_area: Rect::new(0, 0, 0, 0),
@@ -925,6 +930,26 @@ impl App {
         (!ranges.is_empty()).then(|| crate::lasso::summarize(&ranges, &self.facts, &self.grouping, &self.subnets))
     }
 
+    /// The redraw interval: **fast (~60 Hz)** while a lasso is live so the callout's temporal-alpha
+    /// chrome blends smoothly (alternating overlay/map frames reads as see-through only when quick),
+    /// and the calm ~20 Hz idle heartbeat otherwise.
+    #[must_use]
+    pub fn render_tick(&self) -> Duration {
+        if self.lasso.is_some() {
+            Duration::from_millis(16)
+        } else {
+            RENDER_TICK
+        }
+    }
+
+    /// Whether this frame draws the lasso chrome (ring/leader) — the even half of the frame parity
+    /// that produces the temporal-alpha blend. Text is drawn every frame regardless (it stays
+    /// opaque and legible); only the chrome alternates.
+    #[must_use]
+    pub fn lasso_chrome_frame(&self) -> bool {
+        self.frame % 2 == 0
+    }
+
     fn quadrant_move(&mut self, dx: i32, dy: i32) {
         let quads = self.map_quadrants();
         if quads.len() < 2 {
@@ -1400,13 +1425,14 @@ fn main_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -
     while !app.quit {
         app.poll_live();
         app.poll_apply();
+        app.frame = app.frame.wrapping_add(1); // one bump per redraw — drives the temporal-alpha parity
         term.draw(|buf| match app.view {
             View::Table => draw::screen(buf, app),
             View::Graph => super::graph::screen(buf, app),
             View::Tree => super::tree::screen(buf, app),
             View::Map => super::map::screen(buf, app),
         })?;
-        match reader.recv_timeout(RENDER_TICK) {
+        match reader.recv_timeout(app.render_tick()) {
             Some(Event::Key(KeyEvent { code, .. })) => app.on_key(code),
             Some(Event::Mouse(ev)) => app.on_mouse(ev),
             _ => {}
@@ -2007,6 +2033,54 @@ mod tests {
         }
         assert!(bright_label, "the callout paints bright, legible label text");
         assert!(!blue_bg, "the old black-on-blue selection style is gone");
+    }
+
+    #[test]
+    fn lasso_chrome_alternates_by_frame_for_temporal_alpha() {
+        use mullion::style::Color;
+        const BRIGHT: Color = Color::Rgb(240, 238, 230);
+        let facts: Vec<AddressFacts> = ["10.87.3.10", "10.87.3.40", "10.87.3.90"]
+            .iter()
+            .map(|a| AddressFacts { addr: a.parse().unwrap(), netbox: None, ptr: Some("dop.".into()), live: true })
+            .collect();
+        let mut app = App::new(Cidr::parse("10.87.3.0/24").unwrap(), facts, false, false, false, Config::default());
+        app.view = View::Map;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 40));
+        crate::tui::map::screen(&mut buf, &mut app);
+        app.on_key(KeyCode::Char('l'));
+        for _ in 0..10 {
+            app.on_key(KeyCode::Right);
+        }
+
+        // Count bright ring/leader glyphs (box-drawing chars in the callout colour) and whether
+        // legible label text is present.
+        let survey = |app: &mut App| -> (usize, bool) {
+            let mut b = Buffer::empty(Rect::new(0, 0, 120, 40));
+            crate::tui::map::screen(&mut b, app);
+            let (mut lines, mut text) = (0usize, false);
+            for y in 0..b.area.height {
+                for x in 0..b.area.width {
+                    let c = b.get(x, y);
+                    if c.style.fg != BRIGHT {
+                        continue;
+                    }
+                    match c.symbol.chars().next() {
+                        Some(ch) if "─│╭╮╰╯├┤┬┴┼●".contains(ch) => lines += 1,
+                        Some(ch) if ch.is_ascii_alphanumeric() => text = true,
+                        _ => {}
+                    }
+                }
+            }
+            (lines, text)
+        };
+
+        app.frame = 0; // even → ring + leader drawn
+        let (on_lines, on_text) = survey(&mut app);
+        app.frame = 1; // odd → ring + leader skipped (only the solid bookend remains)
+        let (off_lines, off_text) = survey(&mut app);
+
+        assert!(on_lines > off_lines, "the ring/leader draw on even frames and vanish on odd — temporal alpha");
+        assert!(on_text && off_text, "the label text stays legible on both frames");
     }
 
     #[test]
