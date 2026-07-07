@@ -103,6 +103,25 @@ impl Store {
     pub fn save(&self, snap: &Snapshot) -> std::io::Result<()> {
         std::fs::write(self.path_for(&snap.zone, &snap.view), snap.to_text())
     }
+
+    /// Every snapshot currently in the store (all `(zone, view)` files), skipping unparseable ones.
+    /// The union of their facts is the estate's current DNS view.
+    #[must_use]
+    pub fn load_all(&self) -> Vec<Snapshot> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&self.dir) else { return out };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("txt") {
+                if let Ok(text) = std::fs::read_to_string(&p) {
+                    if let Some(snap) = Snapshot::from_text(&text) {
+                        out.push(snap);
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 impl Snapshot {

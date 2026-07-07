@@ -43,7 +43,14 @@ pub fn gather_live(range: &Cidr, cfg: &Config, site: &str, resweep: bool) -> any
     // The on-disk mirror for this site; `None` if the cache dir can't be opened (best-effort — a
     // cache failure never blocks a gather, it just means a full sweep).
     let store = Store::open(crate::config::mirror_dir(site)).ok();
-    gather_live_with_token(range, cfg, token, store.as_ref(), resweep, |_, _| {})
+    let data = gather_live_with_token(range, cfg, token, store.as_ref(), resweep, |_, _| {})?;
+    // Commit this sync to the mirror's git history, so `--since` can diff against it (P15).
+    // Best-effort: no `git`, or nothing changed, is a silent no-op.
+    if store.is_some() {
+        let when = chrono::Utc::now().format("%Y-%m-%d %H:%M:%SZ").to_string();
+        crate::history::commit_sync(&crate::config::mirror_dir(site), site, &when);
+    }
+    Ok(data)
 }
 
 /// Gather and merge the sources using an already-fetched NetBox `token`, reporting

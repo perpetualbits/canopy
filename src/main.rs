@@ -8,6 +8,7 @@
 //! same [`reconcile::AddressFacts`] shape.
 
 mod cache;
+mod history;
 mod lasso;
 mod config;
 mod discover;
@@ -63,6 +64,11 @@ struct Args {
     /// serial un-bumped, so canopy would otherwise trust a stale cached zone as fresh.
     #[arg(long)]
     resweep: bool,
+
+    /// Report what changed in DNS since a past sync — a git revision (`HEAD~1`, a hash) or a time
+    /// (`"2 weeks ago"`, `2026-06-01`). Reads the site's versioned mirror; read-only, no gather.
+    #[arg(long, value_name = "REV")]
+    since: Option<String>,
 
     /// Discover the DNS estate (which server masters which zones) via SOA lookups on the
     /// vantage, and print it as a [[dns_servers]] block for conf.d/<site>.toml. Read-only.
@@ -182,6 +188,11 @@ fn main() -> anyhow::Result<()> {
     // Collect a fabric device's diagnostics into a versioned snapshot (read-only).
     if let Some(device) = &args.fabric_collect {
         return run_fabric_collect(&args, device);
+    }
+
+    // Report what changed in DNS since a past sync, from the versioned mirror (read-only).
+    if args.since.is_some() {
+        return run_since(&args);
     }
 
     // Discover the DNS estate and print it for the site config (read-only).
@@ -324,6 +335,25 @@ fn run_save_estate(args: &Args, cfg: &Config) -> anyhow::Result<()> {
     } else {
         eprintln!("(dry-run — pass --write to save to {})", path.display());
     }
+    Ok(())
+}
+
+/// Handle `--since <rev>`: diff the site's versioned mirror at a past revision against its current
+/// state and print what changed in DNS (appeared / renamed / vanished). Read-only — no gather, no
+/// network; it only reads canopy's own git-backed mirror.
+///
+/// # Errors
+/// Fails if the mirror dir can't be opened, or `<rev>` resolves to no commit (no such history yet).
+fn run_since(args: &Args) -> anyhow::Result<()> {
+    let since = args.since.as_deref().unwrap_or_default();
+    let dir = config::mirror_dir(&args.site);
+    let store = cache::Store::open(&dir)?;
+    let new: Vec<_> = store.load_all().into_iter().flat_map(|s| s.facts).collect();
+    let Some(rev) = history::resolve_rev(&dir, since) else {
+        anyhow::bail!("no history for site {:?} at {since:?} — has canopy synced it with --live yet?", args.site);
+    };
+    let old = history::facts_at(&dir, &rev);
+    print!("{}", history::diff_facts(&old, &new).render());
     Ok(())
 }
 
