@@ -179,7 +179,7 @@ pub fn summarize(ranges: &[AddrRange], facts: &HashMap<IpAddr, AddressFacts>, gr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reconcile::{Cidr, NetBoxRecord};
+    use crate::reconcile::Cidr;
 
     fn facts_of(list: &[AddressFacts]) -> HashMap<IpAddr, AddressFacts> {
         list.iter().map(|f| (f.addr, f.clone())).collect()
