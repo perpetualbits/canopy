@@ -31,7 +31,7 @@ pub struct Artifact {
 pub struct Profile {
     /// Platform id, e.g. `junos-evo`.
     pub os: String,
-    /// All artifacts, in file order.
+    /// All artifacts, sorted by artifact name (BTreeMap iteration order — deterministic).
     pub artifacts: Vec<Artifact>,
 }
 
