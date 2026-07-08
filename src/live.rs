@@ -22,6 +22,9 @@ pub struct LiveData {
     pub subnets: Vec<Subnet>,
     /// How the DNS reverse cache fared this gather (fresh vs refreshed zones) — for the status line.
     pub cache: CacheReport,
+    /// Forward A/AAAA records `(name, addr)` for the hosts we know about — the input to the
+    /// host-level completeness reconciler (P5). Empty on the offline/demo path.
+    pub forward: Vec<(String, std::net::IpAddr)>,
 }
 
 /// Gather NetBox + DNS + probe facts and merge them, fetching the token first.
@@ -108,7 +111,25 @@ pub fn gather_live_with_token(
     });
 
     on_progress(1.0, "merging…");
-    Ok(LiveData { facts: sources::merge(vec![nb, dns_facts, live]), subnets, cache })
+    let facts = sources::merge(vec![nb, dns_facts, live]);
+
+    // Forward resolution: correlate the names we know (from PTRs + NetBox) to their A/AAAA, so the
+    // host-level reconciler can see completeness drift (missing AAAA, forward-without-reverse).
+    // Best-effort and separate from the reverse cache — an empty result just means no host report.
+    let mut names: Vec<String> = Vec::new();
+    for f in &facts {
+        if let Some(p) = &f.ptr {
+            names.push(p.clone());
+        }
+        if let Some(n) = f.netbox.as_ref().and_then(|n| n.dns_name.clone()) {
+            names.push(n);
+        }
+    }
+    names.sort();
+    names.dedup();
+    let forward = dns.resolve_forward(&names);
+
+    Ok(LiveData { facts, subnets, cache, forward })
 }
 
 /// Gather the enriched NetBox inventory (prefixes, VLANs, devices, address→device

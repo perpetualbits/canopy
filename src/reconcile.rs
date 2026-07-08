@@ -653,9 +653,191 @@ impl AddrRange {
     }
 }
 
+/// A logical **host**: a forward name correlated with its A/AAAA, its PTRs, and its NetBox object,
+/// so completeness drift the per-address [`AddressStatus`] can't see becomes visible. Built by
+/// [`hosts_from_facts`] *alongside* the untouched per-address path (`AddressStatus`/`reconcile_at`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Host {
+    /// The forward name, normalised (lower-case, no trailing dot).
+    pub name: String,
+    /// The address its A record resolves to, if any.
+    pub v4: Option<IpAddr>,
+    /// The address its AAAA record resolves to, if any.
+    pub v6: Option<IpAddr>,
+    /// Whether any of its addresses is a NetBox object.
+    pub in_netbox: bool,
+    /// The drift found — empty for a clean, complete host.
+    pub issues: Vec<HostIssue>,
+}
+
+/// One completeness/conflict problem on a [`Host`] — the real drift cases the reconcile pillar
+/// surfaces (missing family, forward-without-reverse, forward/reverse disagreement, source gaps).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostIssue {
+    /// Has an A record but no AAAA — v4-only where it should be dual-stack.
+    MissingAaaa,
+    /// Has an AAAA record but no A.
+    MissingA,
+    /// A forward record points at `addr`, but that address has no PTR back — forward without reverse.
+    MissingPtr(IpAddr),
+    /// `addr`'s PTR names a *different* host than the forward record — forward and reverse disagree.
+    Mismatch { addr: IpAddr, ptr: String },
+    /// In DNS but with no NetBox object.
+    NotInNetbox,
+    /// Has a NetBox object (name) but doesn't resolve in DNS.
+    NotInDns,
+}
+
+impl Host {
+    /// A clean, complete host — no drift.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.issues.is_empty()
+    }
+}
+
+/// Normalise a DNS name for correlation: lower-case, no trailing dot.
+fn norm_name(s: &str) -> String {
+    s.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Correlate per-address `facts` (reverse PTR + NetBox) with the **forward** `(name, addr)` records
+/// (the A/AAAA the names resolve to) into host-level [`Host`]s with completeness [`HostIssue`]s.
+///
+/// Pure and dependency-free. The universe of hosts is every name seen in a forward record, a PTR,
+/// or a NetBox object; each is checked for v4/v6 completeness, forward↔reverse agreement, and
+/// source presence. Address-ordered by name, so the report is stable.
+#[must_use]
+pub fn hosts_from_facts(facts: &HashMap<IpAddr, AddressFacts>, forward: &[(String, IpAddr)]) -> Vec<Host> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // Forward: name → (v4, v6) — first address of each family wins.
+    let mut fwd: BTreeMap<String, (Option<IpAddr>, Option<IpAddr>)> = BTreeMap::new();
+    for (name, addr) in forward {
+        let e = fwd.entry(norm_name(name)).or_default();
+        match addr {
+            IpAddr::V4(_) => {
+                e.0.get_or_insert(*addr);
+            }
+            IpAddr::V6(_) => {
+                e.1.get_or_insert(*addr);
+            }
+        }
+    }
+    let ptr_of = |addr: &IpAddr| facts.get(addr).and_then(|f| f.ptr.as_deref()).map(norm_name);
+    let netbox_name = |f: &AddressFacts| f.netbox.as_ref().and_then(|n| n.dns_name.as_deref()).map(norm_name);
+
+    // The universe of host names: every forward, PTR, and NetBox name.
+    let mut names: BTreeSet<String> = fwd.keys().cloned().collect();
+    for f in facts.values() {
+        if let Some(p) = &f.ptr {
+            names.insert(norm_name(p));
+        }
+        if let Some(n) = netbox_name(f) {
+            names.insert(n);
+        }
+    }
+
+    let mut hosts = Vec::new();
+    for name in names {
+        let (fv4, fv6) = fwd.get(&name).copied().unwrap_or((None, None));
+        // Addresses whose PTR names this host.
+        let rev: Vec<IpAddr> = facts.values().filter(|f| ptr_of(&f.addr).as_deref() == Some(name.as_str())).map(|f| f.addr).collect();
+        let in_dns = fv4.is_some() || fv6.is_some() || !rev.is_empty();
+        let in_netbox = facts.values().any(|f| netbox_name(f).as_deref() == Some(name.as_str()))
+            || [fv4, fv6].into_iter().flatten().any(|a| facts.get(&a).is_some_and(|f| f.netbox.is_some()));
+
+        let mut issues = Vec::new();
+        if in_dns {
+            let has_v4 = fv4.is_some() || rev.iter().any(IpAddr::is_ipv4);
+            let has_v6 = fv6.is_some() || rev.iter().any(IpAddr::is_ipv6);
+            if has_v4 && !has_v6 {
+                issues.push(HostIssue::MissingAaaa);
+            }
+            if has_v6 && !has_v4 {
+                issues.push(HostIssue::MissingA);
+            }
+        }
+        // Forward records that don't reverse-map back to this host.
+        for a in [fv4, fv6].into_iter().flatten() {
+            match ptr_of(&a) {
+                None => issues.push(HostIssue::MissingPtr(a)),
+                Some(p) if p != name => issues.push(HostIssue::Mismatch { addr: a, ptr: p }),
+                _ => {}
+            }
+        }
+        if in_dns && !in_netbox {
+            issues.push(HostIssue::NotInNetbox);
+        }
+        if in_netbox && !in_dns {
+            issues.push(HostIssue::NotInDns);
+        }
+        hosts.push(Host { name, v4: fv4, v6: fv6, in_netbox, issues });
+    }
+    hosts.sort_by(|a, b| a.name.cmp(&b.name));
+    hosts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn facts_map(list: Vec<AddressFacts>) -> HashMap<IpAddr, AddressFacts> {
+        list.into_iter().map(|f| (f.addr, f)).collect()
+    }
+    fn nb(addr: &str, name: &str, ptr: Option<&str>) -> AddressFacts {
+        AddressFacts { addr: addr.parse().unwrap(), netbox: Some(NetBoxRecord { dns_name: Some(name.into()) }), ptr: ptr.map(Into::into), live: false }
+    }
+    fn dns(addr: &str, ptr: &str) -> AddressFacts {
+        AddressFacts { addr: addr.parse().unwrap(), netbox: None, ptr: Some(ptr.into()), live: false }
+    }
+
+    #[test]
+    fn host_with_a_but_no_aaaa_is_flagged_missing_aaaa() {
+        // dop21: an A + matching PTR, in NetBox, but no AAAA — the real dual-stack gap.
+        let facts = facts_map(vec![nb("10.87.3.68", "dop21.nfra.nl", Some("dop21.nfra.nl."))]);
+        let forward = vec![("dop21.nfra.nl".into(), "10.87.3.68".parse().unwrap())];
+        let h = hosts_from_facts(&facts, &forward).into_iter().find(|h| h.name == "dop21.nfra.nl").unwrap();
+        assert_eq!(h.issues, vec![HostIssue::MissingAaaa]);
+        assert_eq!(h.v4, Some("10.87.3.68".parse().unwrap()));
+        assert!(h.in_netbox);
+    }
+
+    #[test]
+    fn forward_record_without_a_ptr_is_missing_reverse() {
+        // srv forward-resolves to .6, but nothing PTRs back and NetBox never heard of it.
+        let hosts = hosts_from_facts(&HashMap::new(), &[("srv.nfra.nl".into(), "10.0.0.6".parse().unwrap())]);
+        let h = hosts.iter().find(|h| h.name == "srv.nfra.nl").unwrap();
+        assert!(h.issues.contains(&HostIssue::MissingPtr("10.0.0.6".parse().unwrap())));
+        assert!(h.issues.contains(&HostIssue::NotInNetbox));
+    }
+
+    #[test]
+    fn forward_and_reverse_disagree_is_a_mismatch() {
+        // .5's PTR says "b", but "a" forward-points at .5 — forward and reverse disagree.
+        let facts = facts_map(vec![dns("10.0.0.5", "b.nfra.nl.")]);
+        let hosts = hosts_from_facts(&facts, &[("a.nfra.nl".into(), "10.0.0.5".parse().unwrap())]);
+        let a = hosts.iter().find(|h| h.name == "a.nfra.nl").unwrap();
+        assert!(a.issues.contains(&HostIssue::Mismatch { addr: "10.0.0.5".parse().unwrap(), ptr: "b.nfra.nl".into() }));
+    }
+
+    #[test]
+    fn clean_dual_stack_host_has_no_issues() {
+        let v4: IpAddr = "10.87.3.68".parse().unwrap();
+        let v6: IpAddr = "2001:db8::68".parse().unwrap();
+        let facts = facts_map(vec![nb("10.87.3.68", "dop21.nfra.nl", Some("dop21.nfra.nl.")), nb("2001:db8::68", "dop21.nfra.nl", Some("dop21.nfra.nl."))]);
+        let forward = vec![("dop21.nfra.nl".into(), v4), ("dop21.nfra.nl".into(), v6)];
+        let h = hosts_from_facts(&facts, &forward).into_iter().find(|h| h.name == "dop21.nfra.nl").unwrap();
+        assert!(h.is_clean(), "A + AAAA + matching PTRs + NetBox = complete, got {:?}", h.issues);
+    }
+
+    #[test]
+    fn netbox_host_that_does_not_resolve_is_not_in_dns() {
+        // A NetBox object whose name has no A/AAAA and no PTR anywhere.
+        let facts = facts_map(vec![AddressFacts { addr: "10.0.0.9".parse().unwrap(), netbox: Some(NetBoxRecord { dns_name: Some("ghost.nfra.nl".into()) }), ptr: None, live: false }]);
+        let h = hosts_from_facts(&facts, &[]).into_iter().find(|h| h.name == "ghost.nfra.nl").unwrap();
+        assert_eq!(h.issues, vec![HostIssue::NotInDns]);
+    }
 
     #[test]
     fn ipv6_parse_contains_and_counts() {

@@ -1559,6 +1559,7 @@ mod tests {
             }],
             subnets: vec![Subnet { cidr: Cidr::parse("10.87.3.0/26").unwrap(), name: "IPMI".into() }],
             cache: Default::default(),
+            forward: Vec::new(),
         });
         assert!(app.live && !app.loading);
         assert_eq!(app.counts.dns_only, 1); // the one supplied PTR

@@ -232,6 +232,43 @@ fn apply_delta(base: &[AddressFacts], delta: &IxfrDelta) -> Vec<AddressFacts> {
 }
 
 impl DnsSource {
+    /// Forward-resolve candidate host `names` to their A/AAAA records over the vantage — the input
+    /// the host-level reconciler ([`crate::reconcile::hosts_from_facts`]) needs to see missing-AAAA
+    /// and forward-without-reverse drift. Best-effort: returns whatever resolves.
+    ///
+    /// Names are filtered to safe hostname characters before they reach the remote shell (a PTR or
+    /// NetBox name is attacker-influenceable, so anything outside `[A-Za-z0-9._-]` is dropped rather
+    /// than interpolated). Each name is dug for both A and AAAA in one shot; `+short` gives bare
+    /// addresses that we classify into the family by parsing.
+    #[must_use]
+    pub fn resolve_forward(&self, names: &[String]) -> Vec<(String, IpAddr)> {
+        let safe: Vec<String> = names
+            .iter()
+            .map(|n| n.trim_end_matches('.').to_string())
+            .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))
+            .collect();
+        if safe.is_empty() {
+            return Vec::new();
+        }
+        let par = self.concurrency.clamp(1, 16);
+        let list = safe.join(" ");
+        let remote =
+            format!("printf '%s\\n' {list} | xargs -P{par} -n1 sh -c 'dig +short A \"$0\" AAAA \"$0\" 2>/dev/null | sed \"s|^|$0 |\"'");
+        let Ok(out) = self.vantage.run(&remote) else { return Vec::new() };
+        let mut recs = Vec::new();
+        for line in out.lines() {
+            let mut it = line.split_whitespace();
+            if let (Some(name), Some(addr)) = (it.next(), it.next()) {
+                if let Ok(ip) = addr.parse::<IpAddr>() {
+                    recs.push((name.trim_end_matches('.').to_string(), ip));
+                }
+            }
+        }
+        recs
+    }
+}
+
+impl DnsSource {
     /// Reverse-resolve every host in `range`, reporting progress through
     /// `on_progress(fraction, label)` as it goes, and return the PTR facts found.
     ///

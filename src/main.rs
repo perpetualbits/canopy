@@ -228,14 +228,14 @@ fn main() -> anyhow::Result<()> {
     // sources to discover from, fall back to the demo range so canopy still runs offline.
     let range = Cidr::parse(pinned_range.as_deref().unwrap_or(DEMO_RANGE)).map_err(|e| anyhow::anyhow!(e))?;
 
-    let (facts, subnets) = if args.live {
+    let (facts, subnets, forward) = if args.live {
         let data = live::gather_live(&range, &cfg, &args.site, args.resweep)?;
         if let Some(line) = data.cache.line() {
             eprintln!("{line}");
         }
-        (data.facts, data.subnets)
+        (data.facts, data.subnets, data.forward)
     } else {
-        (demo_facts(&range), demo_subnets(&range))
+        (demo_facts(&range), demo_subnets(&range), Vec::new())
     };
 
     if let Some(fqdn) = args.allocate.clone() {
@@ -244,6 +244,7 @@ fn main() -> anyhow::Result<()> {
 
     if args.list {
         list_table(range, &facts);
+        print_host_drift(&facts, &forward);
         return Ok(());
     }
 
@@ -748,6 +749,38 @@ fn preview_push_group(name: &str, range: Cidr, args: &Args, cfg: &Config, facts:
         std::process::exit(2);
     }
     Ok(())
+}
+
+/// One-line English for a host completeness/conflict issue (P5).
+fn describe_issue(i: &reconcile::HostIssue) -> String {
+    use reconcile::HostIssue::{Mismatch, MissingA, MissingAaaa, MissingPtr, NotInDns, NotInNetbox};
+    match i {
+        MissingAaaa => "missing AAAA".into(),
+        MissingA => "missing A".into(),
+        MissingPtr(a) => format!("no PTR for {a}"),
+        Mismatch { addr, ptr } => format!("{addr} PTRs to {ptr}"),
+        NotInNetbox => "not in NetBox".into(),
+        NotInDns => "not in DNS".into(),
+    }
+}
+
+/// Report the **incomplete / conflicting hosts** (P5) — the host-level completeness view. Only
+/// prints when forward records were gathered (i.e. `--live`), so the offline/demo path stays quiet;
+/// correlates the reverse facts with the forward A/AAAA into hosts and lists those with drift.
+fn print_host_drift(facts: &[reconcile::AddressFacts], forward: &[(String, std::net::IpAddr)]) {
+    if forward.is_empty() {
+        return;
+    }
+    let map: std::collections::HashMap<_, _> = facts.iter().cloned().map(|f| (f.addr, f)).collect();
+    let drift: Vec<_> = reconcile::hosts_from_facts(&map, forward).into_iter().filter(|h| !h.is_clean()).collect();
+    if drift.is_empty() {
+        return;
+    }
+    println!("\n  incomplete / conflicting hosts ({}):", drift.len());
+    for h in &drift {
+        let issues = h.issues.iter().map(describe_issue).collect::<Vec<_>>().join(", ");
+        println!("    {}  —  {issues}", h.name);
+    }
 }
 
 fn list_table(range: Cidr, facts: &[reconcile::AddressFacts]) {
