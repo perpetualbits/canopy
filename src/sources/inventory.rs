@@ -102,6 +102,16 @@ impl Inventory {
         self.vlans.iter().find(|v| v.vid == vid).map(|v| v.name.as_str())
     }
 
+    /// Resolve a VLAN reference — a numeric **VID** or a VLAN **name** (case-insensitive) — to the
+    /// CIDRs of every prefix on it: **both families** for a dual-stack VLAN. Empty when nothing
+    /// matches. The lookup the provisioning cheat-sheet (`--subnet-info <vlan>`, P11) uses.
+    #[must_use]
+    pub fn subnets_for_vlan(&self, vlan: &str) -> Vec<Cidr> {
+        let vid = vlan.parse::<u16>().ok().or_else(|| self.vlans.iter().find(|v| v.name.eq_ignore_ascii_case(vlan)).map(|v| v.vid));
+        let Some(vid) = vid else { return Vec::new() };
+        self.prefixes.iter().filter(|p| p.vlan == Some(vid)).map(|p| p.cidr).collect()
+    }
+
     /// A formatted, aligned report of the inventory for `range` — the `--inventory` output.
     #[must_use]
     pub fn report(&self, range: &Cidr) -> String {
@@ -256,6 +266,24 @@ pub fn parse_ip_assignments(json: &str) -> anyhow::Result<Vec<Assignment>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subnets_for_vlan_resolves_both_families_by_id_and_name() {
+        let inv = Inventory {
+            prefixes: vec![
+                Prefix { cidr: Cidr::parse("10.87.3.0/24").unwrap(), description: String::new(), role: None, vlan: Some(42), site: None },
+                Prefix { cidr: Cidr::parse("2001:db8:3::/64").unwrap(), description: String::new(), role: None, vlan: Some(42), site: None },
+                Prefix { cidr: Cidr::parse("10.99.0.0/24").unwrap(), description: String::new(), role: None, vlan: Some(7), site: None },
+            ],
+            vlans: vec![Vlan { vid: 42, name: "servers".into(), site: None }],
+            ..Default::default()
+        };
+        let by_id = inv.subnets_for_vlan("42");
+        assert_eq!(by_id.len(), 2, "a dual-stack VLAN resolves to its v4 and v6 prefixes");
+        assert!(by_id.iter().any(|c| c.is_v6()) && by_id.iter().any(|c| !c.is_v6()));
+        assert_eq!(inv.subnets_for_vlan("servers"), by_id, "by name matches by id");
+        assert!(inv.subnets_for_vlan("nope").is_empty());
+    }
 
     #[test]
     fn parses_rich_prefixes() {

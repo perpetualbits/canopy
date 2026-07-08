@@ -70,6 +70,12 @@ struct Args {
     #[arg(long, value_name = "REV")]
     since: Option<String>,
 
+    /// Provisioning cheat-sheet for a subnet or VLAN: network, netmask, gateway, DNS, and the next
+    /// free address — both families for a dual-stack VLAN. Takes a CIDR, or a NetBox VLAN id/name
+    /// (the VLAN form needs `--live`). Read-only.
+    #[arg(long, value_name = "CIDR|VLAN")]
+    subnet_info: Option<String>,
+
     /// Discover the DNS estate (which server masters which zones) via SOA lookups on the
     /// vantage, and print it as a [[dns_servers]] block for conf.d/<site>.toml. Read-only.
     #[arg(long)]
@@ -193,6 +199,11 @@ fn main() -> anyhow::Result<()> {
     // Report what changed in DNS since a past sync, from the versioned mirror (read-only).
     if args.since.is_some() {
         return run_since(&args);
+    }
+
+    // Provisioning cheat-sheet for a subnet/VLAN (read-only).
+    if let Some(arg) = args.subnet_info.clone() {
+        return run_subnet_info(&arg, &args, &cfg);
     }
 
     // Discover the DNS estate and print it for the site config (read-only).
@@ -355,6 +366,61 @@ fn run_since(args: &Args) -> anyhow::Result<()> {
     };
     let old = history::facts_at(&dir, &rev);
     print!("{}", history::diff_facts(&old, &new).render());
+    Ok(())
+}
+
+/// Handle `--subnet-info <cidr|vlan>` (P11): print the provisioning cheat-sheet for a subnet, or —
+/// for a NetBox VLAN reference — for each of its prefixes (both families of a dual-stack VLAN).
+/// Read-only; occupancy for the free-address pick comes from a gather (`--live`) or the demo data.
+///
+/// # Errors
+/// Fails if the argument is neither a CIDR nor (with `--live`) a resolvable VLAN.
+fn run_subnet_info(arg: &str, args: &Args, cfg: &Config) -> anyhow::Result<()> {
+    let cidrs: Vec<Cidr> = if let Ok(c) = Cidr::parse(arg) {
+        vec![c]
+    } else if args.live {
+        let range = Cidr::parse(cfg.range.as_deref().unwrap_or(DEMO_RANGE)).map_err(|e| anyhow::anyhow!(e))?;
+        let subs = live::gather_inventory(&range, cfg)?.subnets_for_vlan(arg);
+        anyhow::ensure!(!subs.is_empty(), "no NetBox VLAN matches {arg:?} within {}/{}", range.base, range.prefix_len);
+        subs
+    } else {
+        anyhow::bail!("--subnet-info {arg:?}: not a CIDR — pass --live to resolve it as a NetBox VLAN");
+    };
+    for c in cidrs {
+        print_subnet_facts(c, args, cfg)?;
+    }
+    Ok(())
+}
+
+/// Print one subnet's cheat-sheet: derived facts (network/gateway/netmask/broadcast/usable), the
+/// configured DNS servers + domains, and the next free address (from live or demo occupancy).
+fn print_subnet_facts(cidr: Cidr, args: &Args, cfg: &Config) -> anyhow::Result<()> {
+    let f = reconcile::SubnetFacts::of(cidr);
+    println!("{}/{}", f.cidr.base, f.cidr.prefix_len);
+    println!("  network    {}", f.network);
+    println!("  gateway    {}   (.1/::1 convention)", f.gateway);
+    if let Some(m) = f.netmask {
+        println!("  netmask    {m}");
+    }
+    if let Some(b) = f.broadcast {
+        println!("  broadcast  {b}");
+    }
+    println!("  usable     {}", f.usable);
+    let servers: Vec<&str> = cfg.dns_servers.iter().map(|s| s.host.as_str()).filter(|h| !h.is_empty()).collect();
+    if !servers.is_empty() {
+        println!("  dns        {}", servers.join(", "));
+    }
+    if !cfg.domains.is_empty() {
+        println!("  domains    {}", cfg.domains.join(", "));
+    }
+    // Next free: lazy scan of host indices against the occupancy (instant on a mostly-empty range).
+    let facts = if args.live { live::gather_live(&cidr, cfg, &args.site, args.resweep)?.facts } else { demo_facts(&cidr) };
+    let occupied: std::collections::HashSet<std::net::IpAddr> = facts.iter().map(|f| f.addr).collect();
+    let scan = cidr.host_count().min(1 << 20); // cap the scan; an empty range yields the first host at once
+    if let Some(free) = (0..scan).map(|i| cidr.host_at(i)).find(|a| !occupied.contains(a)) {
+        println!("  next free  {free}");
+    }
+    println!();
     Ok(())
 }
 

@@ -778,6 +778,47 @@ pub fn hosts_from_facts(facts: &HashMap<IpAddr, AddressFacts>, forward: &[(Strin
     hosts
 }
 
+/// The provisioning **cheat-sheet** facts for a subnet (P11): the fixed answers you need to
+/// configure a box, derived purely from the CIDR. `netmask`/`broadcast` are IPv4-only (IPv6 has
+/// neither); `gateway` is the `.1`/`::1` convention (network + 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubnetFacts {
+    /// The block itself.
+    pub cidr: Cidr,
+    /// The network (all-zero host) address.
+    pub network: IpAddr,
+    /// The conventional default gateway — network + 1 (`.1` for v4, `::1` for v6).
+    pub gateway: IpAddr,
+    /// The dotted netmask — **IPv4 only** (`None` for IPv6, which is prefix-only).
+    pub netmask: Option<IpAddr>,
+    /// The broadcast address — **IPv4 only** (`None` for IPv6, which has no broadcast).
+    pub broadcast: Option<IpAddr>,
+    /// The usable host count in the block.
+    pub usable: u128,
+}
+
+impl SubnetFacts {
+    /// Derive the cheat-sheet facts for `cidr`. Pure arithmetic — no I/O.
+    #[must_use]
+    pub fn of(cidr: Cidr) -> SubnetFacts {
+        let network = cidr.network();
+        let (net_u, v6) = match network {
+            IpAddr::V4(a) => (u128::from(u32::from(a)), false),
+            IpAddr::V6(a) => (u128::from(a), true),
+        };
+        let gateway = if v6 { IpAddr::V6(Ipv6Addr::from(net_u + 1)) } else { IpAddr::V4(Ipv4Addr::from((net_u + 1) as u32)) };
+        let (netmask, broadcast) = if v6 {
+            (None, None)
+        } else {
+            let p = u32::from(cidr.prefix_len);
+            let mask: u32 = if p == 0 { 0 } else { u32::MAX << (32 - p) };
+            let bcast = (net_u as u32) | !mask;
+            (Some(IpAddr::V4(Ipv4Addr::from(mask))), Some(IpAddr::V4(Ipv4Addr::from(bcast))))
+        };
+        SubnetFacts { cidr, network, gateway, netmask, broadcast, usable: cidr.host_count() }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,6 +878,24 @@ mod tests {
         let facts = facts_map(vec![AddressFacts { addr: "10.0.0.9".parse().unwrap(), netbox: Some(NetBoxRecord { dns_name: Some("ghost.nfra.nl".into()) }), ptr: None, live: false }]);
         let h = hosts_from_facts(&facts, &[]).into_iter().find(|h| h.name == "ghost.nfra.nl").unwrap();
         assert_eq!(h.issues, vec![HostIssue::NotInDns]);
+    }
+
+    #[test]
+    fn subnet_facts_v4_has_mask_gateway_broadcast() {
+        let f = SubnetFacts::of(Cidr::parse("10.87.3.0/24").unwrap());
+        assert_eq!(f.network, "10.87.3.0".parse::<IpAddr>().unwrap());
+        assert_eq!(f.gateway, "10.87.3.1".parse::<IpAddr>().unwrap());
+        assert_eq!(f.netmask, Some("255.255.255.0".parse().unwrap()));
+        assert_eq!(f.broadcast, Some("10.87.3.255".parse().unwrap()));
+    }
+
+    #[test]
+    fn subnet_facts_v6_is_prefix_only_no_mask_or_broadcast() {
+        let f = SubnetFacts::of(Cidr::parse("2001:db8:3::/64").unwrap());
+        assert_eq!(f.network, "2001:db8:3::".parse::<IpAddr>().unwrap());
+        assert_eq!(f.gateway, "2001:db8:3::1".parse::<IpAddr>().unwrap());
+        assert_eq!(f.netmask, None, "IPv6 is prefix-only");
+        assert_eq!(f.broadcast, None, "IPv6 has no broadcast");
     }
 
     #[test]
